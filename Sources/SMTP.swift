@@ -28,7 +28,8 @@
 import cURL
 
 /// Header for base64 encoding
-import COpenSSL
+import CoreFoundation
+import Foundation
 
 /// Header for CURL functions
 import PerfectCURL
@@ -64,9 +65,6 @@ public enum SMTPError:Error {
 /// SMTP login structure
 public struct SMTPClient {
 
-  /// singleton for initializing openssl
-  private static var openssl_loaded = false
-
   /// smtp://smtp.mail.server or smtps://smtp.mail.server
   public var url = ""
 
@@ -75,32 +73,6 @@ public struct SMTPClient {
 
   /// login secret
   public var password = ""
-
-  /// constructor
-  /// - parameters:
-  ///   - url: smtp://smtp.mail.server or smtps://smtp.mail.server
-  ///   - username: login name: user@mail.server
-  ///   - password: login secret
-  public init(url: String, username: String, password: String) {
-
-    // assign these variables to structural members
-    self.url = url
-    self.username = username
-    self.password = password
-
-    // singleton
-    if SMTPClient.openssl_loaded {
-      return
-    }//end if
-
-    // initializing OPENSSL
-    SSL_load_error_strings()
-    ERR_load_BIO_strings()
-    OPENSSL_add_all_algorithms_noconf()
-
-    // mark the singleton to "loaded"
-    SMTPClient.openssl_loaded = true
-  }//init
 }//end SMTPClient
 
 /// email receiver format, "Full Name"<nickname@some.where>
@@ -266,16 +238,20 @@ public struct EMail {
       return ""
     }//end guard
 
-    // get base64 encoded text
-    let data = encode(path: path)
-    guard !data.isEmpty else {
-      return ""
-    }//end guard
+    do {
+      // get base64 encoded text
+      let data = try encode(path: path)
+      guard !data.isEmpty else {
+        return ""
+      }//end guard
 
-    // pack it up to an MIME part
-    return "--\(boundary)\r\nContent-Type: text/plain; name=\"\(file)\"\r\n"
-    + "Content-Transfer-Encoding: base64\r\n"
-    + "Content-Disposition: attachment; filename=\"\(file)\"\r\n\r\n\(data)\r\n"
+      // pack it up to an MIME part
+      return "--\(boundary)\r\nContent-Type: text/plain; name=\"\(file)\"\r\n"
+        + "Content-Transfer-Encoding: base64\r\n"
+        + "Content-Disposition: attachment; filename=\"\(file)\"\r\n\r\n\(data)\r\n"
+    } catch {
+      return ""
+    }//end do
   }//end attach
 
   /// encode a file by base64 method
@@ -284,97 +260,27 @@ public struct EMail {
   /// - returns:
   /// base64 encoded text
   @discardableResult
-  private func encode(path: String) -> String {
-
-    // open the file to read
-    guard let fd = fopen(path, "rb") else {
-      return ""
-    }//end fd
-
-    // setup a pipe to encode
-    var pipes:[Int32] = [0,0]
-    let res = pipe(&pipes)
-    guard res == 0 else {
-      return ""
-    }//end pipe
-
-    // setup base64 encoding system
-    let b64 = BIO_new(BIO_f_base64())
-
-    // redirect encoding output to the pipe line
-    let bio = BIO_new_fd(pipes[1], BIO_NOCLOSE)
-    BIO_push(b64, bio)
-
-    var buf:[CChar] = []
-    let size = 512
-    var received = 0
-
-    // use a buffer to encode
-    buf.reserveCapacity(size)
-    buf.withUnsafeBufferPointer{ pBuf in
-
-      // get the buffer pointer from the array
-      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
-      repeat {
-
-        // clear the buffer
-        memset(pRaw, 0, size)
-
-        // read file content
-        received = fread(pRaw, 1, size, fd)
-        if received < 1 {
-          break
-        }//end if
-
-        // encode the bytes
-        BIO_write(b64, pRaw, Int32(received))
-      }while(received >= size)
-    }//end buf
-
-    // all file content processing completed
-    BIO_ctrl(b64,BIO_CTRL_FLUSH,0,nil)
-
-    // release the resources
-    fclose(fd)
-    close(pipes[1])
-    BIO_free_all(b64)
-
-
-    // according to RFC822, the base64 must restrict each line to 80 with \r\n
-    let line = 78
-
-    // prepare the final text presentation
-    var longStr = ""
-
-    // reuse the pre-allocated bytes buffer
-    buf.withUnsafeBufferPointer{ pBuf in
-      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
-
-      // loop for retrieving data
-      repeat {
-
-        // MUST CLEAN THE BUFFER BEFORE USING!!!!
-        memset(pRaw, 0, size)
-
-        // get the encoded content
-        received = read(pipes[0], pRaw, line)
-        if received < 1 {
-          break
-        }//end if
-
-        // convert the buffer into string
-        let str = String(cString: buf) + "\r\n"
-
-        // append to the final presentation
-        longStr += str
-
-        // loop until the end
-      }while(received >= line)
-    }//end buf
-
-    // clean the pipeline
-    close(pipes[0])
-    return longStr
+  private func encode(path: String) throws -> String {
+    var lines = ""
+    do {
+      let data = try Data(contentsOf: URL(fileURLWithPath: path))
+      let longStr = data.base64EncodedString()
+      var i = longStr.startIndex
+      let size = 78
+      while(longStr.distance(from: i, to: longStr.endIndex) > size) {
+        let j = longStr.index(i, offsetBy: size)
+        let line = longStr[i..<j] + "\r\n"
+        lines += line
+        i = j
+      }//end while
+      if longStr.distance(from: i, to: longStr.endIndex) > 0 {
+        let line = longStr[i..<longStr.endIndex] + "\r\n"
+        lines += line
+      }//end if
+    }catch {
+      throw SMTPError.INVALID_BUFFER
+    }//end do
+    return lines
   }//end encode
 
   /// send an email with the current settings
@@ -448,6 +354,7 @@ public struct EMail {
     // end of the attachements
     body += "--\(boundary)--\r\n"
 
+    print(body)
     // load the curl object
     let curl = CURL(url: client.url)
 
@@ -461,7 +368,7 @@ public struct EMail {
     }//end if
 
     // for debug the session
-    //let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
+    let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
 
     // set the mail sender info
     let _ = curl.setOption(CURLOPT_MAIL_FROM, s: from.address)

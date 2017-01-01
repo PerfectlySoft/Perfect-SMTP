@@ -3,7 +3,7 @@ import XCTest
 
 class SMTPTests: XCTestCase {
     func testExample() {
-      var email = EMail(client: SMTPClient(url: "smtp://smtp.gmx.com", username: "judysmith1964@gmx.com", password:"abcd1234"))
+      var email = EMail(client: SMTPClient(url: "smtp://smtp.gmx.com", username: "judysmith1964@gmx.com", password:"yourpassword"))
       email.subject = "hello"
       email.from = Recipient(name: "Judith Smith", address: "judysmith1964@gmx.com")
       email.content = "<h1>这是一个测试</h1><hr><img src='http://www.perfect.org/images/perfect-logo-2-0.svg'>"
