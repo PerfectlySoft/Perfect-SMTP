@@ -144,7 +144,7 @@ extension String {
     }//end get
   }//end fileNameWithoutPath
 
-  /// extract file suffix from a file name 
+  /// extract file suffix from a file name
   public var suffix: String {
     get {
       let segments = self.characters.split(separator: ".")
@@ -163,7 +163,7 @@ extension String {
           return nil
         }//end result
 
-        // turn the low level pipe file number into FILE pointer
+        // turn the low level pipe file numbers into FILE pointers
         let fi = fdopen(p[0], "rb")
         let fo = fdopen(p[1], "wb")
 
@@ -218,7 +218,7 @@ public struct EMail {
   }//end html
 
   /// constructor
-  /// - parameters: 
+  /// - parameters:
   ///   - client: SMTP client for login info
   public init(client: SMTPClient) {
     self.client = client
@@ -262,18 +262,35 @@ public struct EMail {
   /// base64 encoded text
   @discardableResult
   private func encode(path: String) throws -> String {
+
+    // the final lines
     var lines = ""
+
     do {
+
+      // get the file content
       let data = try Data(contentsOf: URL(fileURLWithPath: path))
+
+      // get the base64 encoded string
       let longStr = data.base64EncodedString()
+
+      // according to RFC 822, MIME mail MUST restrict each line to 80 characters
       var i = longStr.startIndex
+
+      // so leave the last two characters for CRLF
       let size = 78
+
+      // split all data into lines
       while(longStr.distance(from: i, to: longStr.endIndex) > size) {
         let j = longStr.index(i, offsetBy: size)
+
+        // add CRLF
         let line = longStr[i..<j] + "\r\n"
         lines += line
         i = j
       }//end while
+
+      // add remain
       if longStr.distance(from: i, to: longStr.endIndex) > 0 {
         let line = longStr[i..<longStr.endIndex] + "\r\n"
         lines += line
