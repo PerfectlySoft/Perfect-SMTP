@@ -372,7 +372,7 @@ public struct EMail {
     // end of the attachements
     body += "--\(boundary)--\r\n"
 
-    print(body)
+    // print(body)
     // load the curl object
     let curl = CURL(url: client.url)
 
@@ -386,7 +386,7 @@ public struct EMail {
     }//end if
 
     // for debug the session
-    let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
+    // let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
 
     // set the mail sender info
     let _ = curl.setOption(CURLOPT_MAIL_FROM, s: from.address)
