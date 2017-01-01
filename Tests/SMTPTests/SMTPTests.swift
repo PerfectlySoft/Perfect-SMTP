@@ -10,9 +10,9 @@ class SMTPTests: XCTestCase {
       email.to.append(email.from)
       email.cc.append(Recipient(address: "rockywei@gmx.com"))
 
-      email.attach(path: "/tmp/hello.txt", mimeType: "text/plain")
-      email.attach(path: "/tmp/hola.txt", mimeType: "text/plain")
-      email.attach(path: "/tmp/qr.gif", mimeType: "image/gif")
+      email.attachments.append("/tmp/hello.txt")
+      email.attachments.append("/tmp/hola.txt")
+      email.attachments.append("/tmp/qr.gif")
       let x = self.expectation(description: "sending mail")
       do {
         try email.send { code, header, body in

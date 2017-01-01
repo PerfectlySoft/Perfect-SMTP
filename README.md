@@ -47,6 +47,15 @@ This package builds with Swift Package Manager and is part of the [Perfect](http
 
 Ensure you have installed and activated the latest Swift 3.0 tool chain.
 
+## Linux Build Note
+
+Please make sure libssl-dev was installed on Ubuntu 16.04:
+
+```
+$ sudo apt-get install libssl-dev
+```
+
+
 ## Issues
 
 We are transitioning to using JIRA for all bugs and support related issues, therefore the GitHub issues has been disabled.
