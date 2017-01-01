@@ -127,28 +127,25 @@ extension String {
   }//end init
 
   /// convert a string buffer into a FILE (pipe) pointer for reading, for CURL upload operations
-  public var asFILE:UnsafeMutablePointer<FILE>? {
+  public var asFileNumber:Int32 {
     get {
 
       // setup a pipe line
       var p:[Int32] = [0, 0]
       let result = pipe(&p)
       guard result == 0 else {
-        return nil
+        return -1
       }//end result
 
-      // turn the low level pipe file number into FILE pointer
-      let fi = fdopen(p[0], "rb")
-      let fo = fdopen(p[1], "wb")
-
-      // write the string into pipe
-      let _ = fwrite(self, 1, self.utf8.count, fo)
+      // write string to pipe
+      let fd = fdopen(p[1], "w")
+      let _ = fwrite(self, 1, self.utf8.count, fd)
 
       // close pipe writing end for reading
-      fclose(fo)
+      fclose(fd)
 
       // return the pipe reading end
-      return fi ?? nil
+      return p[0]
     }//end get
   }//end freader
 
@@ -386,18 +383,25 @@ public struct EMail {
     // set the mime size
     let _ = curl.setOption(CURLOPT_INFILESIZE, int: body.utf8.count)
 
-    // transform the body content into a FILE pointer for uploading
-    guard let data = body.asFILE else {
+    // transform the body content into a file number for uploading
+    var data = body.asFileNumber
+
+    guard data > 0 else {
       throw SMTPError.INVALID_BUFFER
     }//END guard
 
-    // help curl setup the uploading FILE pointer
-    let _ = curl.setOption(CURLOPT_READDATA, v: data)
+    // setup data
+    let _ = curl.setOption(CURLOPT_READDATA, v: &data)
+
+    let _ = curl.setOption(CURLOPT_READFUNCTION, f: { buf, itm, sz, pData in
+      let ptr = unsafeBitCast(pData, to: UnsafePointer<Int32>.self)
+      return read(ptr.pointee, buf, sz)
+    })//end reading
 
     // asynchronized calling
     let _ = curl.perform {
       // clean up
-      fclose(data)
+      close(data)
       // call back
       completion($0, String(cString: $1), String(cString: $2))
     }//end perform
