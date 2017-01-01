@@ -126,29 +126,6 @@ extension String {
     self = "\(prefix): \(r)\r\n"
   }//end init
 
-  /// convert a string buffer into a FILE (pipe) pointer for reading, for CURL upload operations
-  public var asFileNumber:Int32 {
-    get {
-
-      // setup a pipe line
-      var p:[Int32] = [0, 0]
-      let result = pipe(&p)
-      guard result == 0 else {
-        return -1
-      }//end result
-
-      // write string to pipe
-      let fd = fdopen(p[1], "w")
-      let _ = fwrite(self, 1, self.utf8.count, fd)
-
-      // close pipe writing end for reading
-      fclose(fd)
-
-      // return the pipe reading end
-      return p[0]
-    }//end get
-  }//end freader
-
   /// get the address info from a recipient, i.e, someone@somewhere -> @somewhere
   public var emailSuffix: String {
     get {
@@ -174,7 +151,34 @@ extension String {
       return String(segments[segments.count - 1])
     }//end get
   }//end suffix
-}//end String
+
+  /// convert a string buffer into a FILE (pipe) pointer for reading, for CURL upload operations
+  public var asFILE:UnsafeMutablePointer<FILE>! {
+      get {
+
+        // setup a pipe line
+        var p:[Int32] = [0, 0]
+        let result = pipe(&p)
+        guard result == 0 else {
+          return nil
+        }//end result
+
+        // turn the low level pipe file number into FILE pointer
+        let fi = fdopen(p[0], "rb")
+        let fo = fdopen(p[1], "wb")
+
+        // write the string into pipe
+        let _ = fwrite(self, 1, self.utf8.count, fo)
+
+        // close pipe writing end for reading
+        fclose(fo)
+
+        // return the pipe reading end
+        return fi
+      }//end get
+    }//end freader
+
+  }//end String
 
 
 /// SMTP mail composer
@@ -383,25 +387,16 @@ public struct EMail {
     // set the mime size
     let _ = curl.setOption(CURLOPT_INFILESIZE, int: body.utf8.count)
 
-    // transform the body content into a file number for uploading
-    var data = body.asFileNumber
-
-    guard data > 0 else {
+    // get the file pointer from body string
+    let data = body.asFILE
+    guard data != nil else {
       throw SMTPError.INVALID_BUFFER
-    }//END guard
+    }//end guard
 
-    // setup data
-    let _ = curl.setOption(CURLOPT_READDATA, v: &data)
-
-    let _ = curl.setOption(CURLOPT_READFUNCTION, f: { buf, itm, sz, pData in
-      let ptr = unsafeBitCast(pData, to: UnsafePointer<Int32>.self)
-      return read(ptr.pointee, buf, sz)
-    })//end reading
+    let _ = curl.setOption(CURLOPT_READDATA, v: data!)
 
     // asynchronized calling
     let _ = curl.perform {
-      // clean up
-      close(data)
       // call back
       completion($0, String(cString: $1), String(cString: $2))
     }//end perform
