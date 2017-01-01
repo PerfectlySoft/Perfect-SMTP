@@ -397,6 +397,10 @@ public struct EMail {
 
     // asynchronized calling
     let _ = curl.perform {
+
+      //release pipe line
+      fclose(data)
+
       // call back
       completion($0, String(cString: $1), String(cString: $2))
     }//end perform
