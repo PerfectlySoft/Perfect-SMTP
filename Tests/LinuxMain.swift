@@ -1,6 +1,6 @@
 import XCTest
-@testable import SMTPTests
+@testable import PerfectSMTPTests
 
 XCTMain([
-     testCase(SMTPTests.allTests),
+     testCase(PerfectSMTPTests.allTests),
 ])

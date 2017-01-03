@@ -65,7 +65,7 @@ To use SMTP class, please modify the Package.swift file and add following depend
 Then please import SMTP library into the swift source code:
 
 ``` swift
-import SMTP
+import PerfectSMTP
 ```
 
 ## Data Structures

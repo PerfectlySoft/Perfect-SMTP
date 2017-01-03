@@ -67,7 +67,7 @@ $ sudo apt-get install libssl-dev
 随后在源代码开始部分增加导入说明：
 
 ``` swift
-import SMTP
+import PerfectSMTP
 ```
 
 ## 主要数据结构

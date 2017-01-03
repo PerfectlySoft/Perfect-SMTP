@@ -28,8 +28,7 @@
 import cURL
 
 /// Header for base64 encoding
-import CoreFoundation
-import Foundation
+import COpenSSL
 
 /// Header for CURL functions
 import PerfectCURL
@@ -153,7 +152,7 @@ extension String {
   }//end suffix
 
   /// convert a string buffer into a FILE (pipe) pointer for reading, for CURL upload operations
-  public var asFILE:UnsafeMutablePointer<FILE>! {
+  public var asFILE:UnsafeMutablePointer<FILE>? {
       get {
 
         // setup a pipe line
@@ -165,13 +164,16 @@ extension String {
 
         // turn the low level pipe file numbers into FILE pointers
         let fi = fdopen(p[0], "rb")
-        let fo = fdopen(p[1], "wb")
 
         // write the string into pipe
-        let _ = fwrite(self, 1, self.utf8.count, fo)
+        self.withCString { ptr in
+          let raw = unsafeBitCast(ptr, to: UnsafeMutableRawPointer.self)
+          var iov = iovec(iov_base: raw, iov_len: self.utf8.count)
+          let _ = writev(p[1], &iov, 1)
+        }//end cstring
 
         // close pipe writing end for reading
-        fclose(fo)
+        close(p[1])
 
         // return the pipe reading end
         return fi
@@ -263,42 +265,61 @@ public struct EMail {
   @discardableResult
   private func encode(path: String) throws -> String {
 
-    // the final lines
-    var lines = ""
+    // load the source file
+    guard let fd = fopen(path, "rb") else { return "" }
 
-    do {
+    // create a pipe line to manage the encoded data
+    var pipes:[Int32] = [0,0]
+    let res = pipe(&pipes)
+    guard res == 0 else { return "" }
 
-      // get the file content
-      let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    // use openssl to encode in base64 form
+    let b64 = BIO_new(BIO_f_base64())
+    let bio = BIO_new_fd(pipes[1], BIO_NOCLOSE)
+    BIO_push(b64, bio)
 
-      // get the base64 encoded string
-      let longStr = data.base64EncodedString()
+    // prepare a 4k buffer to encode
+    var buf:[CChar] = []
+    let size = 4096
+    var received = 0
 
-      // according to RFC 822, MIME mail MUST restrict each line to 80 characters
-      var i = longStr.startIndex
+    // encode the file buffer by buffer
+    buf.reserveCapacity(size)
+    buf.withUnsafeBufferPointer{ pBuf in
+      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
+      repeat {
+        memset(pRaw, 0, size)
+        received = fread(pRaw, 1, size, fd)
+        if received > 0 {
+          BIO_write(b64, pRaw, Int32(received))
+        }//end if
+      }while(received >= size)
+    }//end buf
 
-      // so leave the last two characters for CRLF
-      let size = 78
+    // finishing the encryption
+    BIO_ctrl(b64,BIO_CTRL_FLUSH,0,nil)
+    fclose(fd)
+    close(pipes[1])
+    BIO_free_all(b64)
 
-      // split all data into lines
-      while(longStr.distance(from: i, to: longStr.endIndex) > size) {
-        let j = longStr.index(i, offsetBy: size)
+    // read encoded data from pipeline and split ascii text 
+    // into lines of 80 chars per line as defined in RFC 822
+    let line = 78
 
-        // add CRLF
-        let line = longStr[i..<j] + "\r\n"
-        lines += line
-        i = j
-      }//end while
-
-      // add remain
-      if longStr.distance(from: i, to: longStr.endIndex) > 0 {
-        let line = longStr[i..<longStr.endIndex] + "\r\n"
-        lines += line
-      }//end if
-    }catch {
-      throw SMTPError.INVALID_BUFFER
-    }//end do
-    return lines
+    var longStr = ""
+    buf.withUnsafeBufferPointer{ pBuf in
+      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
+      repeat {
+        memset(pRaw, 0, size)
+        received = read(pipes[0], pRaw, line)
+        if received > 0 {
+          let str = String(cString: buf) + "\r\n"
+          longStr += str
+        }//end if
+      }while(received >= line)
+    }//end buf
+    close(pipes[0])
+    return longStr
   }//end encode
 
   /// send an email with the current settings
@@ -410,6 +431,7 @@ public struct EMail {
       throw SMTPError.INVALID_BUFFER
     }//end guard
 
+    let _ = curl.setOption(CURLOPT_READFUNCTION, f: {  fread($0, $1, $2, unsafeBitCast($3, to: UnsafeMutablePointer<FILE>.self)) })
     let _ = curl.setOption(CURLOPT_READDATA, v: data!)
 
     // asynchronized calling

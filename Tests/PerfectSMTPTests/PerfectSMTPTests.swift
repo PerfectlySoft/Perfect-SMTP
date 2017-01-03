@@ -1,7 +1,10 @@
 import XCTest
-@testable import SMTP
+import PerfectLib
+import PerfectCURL
 
-class SMTPTests: XCTestCase {
+@testable import PerfectSMTP
+
+class PerfectSMTPTests: XCTestCase {
     func testExample() {
       var email = EMail(client: SMTPClient(url: "smtp://smtp.gmx.com", username: "judysmith1964@gmx.com", password:"yourpassword"))
       email.subject = "hello"
@@ -10,11 +13,28 @@ class SMTPTests: XCTestCase {
       email.to.append(email.from)
       email.cc.append(Recipient(address: "rockywei@gmx.com"))
 
-      email.attachments.append("/tmp/hello.txt")
-      email.attachments.append("/tmp/hola.txt")
-      email.attachments.append("/tmp/qr.gif")
       let x = self.expectation(description: "sending mail")
       do {
+        let fa = File("/tmp/hello.txt")
+        try fa.open(.write)
+        try fa.write(string: "Hello, World!")
+        fa.close()
+        let fb = File("/tmp/hola.txt")
+        try fb.open(.write)
+        try fb.write(string: "中国🇨🇳Canada🇨🇦")
+        fb.close()
+        email.attachments.append("/tmp/hello.txt")
+        email.attachments.append("/tmp/hola.txt")
+        let curl = CURL(url: "https://www.perfect.org/docs/images/China-Flag-icon.png")
+        let r = curl.performFully()
+        if r.0 == 0 {
+          let fc = File("/tmp/china.png")
+          try fc.open(.write)
+          try fc.write(bytes: r.2)
+          fc.close()
+          email.attachments.append("/tmp/china.png")
+        }
+
         try email.send { code, header, body in
           print(code)
           print(header)
@@ -32,7 +52,7 @@ class SMTPTests: XCTestCase {
     }
 
 
-    static var allTests : [(String, (SMTPTests) -> () throws -> Void)] {
+    static var allTests : [(String, (PerfectSMTPTests) -> () throws -> Void)] {
         return [
             ("testExample", testExample),
         ]
