@@ -72,6 +72,17 @@ public struct SMTPClient {
 
   /// login secret
   public var password = ""
+
+  /// constructor
+  /// - parameters:
+  ///   - url: String, smtp://somewhere or smtps://someelsewhere
+  ///   - username: String, user@somewhere
+  ///   - password: String
+  public init(url: String = "", username: String = "", password: String = "") {
+    self.url = url
+    self.username = username
+    self.password = password
+  }//end init
 }//end SMTPClient
 
 /// email receiver format, "Full Name"<nickname@some.where>
