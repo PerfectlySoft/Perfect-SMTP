@@ -395,12 +395,14 @@ public struct EMail {
     body += "MIME-Version: 1.0\r\nContent-type: multipart/mixed; boundary=\"\(boundary)\"\r\n\r\n"
 
     // add the html / plain text content body
-    if content.isEmpty {
+    if content.isEmpty && text.isEmpty {
       throw SMTPError.INVALID_CONTENT
     }else {
-      body += "--\(boundary)\r\nContent-Type: text/html;charset=utf8\r\n\r\n\(content)\r\n\r\n"
       if !text.isEmpty {
         body += "--\(boundary)\r\nContent-Type: text/plain; charset=utf8; format=flowed\r\n\r\n\(content)\r\n\r\n"
+      }
+      if !content.isEmpty {
+        body += "--\(boundary)\r\nContent-Type: text/html;charset=utf8\r\n\r\n\(content)\r\n\r\n"
       }
     }//end if
 
