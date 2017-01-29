@@ -223,6 +223,9 @@ public struct EMail {
 
   /// email content body
   public var content: String = ""
+  
+  // text version, to be added with a html version.
+  public var text: String = ""
 
   /// an alternative name of content
   public var html: String {
@@ -396,6 +399,9 @@ public struct EMail {
       throw SMTPError.INVALID_CONTENT
     }else {
       body += "--\(boundary)\r\nContent-Type: text/html;charset=utf8\r\n\r\n\(content)\r\n\r\n"
+      if !text.isEmpty {
+        body += "--\(boundary)\r\nContent-Type: text/plain; charset=utf8; format=flowed\r\n\r\n\(content)\r\n\r\n"
+      }
     }//end if
 
     // add the attachements
