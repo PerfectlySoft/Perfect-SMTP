@@ -24,6 +24,8 @@
   import Darwin
 #endif
 
+import PerfectThread
+
 /// Header for CURL options macro
 import cURL
 
@@ -230,7 +232,7 @@ public struct EMail {
   /// an alternative name of content
   public var html: String {
     get { return content }
-    set { content = html }
+    set { content = newValue }
   }//end html
 
   /// constructor
