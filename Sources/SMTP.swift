@@ -24,8 +24,6 @@
   import Darwin
 #endif
 
-import PerfectThread
-
 /// Header for CURL options macro
 import cURL
 
@@ -456,12 +454,13 @@ public struct EMail {
     let _ = curl.setOption(CURLOPT_READDATA, v: data!)
 
     // asynchronized calling
-    Threading.dispatch {
-      let r = curl.performFully() 
-      //release pipeline
+    let _ = curl.perform {
+
+      //release pipe line
       fclose(data)
-      //callback
-      completion(r.0, String(cString: r.1), String(cString: r.2))
+
+      // call back
+      completion($0, String(cString: $1), String(cString: $2))
     }//end perform
   }//end send
 }//end class
