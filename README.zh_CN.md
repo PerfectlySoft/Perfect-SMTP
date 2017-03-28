@@ -147,6 +147,39 @@ do {
   - body: String，邮件响应体数据字符串。
 
 
+## 示范程序
+
+在github上有一个完整邮件发送程序供参考：
+[Perfect SMTP Demo](https://github.com/PerfectExamples/Perfect-SMTP-Demo)
+
+## SMTPS协议注意事项
+
+我们收到了很多关于google smtp示范的要求，在此感谢 @ucotta 、@james，当然还有来自Perfect 官方专业支持的 @iamjono，以下说明可能会为您的gmail客户端开发有所帮助： ⚠️*SMTPClient 的地址应该设置为 `smtps://smtp.gmail.com`，并且在谷歌设置中一定要开启“降低安全性以便于某些传统客户端访问”*⚠️
+
+以下是使用SMTPS加密协议的示范例子（以gmail为例）
+
+``` swift
+import PerfectSMTP
+
+let client = SMTPClient(url: "smtps://smtp.gmail.com", username: "yourname@gmail.com", password:"yourpassword")
+
+var email = EMail(client: client)
+
+email.subject = "a topic"
+email.content = "a message"
+
+email.cc.append(Recipient(address: "who@where.com"))
+
+do {
+  try email.send { code, header, body in
+    /// response info from mail server
+    print(code)
+  }//end send
+}catch(let err) {
+  /// something wrong
+}
+```
+
 ## 问题报告、内容贡献和客户支持
 
 我们目前正在过渡到使用JIRA来处理所有源代码资源合并申请、修复漏洞以及其它有关问题。因此，GitHub 的“issues”问题报告功能已经被禁用了。
