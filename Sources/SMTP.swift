@@ -424,7 +424,11 @@ public class EMail {
       }//end if
       let result = this.body.withCString { ptr -> Int in
         let size = remain > szblock ? szblock : remain
-        memcpy(target, ptr.advanced(by: this.progress), size)
+        #if os(Linux)
+          memcpy(target!, ptr.advanced(by: this.progress), size)
+        #else
+          memcpy(target, ptr.advanced(by: this.progress), size)
+        #endif
         return size
       }//end with
       this.progress += result
