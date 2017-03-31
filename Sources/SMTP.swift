@@ -30,7 +30,7 @@ import PerfectThread
 import cURL
 
 /// Header for base64 encoding
-import COpenSSL
+import PerfectCrypto
 
 /// Header for CURL functions
 import PerfectCURL
@@ -61,6 +61,9 @@ public enum SMTPError:Error {
 
   /// unacceptable protocol
   case INVALID_PROTOCOL
+
+  /// base64 failed
+  case INVALID_ENCRYPTION
 }//end enum
 
 /// SMTP login structure
@@ -164,40 +167,11 @@ extension String {
     }//end get
   }//end suffix
 
-  /// convert a string buffer into a FILE (pipe) pointer for reading, for CURL upload operations
-  public var asFILE:UnsafeMutablePointer<FILE>? {
-      get {
-
-        // setup a pipe line
-        var p:[Int32] = [0, 0]
-        let result = pipe(&p)
-        guard result == 0 else {
-          return nil
-        }//end result
-
-        // turn the low level pipe file numbers into FILE pointers
-        let fi = fdopen(p[0], "rb")
-
-        // write the string into pipe
-        self.withCString { ptr in
-          let raw = unsafeBitCast(ptr, to: UnsafeMutableRawPointer.self)
-          var iov = iovec(iov_base: raw, iov_len: self.utf8.count)
-          let _ = writev(p[1], &iov, 1)
-        }//end cstring
-
-        // close pipe writing end for reading
-        close(p[1])
-
-        // return the pipe reading end
-        return fi
-      }//end get
-    }//end freader
-
-  }//end String
+}//end String
 
 
 /// SMTP mail composer
-public struct EMail {
+public class EMail {
 
   /// boundary for mark different part of the mail
   let boundary = "perfect-smtp-boundary"
@@ -235,6 +209,15 @@ public struct EMail {
     set { content = newValue }
   }//end html
 
+  /// for debugging purposes
+  public var debug = false
+
+  /// for callback only, do not use it!
+  public var progress = 0
+
+  /// for callback only, do not use it!
+  public var body = ""
+
   /// constructor
   /// - parameters:
   ///   - client: SMTP client for login info
@@ -259,10 +242,13 @@ public struct EMail {
 
     do {
       // get base64 encoded text
-      let data = try encode(path: path)
-      guard !data.isEmpty else {
+      guard let data = try encode(path: path) else {
         return ""
       }//end guard
+
+      if self.debug {
+        print("\(data.utf8.count) bytes attached")
+      }//end if
 
       // pack it up to an MIME part
       return "--\(boundary)\r\nContent-Type: text/plain; name=\"\(file)\"\r\n"
@@ -279,63 +265,32 @@ public struct EMail {
   /// - returns:
   /// base64 encoded text
   @discardableResult
-  private func encode(path: String) throws -> String {
-
-    // load the source file
-    guard let fd = fopen(path, "rb") else { return "" }
-
-    // create a pipe line to manage the encoded data
-    var pipes:[Int32] = [0,0]
-    let res = pipe(&pipes)
-    guard res == 0 else { return "" }
-
-    // use openssl to encode in base64 form
-    let b64 = BIO_new(BIO_f_base64())
-    let bio = BIO_new_fd(pipes[1], BIO_NOCLOSE)
-    BIO_push(b64, bio)
-
-    // prepare a 4k buffer to encode
-    var buf:[CChar] = []
-    let size = 4096
-    var received = 0
-
-    // encode the file buffer by buffer
-    buf.reserveCapacity(size)
-    buf.withUnsafeBufferPointer{ pBuf in
-      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
-      repeat {
-        memset(pRaw, 0, size)
-        received = fread(pRaw, 1, size, fd)
-        if received > 0 {
-          BIO_write(b64, pRaw, Int32(received))
-        }//end if
-      }while(received >= size)
-    }//end buf
-
-    // finishing the encryption
-    BIO_ctrl(b64,BIO_CTRL_FLUSH,0,nil)
-    fclose(fd)
-    close(pipes[1])
-    BIO_free_all(b64)
-
-    // read encoded data from pipeline and split ascii text 
-    // into lines of 80 chars per line as defined in RFC 822
-    let line = 78
-
-    var longStr = ""
-    buf.withUnsafeBufferPointer{ pBuf in
-      let pRaw = unsafeBitCast(pBuf.baseAddress, to: UnsafeMutableRawPointer.self)
-      repeat {
-        memset(pRaw, 0, size)
-        received = read(pipes[0], pRaw, line)
-        if received > 0 {
-          let str = String(cString: buf) + "\r\n"
-          longStr += str
-        }//end if
-      }while(received >= line)
-    }//end buf
-    close(pipes[0])
-    return longStr
+  private func encode(path: String) throws -> String? {
+    let fd = File(path)
+    try fd.open(.read)
+    guard let buffer = try fd.readSomeBytes(count: fd.size).encode(.base64) else {
+      fd.close()
+      throw SMTPError.INVALID_ENCRYPTION
+    }//end let
+    if self.debug {
+      print("encode \(fd.size) -> \(buffer.count)")
+    }//end if
+    var wraped = [UInt8]()
+    let szline = 78
+    var cursor = 0
+    let newline:[UInt8] = [13, 10]
+    while cursor < buffer.count {
+      var mark = cursor + szline
+      if mark >= buffer.count {
+        mark = buffer.count
+      }//end if
+      wraped.append(contentsOf: buffer[cursor ..< mark])
+      wraped.append(contentsOf: newline)
+      cursor += szline
+    }//end while
+    fd.close()
+    wraped.append(0)
+    return String(validatingUTF8: wraped)
   }//end encode
 
   /// send an email with the current settings
@@ -356,8 +311,8 @@ public struct EMail {
     // print a timestamp to the email
     var timestamp = time(nil)
     let now = String(cString: asctime(localtime(&timestamp))!)
-    var body = "Date: \(now)"
-
+    self.body = "Date: \(now)"
+    progress = 0
     // add the "To: " section
     if to.count > 0 {
       body += String(prefix: "To", recipients: to)
@@ -418,6 +373,10 @@ public struct EMail {
     // load the curl object
     let curl = CURL(url: client.url)
 
+    if self.debug {
+      let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
+    }//end if
+    
     // TO FIX: ssl requires a certificate, how to get one???
     if client.url.lowercased().hasPrefix("smtps") {
       let _ = curl.setOption(CURLOPT_USE_SSL, int: Int(CURLUSESSL_ALL.rawValue))
@@ -446,22 +405,44 @@ public struct EMail {
     // set the mime size
     let _ = curl.setOption(CURLOPT_INFILESIZE, int: body.utf8.count)
 
-    // get the file pointer from body string
-    let data = body.asFILE
-    guard data != nil else {
-      throw SMTPError.INVALID_BUFFER
-    }//end guard
+    let me = Unmanaged<AnyObject>.passRetained(self as AnyObject).toOpaque()
 
-    let _ = curl.setOption(CURLOPT_READFUNCTION, f: {  fread($0, $1, $2, unsafeBitCast($3, to: UnsafeMutablePointer<FILE>.self)) })
-    let _ = curl.setOption(CURLOPT_READDATA, v: data!)
+    let _ = curl.setOption(CURLOPT_READFUNCTION, f: { target, sz, items, opaque in
+      guard let pointer = opaque else {
+        print("curl callback failed")
+        return 0
+      }//end guard
+
+      let this = Unmanaged<EMail>.fromOpaque(pointer).takeUnretainedValue()
+
+      let szblock = sz * items;
+
+      let remain = this.body.utf8.count - this.progress
+      if remain <= 0 {
+        print("return 0")
+        return 0
+      }//end if
+      let result = this.body.withCString { ptr -> Int in
+        let size = remain > szblock ? szblock : remain
+        memcpy(target, ptr.advanced(by: this.progress), size)
+        return size
+      }//end with
+      this.progress += result
+      return result
+    })
+
+    let _ = curl.setOption(CURLOPT_READDATA, v: me)
 
     // asynchronized calling
     Threading.dispatch {
       let r = curl.performFully() 
       //release pipeline
-      fclose(data)
       //callback
-      completion(r.0, String(cString: r.1), String(cString: r.2))
+      var r1 = r.1
+      r1.append(0)
+      var r2 = r.2
+      r2.append(0)
+      completion(r.0, String(cString: r1), String(cString: r2))
     }//end perform
   }//end send
 }//end class
