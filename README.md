@@ -153,7 +153,7 @@ A demo can be found here:
 
 ## Tips for SMTPS
 
-We've received a lot of requests about google smtp examples, Thanks for @ucotta @james and of course the official Perfect support from @iamjono, this note might be helpful for building gmail applications: ⚠️*the SMTPClient url needs to be `smtps://smtp.gmail.com`, and you may need to “turn on access for less secure apps” in the google settings.*⚠️
+We've received a lot of requests about google smtp examples, Thanks for @ucotta @james and of course the official Perfect support from @iamjono, this note might be helpful for building gmail applications: ⚠️*the SMTPClient url needs to be `smtps://smtp.gmail.com`, and you may need to [“turn on access for less secure apps”](https://myaccount.google.com/lesssecureapps) in the google settings.*⚠️
 
 Please check the SMTPS code below, note the only difference is the URL pattern:
 
