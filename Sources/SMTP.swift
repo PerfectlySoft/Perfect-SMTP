@@ -199,7 +199,7 @@ public class EMail {
 
   /// email content body
   public var content: String = ""
-  
+
   // text version, to be added with a html version.
   public var text: String = ""
 
@@ -375,8 +375,9 @@ public class EMail {
 
     if self.debug {
       let _ = curl.setOption(CURLOPT_VERBOSE, int: 1)
+      let _ = curl.setOption(CURLOPT_HEADER, int: 1)
     }//end if
-    
+
     // TO FIX: ssl requires a certificate, how to get one???
     if client.url.lowercased().hasPrefix("smtps") {
       let _ = curl.setOption(CURLOPT_USE_SSL, int: Int(CURLUSESSL_ALL.rawValue))
@@ -439,7 +440,7 @@ public class EMail {
 
     // asynchronized calling
     Threading.dispatch {
-      let r = curl.performFully() 
+      let r = curl.performFully()
       //release pipeline
       //callback
       var r1 = r.1
