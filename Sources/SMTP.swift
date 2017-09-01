@@ -345,9 +345,11 @@ public class EMail {
     }//end if
 
     // add the uuid of the email to avoid duplicated shipment
-    let uuid = UUID().string
+    var uuidBuf = UUID().string.encode(.base64) ?? []
+    uuidBuf.append(0)
+    let uuid = String(cString: uuidBuf)
 
-    body += "Message-ID: <\(uuid)\(from.address.emailSuffix)>\r\n"
+    body += "Message-ID: <\(uuid).\(from.address)>\r\n"
 
     // add the email title
     if subject.isEmpty {
