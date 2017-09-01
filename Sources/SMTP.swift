@@ -349,7 +349,7 @@ public class EMail {
     uuidBuf.append(0)
     let uuid = String(cString: uuidBuf)
 
-    body += "Message-ID: <\(uuid).\(from.address)>\r\n"
+    body += "Message-ID: <\(uuid)\(from.address.emailSuffix)>\r\n"
 
     // add the email title
     if subject.isEmpty {
