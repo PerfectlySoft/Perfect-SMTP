@@ -96,10 +96,10 @@ public struct SMTPClient {
 public struct Recipient {
 
   /// Full Name
-  var name = ""
+  public var name = ""
 
   /// email address, nickname@some.where
-  var address = ""
+  public var address = ""
 
   /// constructor
   /// - parameters:
