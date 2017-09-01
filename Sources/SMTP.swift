@@ -24,6 +24,8 @@
   import Darwin
 #endif
 
+import Foundation
+
 import PerfectThread
 
 /// Header for CURL options macro
@@ -111,6 +113,15 @@ public struct Recipient {
 
 /// string extension for express conversion from recipient, etc.
 extension String {
+
+  /// get RFC 5322-compliant date for email
+  public static var rfc5322Date: String {
+    let dateFormatter = DateFormatter()
+    dateFormatter.locale = Locale.current
+    dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+    let compliantDate = dateFormatter.string(from: Date())
+    return compliantDate
+  }
 
   /// convert a recipient to standard email format: "Full Name"<nickname@some.where>
   /// - parameters:
@@ -308,10 +319,7 @@ public class EMail {
       throw SMTPError.INVALID_RECIPIENT
     }//end guard
 
-    // print a timestamp to the email
-    var timestamp = time(nil)
-    let now = String(cString: asctime(localtime(&timestamp))!)
-    self.body = "Date: \(now)"
+    self.body = "Date: (String.rfc5322Date)\r\n"
     progress = 0
     // add the "To: " section
     if to.count > 0 {
