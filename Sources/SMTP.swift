@@ -319,7 +319,7 @@ public class EMail {
       throw SMTPError.INVALID_RECIPIENT
     }//end guard
 
-    self.body = "Date: (String.rfc5322Date)\r\n"
+    self.body = "Date: \(String.rfc5322Date)\r\n"
     progress = 0
     // add the "To: " section
     if to.count > 0 {
