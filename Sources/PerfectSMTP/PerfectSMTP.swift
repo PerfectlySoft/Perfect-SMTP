@@ -155,7 +155,7 @@ extension String {
   /// get the address info from a recipient, i.e, someone@somewhere -> @somewhere
   public var emailSuffix: String {
     get {
-      guard let at = self.characters.index(of: "@") else {
+      guard let at = self.index(of: "@") else {
         return self
       }//end at
       return self[at..<self.endIndex]
@@ -165,7 +165,7 @@ extension String {
   /// extract file name from a full path
   public var fileNameWithoutPath: String {
     get {
-      let segments = self.characters.split(separator: "/")
+      let segments = self.split(separator: "/")
       return String(segments[segments.count - 1])
     }//end get
   }//end fileNameWithoutPath
@@ -173,7 +173,7 @@ extension String {
   /// extract file suffix from a file name
   public var suffix: String {
     get {
-      let segments = self.characters.split(separator: ".")
+      let segments = self.split(separator: ".")
       return String(segments[segments.count - 1])
     }//end get
   }//end suffix
