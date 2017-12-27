@@ -23,7 +23,7 @@
 
 <p align="center">
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-3.0-orange.svg?style=flat" alt="Swift 3.0">
+        <img src="https://img.shields.io/badge/Swift-4.0-orange.svg?style=flat" alt="Swift 4.0">
     </a>
     <a href="https://developer.apple.com/swift/" target="_blank">
         <img src="https://img.shields.io/badge/Platforms-OS%20X%20%7C%20Linux%20-lightgray.svg?style=flat" alt="Platforms OS X | Linux">
@@ -45,7 +45,7 @@ This project provides an SMTP library.
 
 This package builds with Swift Package Manager and is part of the [Perfect](https://github.com/PerfectlySoft/Perfect) project.
 
-Ensure you have installed and activated the latest Swift 3.0 tool chain.
+Ensure you have installed and activated the latest Swift 4.0.3 tool chain.
 
 ## Linux Build Note
 
@@ -54,12 +54,20 @@ Please make sure libssl-dev was installed on Ubuntu 16.04:
 ```
 $ sudo apt-get install libssl-dev
 ```
+
+## The Best Practice
+
+Prior to code with Perfect-SMTP, please feel free to try [SMTP command line example by curl](https://ec.haxx.se/usingcurl-smtp.html).
+
+This command line tool can be helpful to understand the SMTP protocol and the objective server you are going to work with.
+
+
 ## Quick Start
 
 To use SMTP class, please modify the Package.swift file and add following dependency:
 
 ``` swift
-.Package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", majorVersion: 1, minor: 0)
+.Package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", majorVersion: 3)
 ```
 
 Then please import SMTP library into the swift source code:
