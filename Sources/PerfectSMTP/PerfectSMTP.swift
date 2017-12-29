@@ -81,14 +81,14 @@ public struct SMTPClient {
   public var password = ""
     
   /// upgrade connection to use TLS
-  public var requiresTLSUpgrade
+  public var requiresTLSUpgrade = false
 
   /// constructor
   /// - parameters:
   ///   - url: String, smtp://somewhere or smtps://someelsewhere
   ///   - username: String, user@somewhere
   ///   - password: String
-  public init(url: String = "", username: String = "", password: String = "", requiresTLSUpgrade = false) {
+  public init(url: String = "", username: String = "", password: String = "", requiresTLSUpgrade: Bool = false) {
     self.url = url
     self.username = username
     self.password = password
@@ -391,7 +391,7 @@ public class EMail {
 
     // TO FIX: ssl requires a certificate, how to get one???
     if client.url.lowercased().hasPrefix("smtps")
-        || (client.url.lowercased().hasPrefix("smtp") && self.requiresTLSUpgrade) {
+        || (client.url.lowercased().hasPrefix("smtp") && client.requiresTLSUpgrade) {
       let _ = curl.setOption(CURLOPT_USE_SSL, int: Int(CURLUSESSL_ALL.rawValue))
 
       // otherwise just non-secured smtp protocol
