@@ -391,7 +391,7 @@ public class EMail {
 
     // TO FIX: ssl requires a certificate, how to get one???
     if client.url.lowercased().hasPrefix("smtps")
-        || (client.url.lowercased().hasPrefix("smtp") && client.requiresTLSUpgrade) {
+        || client.requiresTLSUpgrade {
       let _ = curl.setOption(CURLOPT_USE_SSL, int: Int(CURLUSESSL_ALL.rawValue))
 
       // otherwise just non-secured smtp protocol
