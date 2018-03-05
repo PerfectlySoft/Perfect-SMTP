@@ -341,6 +341,9 @@ public class EMail {
 			.upload(EmailBodyGen(body)),
 			.connectTimeout(connectTimeoutSeconds)]
 		options.append(contentsOf: recipients.map { .mailRcpt($0.address) })
+		if client.url.lowercased().hasPrefix("smtps") || client.requiresTLSUpgrade {
+			options.append(.useSSL)
+		}
 		do {
 			let request = CURLRequest(client.url, options: options)
 			let response = try request.perform()
