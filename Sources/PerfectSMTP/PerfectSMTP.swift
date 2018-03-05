@@ -193,6 +193,7 @@ public class EMail {
 		get { return content }
 		set { content = newValue }
 	}
+	public var connectTimeoutSeconds: Int = 15
 	/// for debugging purposes
 	public var debug = false
 	
@@ -334,11 +335,11 @@ public class EMail {
 			throw SMTPError.INVALID_RECIPIENT
 		}
 		let body = try makeBody()
-		var options: [CURLRequest.Option] = (debug ? [.verbose] : []) +
-			[
+		var options: [CURLRequest.Option] = (debug ? [.verbose] : []) + [
 			.mailFrom(from.address),
 			.userPwd("\(client.username):\(client.password)"),
-			.upload(EmailBodyGen(body))]
+			.upload(EmailBodyGen(body)),
+			.connectTimeout(connectTimeoutSeconds)]
 		options.append(contentsOf: recipients.map { .mailRcpt($0.address) })
 		do {
 			let request = CURLRequest(client.url, options: options)
