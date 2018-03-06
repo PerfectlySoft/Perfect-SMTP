@@ -314,7 +314,7 @@ public class EMail {
 				body += "--\(boundary)\r\nContent-Type: text/plain; charset=UTF-8; format=flowed\r\n\r\n\(text)\r\n\r\n"
 			}
 			if !content.isEmpty {
-				body += "--\(boundary)\r\nContent-Type: text/html;charset=UTF-8\r\n\r\n\(content)\r\n\r\n"
+				body += "--\(boundary)\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\(content)\r\n\r\n"
 			}
 		}
 		// add the attachements
@@ -343,24 +343,20 @@ public class EMail {
 		return try request.perform()
 	}
 	
-	public func send() throws {
-		let response = try getResponse()
-		let code = response.responseCode
-		guard code > 199 && code < 300 else {
-			throw SMTPError.general(code, response.bodyString)
-		}
-	}
-	
 	/// send an email with the current settings
 	/// - parameters:
 	///   - completion: once sent, callback to the main thread with curl code, header & body string
 	/// - throws:
 	/// SMTPErrors
-	public func send(completion: @escaping ((Int, String, String) -> Void)) throws {
+	public func send(completion: ((Int, String, String) -> ())? = nil) throws {
 		let response = try getResponse()
 		let code = response.responseCode
-		let body = response.bodyString
-		completion(code, "", body)
+		if let c = completion {
+			return c(code, "", response.bodyString)
+		}
+		guard code > 199 && code < 300 else {
+			throw SMTPError.general(code, response.bodyString)
+		}
 	}
 }
 
