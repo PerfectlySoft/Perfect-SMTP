@@ -38,6 +38,8 @@ public enum SMTPError:Error {
 	case INVALID_PROTOCOL
 	/// base64 failed
 	case INVALID_ENCRYPTION
+	
+	case general(Int, String)
 }
 
 /// SMTP login structure
@@ -63,7 +65,7 @@ public struct SMTPClient {
 	}
 }
 
-/// email receiver format, "Full Name"<nickname@some.where>
+/// email receiver format, "Full Name" <nickname@some.where>
 public struct Recipient {
 	/// Full Name
 	public var name = ""
@@ -322,15 +324,8 @@ public class EMail {
 		return body
 	}
 	
-	/// send an email with the current settings
-	/// - parameters:
-	///   - completion: once sent, callback to the main thread with curl code, header & body string
-	/// - throws:
-	/// SMTPErrors
-	public func send(completion: @escaping ((Int, String, String) -> Void)) throws {
-		// merge all recipients
+	private func getResponse() throws -> CURLResponse {
 		let recipients = to + cc + bcc
-		// validate recipients
 		guard recipients.count > 0 else {
 			throw SMTPError.INVALID_RECIPIENT
 		}
@@ -344,13 +339,28 @@ public class EMail {
 		if client.url.lowercased().hasPrefix("smtps") || client.requiresTLSUpgrade {
 			options.append(.useSSL)
 		}
-		do {
-			let request = CURLRequest(client.url, options: options)
-			let response = try request.perform()
-			let code = response.responseCode
-			let body = response.bodyString
-			completion(code, "", body)
+		let request = CURLRequest(client.url, options: options)
+		return try request.perform()
+	}
+	
+	public func send() throws {
+		let response = try getResponse()
+		let code = response.responseCode
+		guard code > 199 && code < 300 else {
+			throw SMTPError.general(code, response.bodyString)
 		}
+	}
+	
+	/// send an email with the current settings
+	/// - parameters:
+	///   - completion: once sent, callback to the main thread with curl code, header & body string
+	/// - throws:
+	/// SMTPErrors
+	public func send(completion: @escaping ((Int, String, String) -> Void)) throws {
+		let response = try getResponse()
+		let code = response.responseCode
+		let body = response.bodyString
+		completion(code, "", body)
 	}
 }
 
