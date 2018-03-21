@@ -1,6 +1,6 @@
 import PackageDescription
 #if os(Linux)
-import Glibc
+import SwiftGlibc
 #else
 import Darwin
 #endif
