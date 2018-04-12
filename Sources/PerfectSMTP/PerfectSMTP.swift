@@ -162,7 +162,7 @@ private struct EmailBodyGen: CURLRequestBodyGenerator {
 		guard remaining > 0 else {
 			return nil
 		}
-		let ret = Array(bytes[offset..<min(byteCount, remaining)])
+		let ret = Array(bytes[offset..<(offset + min(byteCount, remaining))])
 		offset += ret.count
 		return ret
 	}
