@@ -1,16 +1,12 @@
+// swift-tools-version:4.0
 import PackageDescription
-#if os(Linux)
-import SwiftGlibc
-#else
-import Darwin
-#endif
-var url = "https://github.com/PerfectlySoft/Perfect-CURL.git"
-if let urlenv = getenv("URL_PERFECT_CURL") {
-    url = String(cString: urlenv)
-}
-let package = Package(
-    name: "PerfectSMTP",
+let package = Package(name: "PerfectSMTP", 
+	products: [.library(name: "PerfectSMTP",targets: ["PerfectSMTP"]),],
     dependencies: [
-    .Package(url: url, majorVersion: 3)
-  ]
-)
+		.package(url: "https://github.com/PerfectlySoft/Perfect-CURL.git", .branch("master")),
+	],
+    targets: [
+        .target(
+            name: "PerfectSMTP",
+            dependencies: ["PerfectCURL"]),
+    ])
