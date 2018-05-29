@@ -23,7 +23,7 @@
 
 <p align="center">
     <a href="https://developer.apple.com/swift/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-4.0-orange.svg?style=flat" alt="Swift 4.0">
+        <img src="https://img.shields.io/badge/Swift-4.1-orange.svg?style=flat" alt="Swift 4.1">
     </a>
     <a href="https://developer.apple.com/swift/" target="_blank">
         <img src="https://img.shields.io/badge/Platforms-OS%20X%20%7C%20Linux%20-lightgray.svg?style=flat" alt="Platforms OS X | Linux">
@@ -47,7 +47,7 @@
 
 该软件使用SPM进行编译和测试，本软件也是[Perfect](https://github.com/PerfectlySoft/Perfect)项目的一部分。
 
-请确保您已经安装并激活了最新版本的 Swift 4.0.3 tool chain 工具链。
+请确保您已经安装并激活了最新版本的 Swift 4.1.1 tool chain 工具链。
 
 ## Linux 编译注意事项
 
@@ -69,7 +69,7 @@ $ sudo apt-get install libssl-dev
 使用 SMTP 库函数之前，请首先修改您的项目 Package.swift 文件并增加如下依存关系：
 
 ``` swift
-.Package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", majorVersion: 3)
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", .branch("master"))
 ```
 
 随后在源代码开始部分增加导入说明：

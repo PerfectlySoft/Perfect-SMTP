@@ -126,7 +126,11 @@ extension String {
 			guard let at = index(of: "@") else {
 				return self
 			}
-			return self[at..<endIndex]
+			#if swift(>=4.1)
+				return String(self[at..<endIndex])
+			#else
+				return self[at..<endIndex]
+			#endif
 		}
 	}
 	
