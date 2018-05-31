@@ -300,7 +300,7 @@ public class EMail {
 			body += String(prefix: "Bcc", recipients: bcc)
 		}
 		// add the uuid of the email to avoid duplicated shipment
-		let uuid = UUID().string
+		let uuid = UUID().uuidString
 		body += "Message-ID: <\(uuid).Perfect-SMTP\(from.address.emailSuffix)>\r\n"
 		// add the email title
 		if subject.isEmpty {

@@ -69,7 +69,7 @@ $ sudo apt-get install libssl-dev
 使用 SMTP 库函数之前，请首先修改您的项目 Package.swift 文件并增加如下依存关系：
 
 ``` swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", .branch("master"))
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "3.0.0")
 ```
 
 随后在源代码开始部分增加导入说明：
@@ -188,14 +188,6 @@ do {
   /// something wrong
 }
 ```
-
-## 问题报告、内容贡献和客户支持
-
-我们目前正在过渡到使用JIRA来处理所有源代码资源合并申请、修复漏洞以及其它有关问题。因此，GitHub 的“issues”问题报告功能已经被禁用了。
-
-如果您发现了问题，或者希望为改进本文提供意见和建议，[请在这里指出](http://jira.perfect.org:8080/servicedesk/customer/portal/1).
-
-在您开始之前，请参阅[目前待解决的问题清单](http://jira.perfect.org:8080/projects/ISS/issues).
 
 ## 更多信息
 关于本项目更多内容，请参考[perfect.org](http://perfect.org).

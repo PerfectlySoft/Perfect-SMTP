@@ -67,7 +67,7 @@ This command line tool can be helpful to understand the SMTP protocol and the ob
 To use SMTP class, please modify the Package.swift file and add following dependency:
 
 ``` swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", .branch("master"))
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "3.0.0")
 ```
 
 Then please import SMTP library into the swift source code:
