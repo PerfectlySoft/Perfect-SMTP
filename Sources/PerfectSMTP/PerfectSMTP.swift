@@ -83,6 +83,13 @@ public struct Recipient {
 
 /// string extension for express conversion from recipient, etc.
 extension String {
+    func base64Encoded() -> String? {
+        if let data = self.data(using: .utf8) {
+            return data.base64EncodedString()
+        }
+        return nil
+    }
+    
 	/// get RFC 5322-compliant date for email
 	static var rfc5322Date: String {
 		let dateFormatter = DateFormatter()
@@ -100,7 +107,11 @@ extension String {
 		if recipient.name.isEmpty {
 			self = recipient.address
 		} else {
-			self = "\"\(recipient.name)\" <\(recipient.address)>"
+            if let recipientNameB64 = recipient.name.base64Encoded() {
+                self = "=?utf-8?B?\(recipientNameB64)?= <\(recipient.address)>"
+            } else {
+                self = "\"\(recipient.name)\" <\(recipient.address)>"
+            }
 		}
 	}
 	
