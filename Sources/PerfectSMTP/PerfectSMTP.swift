@@ -210,6 +210,7 @@ public class EMail {
 		get { return content }
 		set { content = newValue }
 	}
+    public var reference : String = ""
 	public var connectTimeoutSeconds: Int = 15
 	/// for debugging purposes
 	public var debug = false
@@ -287,7 +288,7 @@ public class EMail {
 		return String(validatingUTF8: wraped)
 	}
 	
-	private func makeBody() throws -> String {
+	private func makeBody() throws -> (String, String) {
 		// !FIX! quoted printable?
 		var body = "Date: \(String.rfc5322Date)\r\n"
 		progress = 0
@@ -313,6 +314,11 @@ public class EMail {
 		// add the uuid of the email to avoid duplicated shipment
 		let uuid = UUID().uuidString
 		body += "Message-ID: <\(uuid).Perfect-SMTP\(from.address.emailSuffix)>\r\n"
+        if reference != "" {
+            body += "In-Reply-To: \(reference)\r\n"
+            body += "References: \(reference)\r\n"
+        }
+        
 		// add the email title
 		if subject.isEmpty {
 			throw SMTPError.INVALID_SUBJECT
@@ -336,15 +342,15 @@ public class EMail {
 		body += attachments.map { attach(path: $0, mimeType: MimeType.forExtension($0.suffix)) }.joined(separator: "\r\n")
 		// end of the attachements
 		body += "--\(boundary)--\r\n"
-		return body
+		return (body, uuid)
 	}
 	
-	private func getResponse() throws -> CURLResponse {
+    private func getResponse(_ body : String) throws -> CURLResponse {
 		let recipients = to + cc + bcc
 		guard recipients.count > 0 else {
 			throw SMTPError.INVALID_RECIPIENT
 		}
-		let body = try makeBody()
+//        let (body, uuid) = try makeBody()
 		var options: [CURLRequest.Option] = (debug ? [.verbose] : []) + [
 			.mailFrom(from.address),
 			.userPwd("\(client.username):\(client.password)"),
@@ -355,7 +361,10 @@ public class EMail {
 			options.append(.useSSL)
 		}
 		let request = CURLRequest(client.url, options: options)
-		return try request.perform()
+        
+        let response = try request.perform()
+//        response.bodyJSON["uuid"] = uuid
+        return response
 	}
 	
 	/// send an email with the current settings
@@ -364,10 +373,11 @@ public class EMail {
 	/// - throws:
 	/// SMTPErrors
 	public func send(completion: ((Int, String, String) -> ())? = nil) throws {
-		let response = try getResponse()
+        let (body, uuid) = try makeBody()
+		let response = try getResponse(body)
 		let code = response.responseCode
 		if let c = completion {
-			return c(code, "", response.bodyString)
+			return c(code, uuid, response.bodyString)
 		}
 		guard code > 199 && code < 300 else {
 			throw SMTPError.general(code, response.bodyString)
