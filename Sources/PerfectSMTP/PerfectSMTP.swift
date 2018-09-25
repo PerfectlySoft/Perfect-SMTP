@@ -361,10 +361,7 @@ public class EMail {
 			options.append(.useSSL)
 		}
 		let request = CURLRequest(client.url, options: options)
-        
-        let response = try request.perform()
-//        response.bodyJSON["uuid"] = uuid
-        return response
+        return try request.perform()
 	}
 	
 	/// send an email with the current settings
