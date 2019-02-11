@@ -20,7 +20,8 @@
 import Foundation
 import PerfectCURL
 import PerfectLib
-import PerfectHTTP
+import PerfectCrypto
+import PerfectMIME
 
 /// SMTP Common Errors
 public enum SMTPError:Error {
@@ -83,13 +84,13 @@ public struct Recipient {
 
 /// string extension for express conversion from recipient, etc.
 extension String {
-    func base64Encoded() -> String? {
-        if let data = self.data(using: .utf8) {
-            return data.base64EncodedString()
-        }
-        return nil
-    }
-    
+	func base64Encoded() -> String? {
+		if let data = self.data(using: .utf8) {
+			return data.base64EncodedString()
+		}
+		return nil
+	}
+	
 	/// get RFC 5322-compliant date for email
 	static var rfc5322Date: String {
 		let dateFormatter = DateFormatter()
@@ -107,11 +108,11 @@ extension String {
 		if recipient.name.isEmpty {
 			self = recipient.address
 		} else {
-            if let recipientNameB64 = recipient.name.base64Encoded() {
-                self = "=?utf-8?B?\(recipientNameB64)?= <\(recipient.address)>"
-            } else {
-                self = "\"\(recipient.name)\" <\(recipient.address)>"
-            }
+			if let recipientNameB64 = recipient.name.base64Encoded() {
+				self = "=?utf-8?B?\(recipientNameB64)?= <\(recipient.address)>"
+			} else {
+				self = "\"\(recipient.name)\" <\(recipient.address)>"
+			}
 		}
 	}
 	
@@ -138,9 +139,9 @@ extension String {
 				return self
 			}
 			#if swift(>=4.0)
-				return String(self[at..<endIndex])
+			return String(self[at..<endIndex])
 			#else
-				return self[at..<endIndex]
+			return self[at..<endIndex]
 			#endif
 		}
 	}
@@ -200,7 +201,7 @@ public class EMail {
 	/// title of the email
 	public var subject: String = ""
 	/// attachements of the mail - file name with full path
-	public var attachments:[String] = []
+	public var attachments: [String] = []
 	/// email content body
 	public var content: String = ""
 	// text version, to be added with a html version.
@@ -210,7 +211,7 @@ public class EMail {
 		get { return content }
 		set { content = newValue }
 	}
-    public var reference : String = ""
+	public var reference: String = ""
 	public var connectTimeoutSeconds: Int = 15
 	/// for debugging purposes
 	public var debug = false
@@ -314,11 +315,11 @@ public class EMail {
 		// add the uuid of the email to avoid duplicated shipment
 		let uuid = UUID().uuidString
 		body += "Message-ID: <\(uuid).Perfect-SMTP\(from.address.emailSuffix)>\r\n"
-        if reference != "" {
-            body += "In-Reply-To: \(reference)\r\n"
-            body += "References: \(reference)\r\n"
-        }
-        
+		if reference != "" {
+			body += "In-Reply-To: \(reference)\r\n"
+			body += "References: \(reference)\r\n"
+		}
+		
 		// add the email title
 		if subject.isEmpty {
 			throw SMTPError.INVALID_SUBJECT
@@ -339,18 +340,17 @@ public class EMail {
 			}
 		}
 		// add the attachements
-		body += attachments.map { attach(path: $0, mimeType: MimeType.forExtension($0.suffix)) }.joined(separator: "\r\n")
+		body += attachments.map { attach(path: $0, mimeType: MIMEType.forExtension($0.suffix)) }.joined(separator: "\r\n")
 		// end of the attachements
 		body += "--\(boundary)--\r\n"
 		return (body, uuid)
 	}
 	
-    private func getResponse(_ body : String) throws -> CURLResponse {
+	private func getResponse(_ body : String) throws -> CURLResponse {
 		let recipients = to + cc + bcc
 		guard recipients.count > 0 else {
 			throw SMTPError.INVALID_RECIPIENT
 		}
-//        let (body, uuid) = try makeBody()
 		var options: [CURLRequest.Option] = (debug ? [.verbose] : []) + [
 			.mailFrom(from.address),
 			.userPwd("\(client.username):\(client.password)"),
@@ -361,7 +361,7 @@ public class EMail {
 			options.append(.useSSL)
 		}
 		let request = CURLRequest(client.url, options: options)
-        return try request.perform()
+		return try request.perform()
 	}
 	
 	/// send an email with the current settings
@@ -370,7 +370,7 @@ public class EMail {
 	/// - throws:
 	/// SMTPErrors
 	public func send(completion: ((Int, String, String) -> ())? = nil) throws {
-        let (body, uuid) = try makeBody()
+		let (body, uuid) = try makeBody()
 		let response = try getResponse(body)
 		let code = response.responseCode
 		if let c = completion {
