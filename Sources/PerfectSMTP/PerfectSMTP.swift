@@ -324,7 +324,11 @@ public class EMail {
 		if subject.isEmpty {
 			throw SMTPError.INVALID_SUBJECT
 		} else {
-			body += "Subject: =?UTF-8?Q?\(subject)?=\r\n"
+			if let subjectB64 = subject.base64Encoded() {
+				body += "Subject: =?utf-8?B?\(subjectB64)?=\r\n"
+			} else {
+				body += "Subject: =?utf-8?Q?\(subject)?=\r\n"
+			}
 		}
 		// mark the content type
 		body += "MIME-Version: 1.0\r\nContent-type: multipart/alternative; boundary=\"\(boundary)\"\r\n\r\n"
