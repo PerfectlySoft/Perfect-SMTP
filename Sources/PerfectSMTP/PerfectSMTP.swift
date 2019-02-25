@@ -247,7 +247,7 @@ public class EMail {
 				print("\(data.utf8.count) bytes attached")
 			}
 			// pack it up to an MIME part
-			return "--\(boundary)\r\nContent-Type: text/plain; name=\"\(file)\"\r\n"
+			return "--\(boundary)\r\nContent-Type: \(mimeType); name=\"\(file)\"\r\n"
 				+ "Content-Transfer-Encoding: base64\r\n"
 				+ "Content-Disposition: attachment; filename=\"\(file)\"\r\n\r\n\(data)\r\n"
 		} catch {
