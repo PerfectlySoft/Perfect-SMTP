@@ -243,13 +243,14 @@ public class EMail {
 			guard let data = try encode(path: path) else {
 				return ""
 			}
+			let disposition = "attachment"
 			if self.debug {
 				print("\(data.utf8.count) bytes attached")
 			}
 			// pack it up to an MIME part
 			return "--\(boundary)\r\nContent-Type: \(mimeType); name=\"\(file)\"\r\n"
 				+ "Content-Transfer-Encoding: base64\r\n"
-				+ "Content-Disposition: attachment; filename=\"\(file)\"\r\n\r\n\(data)\r\n"
+				+ "Content-Disposition: \(disposition); filename=\"\(file)\"\r\n\r\n\(data)"
 		} catch {
 			return ""
 		}
@@ -259,7 +260,7 @@ public class EMail {
 	/// - parameters:
 	///   - path: full path of the file to encode
 	/// - returns:
-	/// base64 encoded text
+	/// base64 encoded text WITH A TRAILING NEWLINE
 	@discardableResult
 	private func encode(path: String) throws -> String? {
 		let fd = File(path)
@@ -272,7 +273,7 @@ public class EMail {
 			print("encode \(fd.size) -> \(buffer.count)")
 		}
 		var wraped = [UInt8]()
-		let szline = 78
+		let szline = 76
 		var cursor = 0
 		let newline:[UInt8] = [13, 10]
 		while cursor < buffer.count {
@@ -331,20 +332,28 @@ public class EMail {
 			}
 		}
 		// mark the content type
-		body += "MIME-Version: 1.0\r\nContent-type: multipart/alternative; boundary=\"\(boundary)\"\r\n\r\n"
+		body += "MIME-Version: 1.0\r\nContent-type: multipart/mixed; boundary=\"\(boundary)\"\r\n\r\n"
 		// add the html / plain text content body
-		if content.isEmpty && text.isEmpty {
+		guard  !(content.isEmpty && text.isEmpty) else {
 			throw SMTPError.INVALID_CONTENT
+		}
+		let alternative = !content.isEmpty && !text.isEmpty
+		if alternative {
+			let boundary2 = boundary + "-2"
+			body += "--\(boundary)\r\nContent-Type: multipart/alternative; boundary=\(boundary2)\r\n\r\n"
+			body += "--\(boundary2)\r\nContent-Type: text/plain; charset=UTF-8; format=flowed\r\n\r\n\(text)\r\n"
+			body += "--\(boundary2)\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\(content)\r\n"
+			body += "--\(boundary2)--\r\n"
 		} else {
 			if !text.isEmpty {
-				body += "--\(boundary)\r\nContent-Type: text/plain; charset=UTF-8; format=flowed\r\n\r\n\(text)\r\n\r\n"
+				body += "--\(boundary)\r\nContent-Type: text/plain; charset=UTF-8; format=flowed\r\n\r\n\(text)\r\n"
 			}
 			if !content.isEmpty {
-				body += "--\(boundary)\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\(content)\r\n\r\n"
+				body += "--\(boundary)\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\(content)\r\n"
 			}
 		}
 		// add the attachements
-		body += attachments.map { attach(path: $0, mimeType: MIMEType.forExtension($0.suffix)) }.joined(separator: "\r\n")
+		body += attachments.map { attach(path: $0, mimeType: MIMEType.forExtension($0.suffix)) }.joined(separator: "")
 		// end of the attachements
 		body += "--\(boundary)--\r\n"
 		return (body, uuid)
