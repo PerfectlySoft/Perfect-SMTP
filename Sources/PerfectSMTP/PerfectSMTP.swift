@@ -250,7 +250,7 @@ public class EMail {
 			// pack it up to an MIME part
 			return "--\(boundary)\r\nContent-Type: \(mimeType); name=\"\(file)\"\r\n"
 				+ "Content-Transfer-Encoding: base64\r\n"
-				+ "Content-Disposition: \(disposition); filename=\"\(file)\"\r\n\r\n\(data)"
+				+ "Content-Disposition: \(disposition); filename=\"\(file)\"\r\n\r\n\(data)\r\n"
 		} catch {
 			return ""
 		}
@@ -332,7 +332,7 @@ public class EMail {
 			}
 		}
 		// mark the content type
-		body += "MIME-Version: 1.0\r\nContent-type: multipart/mixed; boundary=\"\(boundary)\"\r\n\r\n"
+		body += "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"\(boundary)\"\r\n\r\n"
 		// add the html / plain text content body
 		guard  !(content.isEmpty && text.isEmpty) else {
 			throw SMTPError.INVALID_CONTENT
