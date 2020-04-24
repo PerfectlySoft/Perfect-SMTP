@@ -39,7 +39,7 @@ public enum SMTPError:Error {
 	case INVALID_PROTOCOL
 	/// base64 failed
 	case INVALID_ENCRYPTION
-	
+
 	case general(Int, String)
 }
 
@@ -90,7 +90,7 @@ extension String {
 		}
 		return nil
 	}
-	
+
 	/// get RFC 5322-compliant date for email
 	static var rfc5322Date: String {
 		let dateFormatter = DateFormatter()
@@ -99,7 +99,7 @@ extension String {
 		let compliantDate = dateFormatter.string(from: Date())
 		return compliantDate
 	}
-	
+
 	/// convert a recipient to standard email format: "Full Name"<nickname@some.where>
 	/// - parameters:
 	///   - recipient: the email receiver name / address structure
@@ -115,14 +115,14 @@ extension String {
 			}
 		}
 	}
-	
+
 	/// convert a group of recipients into an address list, joined by comma
 	/// - parameters:
 	///   - recipients: array of recipient
 	init(recipients: [Recipient]) {
 		self = recipients.map{String(recipient: $0)}.joined(separator: ", ")
 	}
-	
+
 	/// MIME mail header: To/Cc/Bcc + recipients
 	/// - parameters:
 	///   - prefix: To / Cc or Bcc
@@ -131,7 +131,7 @@ extension String {
 		let r = String(recipients: recipients)
 		self = "\(prefix): \(r)\r\n"
 	}
-	
+
 	/// get the address info from a recipient, i.e, someone@somewhere -> @somewhere
 	var emailSuffix: String {
 		get {
@@ -145,7 +145,7 @@ extension String {
 			#endif
 		}
 	}
-	
+
 	/// extract file name from a full path
 	var fileNameWithoutPath: String {
 		get {
@@ -153,7 +153,7 @@ extension String {
 			return String(segments[segments.count - 1])
 		}
 	}
-	
+
 	/// extract file suffix from a file name
 	var suffix: String {
 		get {
@@ -167,11 +167,11 @@ private struct EmailBodyGen: CURLRequestBodyGenerator {
 	let bytes: [UInt8]
 	var offset = 0
 	var contentLength: Int? { return bytes.count }
-	
+
 	init(_ string: String) {
 		bytes = Array(string.utf8)
 	}
-	
+
 	mutating func next(byteCount: Int) -> [UInt8]? {
 		let count = bytes.count
 		let remaining = count - offset
@@ -215,16 +215,16 @@ public class EMail {
 	public var connectTimeoutSeconds: Int = 15
 	/// for debugging purposes
 	public var debug = false
-	
+
 	var progress = 0
-	
+
 	/// constructor
 	/// - parameters:
 	///   - client: SMTP client for login info
 	public init(client: SMTPClient) {
 		self.client = client
 	}
-	
+
 	/// transform an attachment into an MIME part
 	/// - parameters:
 	///   - path: local full path
@@ -248,14 +248,45 @@ public class EMail {
 				print("\(data.utf8.count) bytes attached")
 			}
 			// pack it up to an MIME part
-			return "--\(boundary)\r\nContent-Type: \(mimeType); name=\"\(file)\"\r\n"
+			let filename = paramterRfc2231(something: file)
+			let name = contentTypefilenameParameter(something: file)
+			return "--\(boundary)\r\n"
+				+ "Content-Disposition: \(disposition);\r\n"
+				+ "    filename*=\(filename)\r\n"
+				+ "Content-Type: \(mimeType);\r\n"
+				+ "    name=\"\(name)\"\r\n"
 				+ "Content-Transfer-Encoding: base64\r\n"
-				+ "Content-Disposition: \(disposition); filename=\"\(file)\"\r\n\r\n\(data)\r\n"
+				+ "\r\n\(data)\r\n"
 		} catch {
 			return ""
 		}
 	}
-	
+
+	/// https://www.ietf.org/rfc/rfc2047.txt
+	/// encode a string to url encode conform string
+	/// - parameters:
+	///   - something: a string to be encoded
+	/// - returns:
+	/// base64 but rfc2047 conform string
+	private func contentTypefilenameParameter(something: String) -> String {
+		let something = something.base64Encoded()!
+		// from rfc2047 encoded-word = "=?" charset "?" encoding "?" encoded-text "?="
+		//   Q is "Quoted-Printable" content-transfer-encoding defined in RFC 2045
+		//   B is Base64
+		return "=?utf-8?B?\(something)?="
+	}
+
+	/// https://tools.ietf.org/html/rfc2231
+	/// encode a string to url encode conform string
+	/// - parameters:
+	///   - something: a string to be encoded
+	/// - returns:
+	/// url encoded string
+	private func paramterRfc2231(something: String) -> String {
+		let something = something.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!
+		return "utf-8''\(something)"
+	}
+
 	/// encode a file by base64 method
 	/// - parameters:
 	///   - path: full path of the file to encode
@@ -289,7 +320,7 @@ public class EMail {
 		wraped.append(0)
 		return String(validatingUTF8: wraped)
 	}
-	
+
 	private func makeBody() throws -> (String, String) {
 		// !FIX! quoted printable?
 		var body = "Date: \(String.rfc5322Date)\r\n"
@@ -320,7 +351,7 @@ public class EMail {
 			body += "In-Reply-To: \(reference)\r\n"
 			body += "References: \(reference)\r\n"
 		}
-		
+
 		// add the email title
 		if subject.isEmpty {
 			throw SMTPError.INVALID_SUBJECT
@@ -358,7 +389,7 @@ public class EMail {
 		body += "--\(boundary)--\r\n"
 		return (body, uuid)
 	}
-	
+
 	private func getResponse(_ body : String) throws -> CURLResponse {
 		let recipients = to + cc + bcc
 		guard recipients.count > 0 else {
@@ -376,7 +407,7 @@ public class EMail {
 		let request = CURLRequest(client.url, options: options)
 		return try request.perform()
 	}
-	
+
 	/// send an email with the current settings
 	/// - parameters:
 	///   - completion: once sent, callback to the main thread with curl code, header & body string
