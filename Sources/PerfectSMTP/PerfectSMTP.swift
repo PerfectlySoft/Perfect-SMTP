@@ -39,7 +39,7 @@ public enum SMTPError:Error {
 	case INVALID_PROTOCOL
 	/// base64 failed
 	case INVALID_ENCRYPTION
-	
+
 	case general(Int, String)
 }
 
@@ -90,7 +90,7 @@ extension String {
 		}
 		return nil
 	}
-	
+
 	/// get RFC 5322-compliant date for email
 	static var rfc5322Date: String {
 		let dateFormatter = DateFormatter()
@@ -99,7 +99,7 @@ extension String {
 		let compliantDate = dateFormatter.string(from: Date())
 		return compliantDate
 	}
-	
+
 	/// convert a recipient to standard email format: "Full Name"<nickname@some.where>
 	/// - parameters:
 	///   - recipient: the email receiver name / address structure
@@ -115,14 +115,14 @@ extension String {
 			}
 		}
 	}
-	
+
 	/// convert a group of recipients into an address list, joined by comma
 	/// - parameters:
 	///   - recipients: array of recipient
 	init(recipients: [Recipient]) {
 		self = recipients.map{String(recipient: $0)}.joined(separator: ", ")
 	}
-	
+
 	/// MIME mail header: To/Cc/Bcc + recipients
 	/// - parameters:
 	///   - prefix: To / Cc or Bcc
@@ -131,7 +131,7 @@ extension String {
 		let r = String(recipients: recipients)
 		self = "\(prefix): \(r)\r\n"
 	}
-	
+
 	/// get the address info from a recipient, i.e, someone@somewhere -> @somewhere
 	var emailSuffix: String {
 		get {
@@ -145,7 +145,7 @@ extension String {
 			#endif
 		}
 	}
-	
+
 	/// extract file name from a full path
 	var fileNameWithoutPath: String {
 		get {
@@ -153,7 +153,7 @@ extension String {
 			return String(segments[segments.count - 1])
 		}
 	}
-	
+
 	/// extract file suffix from a file name
 	var suffix: String {
 		get {
@@ -167,11 +167,11 @@ private struct EmailBodyGen: CURLRequestBodyGenerator {
 	let bytes: [UInt8]
 	var offset = 0
 	var contentLength: Int? { return bytes.count }
-	
+
 	init(_ string: String) {
 		bytes = Array(string.utf8)
 	}
-	
+
 	mutating func next(byteCount: Int) -> [UInt8]? {
 		let count = bytes.count
 		let remaining = count - offset
@@ -215,16 +215,16 @@ public class EMail {
 	public var connectTimeoutSeconds: Int = 15
 	/// for debugging purposes
 	public var debug = false
-	
+
 	var progress = 0
-	
+
 	/// constructor
 	/// - parameters:
 	///   - client: SMTP client for login info
 	public init(client: SMTPClient) {
 		self.client = client
 	}
-	
+
 	/// transform an attachment into an MIME part
 	/// - parameters:
 	///   - path: local full path
@@ -255,7 +255,7 @@ public class EMail {
 			return ""
 		}
 	}
-	
+
 	/// encode a file by base64 method
 	/// - parameters:
 	///   - path: full path of the file to encode
@@ -263,33 +263,11 @@ public class EMail {
 	/// base64 encoded text WITH A TRAILING NEWLINE
 	@discardableResult
 	private func encode(path: String) throws -> String? {
-		let fd = File(path)
-		try fd.open(.read)
-		guard let buffer = try fd.readSomeBytes(count: fd.size).encode(.base64) else {
-			fd.close()
-			throw SMTPError.INVALID_ENCRYPTION
-		}
-		if self.debug {
-			print("encode \(fd.size) -> \(buffer.count)")
-		}
-		var wraped = [UInt8]()
-		let szline = 76
-		var cursor = 0
-		let newline:[UInt8] = [13, 10]
-		while cursor < buffer.count {
-			var mark = cursor + szline
-			if mark >= buffer.count {
-				mark = buffer.count
-			}
-			wraped.append(contentsOf: buffer[cursor ..< mark])
-			wraped.append(contentsOf: newline)
-			cursor += szline
-		}
-		fd.close()
-		wraped.append(0)
-		return String(validatingUTF8: wraped)
+		return FileManager.default.contents(atPath: path)?
+			.base64EncodedString(options:
+				.init(arrayLiteral: [.endLineWithCarriageReturn, .endLineWithLineFeed, .lineLength76Characters]))
 	}
-	
+
 	private func makeBody() throws -> (String, String) {
 		// !FIX! quoted printable?
 		var body = "Date: \(String.rfc5322Date)\r\n"
@@ -320,7 +298,7 @@ public class EMail {
 			body += "In-Reply-To: \(reference)\r\n"
 			body += "References: \(reference)\r\n"
 		}
-		
+
 		// add the email title
 		if subject.isEmpty {
 			throw SMTPError.INVALID_SUBJECT
@@ -358,7 +336,7 @@ public class EMail {
 		body += "--\(boundary)--\r\n"
 		return (body, uuid)
 	}
-	
+
 	private func getResponse(_ body : String) throws -> CURLResponse {
 		let recipients = to + cc + bcc
 		guard recipients.count > 0 else {
@@ -376,7 +354,7 @@ public class EMail {
 		let request = CURLRequest(client.url, options: options)
 		return try request.perform()
 	}
-	
+
 	/// send an email with the current settings
 	/// - parameters:
 	///   - completion: once sent, callback to the main thread with curl code, header & body string
