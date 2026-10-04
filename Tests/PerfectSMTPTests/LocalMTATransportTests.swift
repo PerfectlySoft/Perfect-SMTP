@@ -18,24 +18,23 @@ import Testing
 
 struct LocalMTATransportTests {
 
-    /// Writes a small, portable Python "fake MTA" script to a temp file
+    /// Writes a small, portable POSIX `sh` "fake MTA" script to a temp file
     /// and marks it executable. `stderrBytes` controls how much it writes
     /// to stderr before exiting -- large enough to exceed the OS pipe
     /// buffer (typically 64KiB) proves the deadlock scenario is real, not
-    /// just theoretical.
+    /// just theoretical. (`/bin/sh`, not Python: the `swift` Linux images
+    /// ship without `python3`, which made these tests fail there with exit
+    /// code 127 before the transport was ever exercised.)
     private func makeFakeMTA(stderrBytes: Int, exitCode: Int32 = 0) throws -> URL {
         let script = """
-        #!/usr/bin/env python3
-        import sys
-        data = sys.stdin.buffer.read()
-        sys.stderr.buffer.write(b"E" * \(stderrBytes))
-        sys.stderr.buffer.flush()
-        sys.stdout.buffer.write(b"O" * \(stderrBytes))
-        sys.stdout.buffer.flush()
-        sys.exit(\(exitCode))
+        #!/bin/sh
+        cat > /dev/null
+        head -c \(stderrBytes) /dev/zero | tr '\\000' E >&2
+        head -c \(stderrBytes) /dev/zero | tr '\\000' O
+        exit \(exitCode)
         """
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("fake-mta-\(UUID().uuidString).py")
+            .appendingPathComponent("fake-mta-\(UUID().uuidString).sh")
         try script.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
@@ -43,27 +42,25 @@ struct LocalMTATransportTests {
 
     /// Writes a fake MTA that, instead of doing anything MTA-like, dumps
     /// its own received `argv` (everything after the script path) to a
-    /// sibling file next to itself -- `<script path>.args`, NUL-separated
-    /// -- then exits 0. Used to structurally inspect the exact arguments
+    /// sibling file next to itself -- `<script path>.args`, each argument
+    /// NUL-terminated (empty when there are no arguments) -- then exits 0. Used to structurally inspect the exact arguments
     /// `LocalMTATransport` constructs (FIX #2 layer 2's `"--"` separator,
     /// FIX #3's `.null` reverse-path `-f` argument) without needing any
     /// production-code seam to intercept `Process.arguments` directly.
     /// A sibling file (not an environment variable) is used deliberately:
     /// FIX #2's defense-in-depth `process.environment` lockdown means the
     /// subprocess no longer inherits arbitrary environment variables, so
-    /// the sibling-file path is derived purely from the script's own
-    /// `sys.argv[0]`, needing no environment cooperation at all.
+    /// the sibling-file path is derived purely from the script's own `$0`,
+    /// needing no environment cooperation at all.
     private func makeArgvCapturingMTA() throws -> URL {
         let script = """
-        #!/usr/bin/env python3
-        import sys
-        sys.stdin.buffer.read()
-        with open(sys.argv[0] + ".args", "wb") as f:
-            f.write(b"\\x00".join(a.encode("utf-8") for a in sys.argv[1:]))
-        sys.exit(0)
+        #!/bin/sh
+        cat > /dev/null
+        if [ "$#" -gt 0 ]; then printf '%s\\000' "$@"; fi > "$0.args"
+        exit 0
         """
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("fake-mta-argv-\(UUID().uuidString).py")
+            .appendingPathComponent("fake-mta-argv-\(UUID().uuidString).sh")
         try script.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
         return url
@@ -74,7 +71,10 @@ struct LocalMTATransportTests {
     private func capturedArguments(for scriptURL: URL) throws -> [String] {
         let data = try Data(contentsOf: URL(fileURLWithPath: scriptURL.path + ".args"))
         guard !data.isEmpty else { return [] }
+        // Every argument (including an empty one, e.g. `-f ""`) ends in a
+        // NUL, so the split's final element is always the empty remainder.
         return data.split(separator: 0x00, omittingEmptySubsequences: false)
+            .dropLast()
             .map { String(decoding: $0, as: UTF8.self) }
     }
 

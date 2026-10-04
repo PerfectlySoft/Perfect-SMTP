@@ -43,7 +43,9 @@
 //  "the CryptoKit implementation of the algorithm employs randomization
 //  to generate a different signature on every call, even for the same
 //  data and key"). Two signatures of the identical input are therefore
-//  both valid but not byte-identical -- so this test instead verifies the
+//  both valid but not byte-identical (on Linux, BoringSSL's Ed25519 is
+//  deterministic, but byte-comparing would still be Linux-only, so the same
+//  approach is used everywhere) -- so this test instead verifies the
 //  RFC's *published* Ed25519 signature against this implementation's
 //  computed hash input using `isValidSignature`, which proves the
 //  canonicalization/hash-construction is byte-exact (a forged or
@@ -223,11 +225,15 @@ struct DKIMRealVectorTests {
         #expect(publicKey.isValidSignature(producedSignatureBytes, for: digest))
     }
 
-    @Test func ed25519SigningIsNonDeterministicAcrossCalls() throws {
+    @Test func ed25519SigningDeterminismMatchesThePlatformBackend() throws {
         // Documents, as an executable fact rather than only a code
         // comment, exactly why the two tests above verify rather than
-        // byte-compare: two signatures of the identical input, from the
-        // identical key, are not byte-identical (both are still valid).
+        // byte-compare. On Apple platforms swift-crypto passes through to
+        // CryptoKit, whose randomized nonce makes two signatures of the
+        // identical input, from the identical key, differ (both still
+        // valid). Elsewhere swift-crypto uses BoringSSL's RFC 8032 Ed25519,
+        // which is deterministic, so the same two signatures are identical.
+        // Verification-only tests are correct on both.
         let seed = try #require(Data(base64Encoded: Self.ed25519SeedBase64))
         let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
         let message = Data("fixed DKIM data-hash stand-in".utf8)
@@ -235,7 +241,11 @@ struct DKIMRealVectorTests {
         let first = try privateKey.signature(for: message)
         let second = try privateKey.signature(for: message)
 
+        #if canImport(CryptoKit)
         #expect(first != second)
+        #else
+        #expect(first == second)
+        #endif
         #expect(privateKey.publicKey.isValidSignature(first, for: message))
         #expect(privateKey.publicKey.isValidSignature(second, for: message))
     }
