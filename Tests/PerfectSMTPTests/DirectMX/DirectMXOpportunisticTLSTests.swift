@@ -152,7 +152,7 @@ struct DirectMXOpportunisticTLSTests {
     // dial failure -- including a detected `.starttlsInjection` -- with no
     // distinction of cause. After `circuitBreakerThreshold` (default 5)
     // consecutive failures against `Key(host, port, tls: .startTLS)`, the
-    // breaker opens; while open, `checkBreaker` throws a bare
+    // breaker opens; while open, the pool's breaker check throws a bare
     // `SMTPError.circuitOpen` *before ever dialing again*. Before this fix,
     // `attemptOpportunisticHostsInOrder`'s catch block only pattern-matched
     // `.starttlsInjection` specifically, so `.circuitOpen` fell through to
@@ -216,7 +216,7 @@ struct DirectMXOpportunisticTLSTests {
         }
 
         // Sixth attempt: the breaker for `Key(host, port, .startTLS)` is
-        // now open, so `checkBreaker` rejects with a bare
+        // now open, so the pool's breaker check rejects with a bare
         // `SMTPError.circuitOpen` *before* ever dialing again -- the fake
         // server never even sees a sixth STARTTLS attempt. This is the
         // exact scenario the laundering bug turned into a silent plaintext

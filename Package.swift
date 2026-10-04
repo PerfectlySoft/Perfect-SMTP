@@ -45,7 +45,7 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // Transport layer target. Channel handlers, the protocol state
-        // machine, the connection-pool actor, Transport strategies, and
+        // machine, the connection pool, Transport strategies, and
         // SMTPMailer's public API land here starting Phase 1 (see
         // Documentation/swift6-nio-rewrite-plan.md §9).
         .target(
