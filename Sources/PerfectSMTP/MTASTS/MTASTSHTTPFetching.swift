@@ -107,9 +107,26 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
 /// `MTASTSDiscoveryError.fetchFailed`, so a refused redirect is correctly
 /// folded into the ordinary "fetch failed" path with no separate handling
 /// needed here.
+///
+/// **Linux:** swift-corelibs-foundation ignores the per-task delegate
+/// passed to `data(for:delegate:)`, and auto-follows redirects for any task
+/// created with a completion handler, so the Darwin code path above
+/// silently followed redirects there (seen with `swift:6.4-noble`: the
+/// redirect test failed with "too many HTTP redirects"). On platforms that
+/// use `FoundationNetworking`, each fetch therefore runs on its own
+/// short-lived `URLSession` built from `session.configuration`, with
+/// `RedirectRefusingFetchDelegate` as the *session* delegate driving a
+/// delegate-based data task; only the injected session's configuration is
+/// used there, not the session itself.
 public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     private let session: URLSession
 
+    /// - Parameter session: On Darwin, the session every fetch runs on. On
+    ///   platforms that use `FoundationNetworking` (Linux), only its
+    ///   `configuration` is used: each fetch runs on its own short-lived
+    ///   session whose delegate refuses redirects, so a delegate set on
+    ///   `session` (e.g. one handling authentication challenges) is not
+    ///   consulted there.
     public init(session: URLSession = .shared) {
         self.session = session
     }
@@ -118,7 +135,11 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        #if canImport(FoundationNetworking)
+        let (data, response) = try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration)
+        #else
         let (data, response) = try await session.data(for: request, delegate: RedirectRefusingTaskDelegate())
+        #endif
         guard let http = response as? HTTPURLResponse else {
             throw MTASTSHTTPFetchError.notAnHTTPResponse
         }
@@ -147,3 +168,95 @@ private final class RedirectRefusingTaskDelegate: NSObject, URLSessionTaskDelega
         completionHandler(nil)
     }
 }
+
+#if canImport(FoundationNetworking)
+/// The `FoundationNetworking` counterpart of `RedirectRefusingTaskDelegate`
+/// (see `URLSessionMTASTSFetcher`'s "Linux" paragraph): the session delegate
+/// of a one-fetch `URLSession`, so corelibs actually consults it for
+/// redirects. It refuses every redirect, collects the body, and resumes the
+/// caller's continuation when the task completes. `@unchecked Sendable`:
+/// its mutable state is only touched under `lock`.
+private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var body = Data()
+    private var continuation: CheckedContinuation<(Data, URLResponse), any Error>?
+    private var task: URLSessionDataTask?
+    private var cancelled = false
+
+    static func fetch(_ request: URLRequest, configuration: URLSessionConfiguration) async throws -> (Data, URLResponse) {
+        let delegate = RedirectRefusingFetchDelegate()
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.start(session.dataTask(with: request), continuation: continuation)
+            }
+        } onCancel: {
+            delegate.cancel()
+        }
+    }
+
+    private func start(_ task: URLSessionDataTask, continuation: CheckedContinuation<(Data, URLResponse), any Error>) {
+        lock.lock()
+        let alreadyCancelled = cancelled
+        if !alreadyCancelled {
+            self.continuation = continuation
+            self.task = task
+        }
+        lock.unlock()
+        if alreadyCancelled {
+            // Cancel the never-started task too: corelibs'
+            // `finishTasksAndInvalidate()` waits for every task it created,
+            // so an unstarted one would keep the session and this delegate
+            // alive forever. `didCompleteWithError` then finds no
+            // continuation and does nothing.
+            task.cancel()
+            continuation.resume(throwing: CancellationError())
+        } else {
+            task.resume()
+        }
+    }
+
+    private func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = self.task
+        lock.unlock()
+        // Completes through `didCompleteWithError` with `NSURLErrorCancelled`.
+        task?.cancel()
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // `nil` -- do not follow the redirect. The task completes with
+        // `response` (the 3xx itself) as its final result.
+        completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        body.append(data)
+        lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        self.task = nil
+        let data = body
+        lock.unlock()
+        guard let continuation else { return }
+        if let error {
+            continuation.resume(throwing: error)
+        } else if let response = task.response {
+            continuation.resume(returning: (data, response))
+        } else {
+            continuation.resume(throwing: MTASTSHTTPFetchError.notAnHTTPResponse)
+        }
+    }
+}
+#endif
