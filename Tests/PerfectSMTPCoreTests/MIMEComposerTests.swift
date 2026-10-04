@@ -602,3 +602,106 @@ struct MIMEComposerTests {
 private func header(_ message: RFC5322Message, _ name: String) -> String? {
     message.headers.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.value
 }
+
+/// RFC 2231 filename encoding for non-ASCII attachment and inline-resource names (issue #21).
+struct RFC2231FilenameTests {
+    private func composedBody(attachmentName: String) throws -> String {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        message.attachments = [Attachment(filename: attachmentName, contentType: "application/pdf", data: Data("x".utf8))]
+        return String(decoding: try MIMEComposer(message).compose().body, as: UTF8.self)
+    }
+
+    /// The full value of the first header line starting with `prefix` (e.g. "Content-Type: application/pdf"),
+    /// with folded continuation lines joined back, without the "Name: " part.
+    private func header(_ prefix: String, in body: String) -> String? {
+        let lines = body.components(separatedBy: "\r\n")
+        guard let start = lines.firstIndex(where: { $0.hasPrefix(prefix) }),
+              let colon = lines[start].firstIndex(of: ":") else { return nil }
+        var value = String(lines[start][lines[start].index(colon, offsetBy: 2)...])
+        var index = start + 1
+        while index < lines.count, lines[index].hasPrefix(" ") || lines[index].hasPrefix("\t") {
+            value += lines[index]
+            index += 1
+        }
+        return value
+    }
+
+    /// Decodes `parameter*=` / `parameter*N*=` RFC 2231 values back to a string.
+    private func decodeExtended(_ parameter: String, in headerValue: String) -> String? {
+        var pieces: [(Int, String)] = []
+        for raw in headerValue.split(separator: ";") {
+            let part = raw.trimmingCharacters(in: .whitespaces)
+            if part.hasPrefix("\(parameter)*=") {
+                pieces.append((0, String(part.dropFirst(parameter.count + 2))))
+            } else if part.hasPrefix("\(parameter)*"), let star = part.dropFirst(parameter.count + 1).firstIndex(of: "*") {
+                let index = Int(part[part.index(part.startIndex, offsetBy: parameter.count + 1)..<star]) ?? -1
+                pieces.append((index, String(part[part.index(star, offsetBy: 2)...])))
+            }
+        }
+        guard !pieces.isEmpty else { return nil }
+        var joined = pieces.sorted { $0.0 < $1.0 }.map(\.1).joined()
+        guard joined.hasPrefix("utf-8''") else { return nil }
+        joined.removeFirst("utf-8''".count)
+        return joined.removingPercentEncoding
+    }
+
+    @Test func asciiFilenameIsUnchanged() throws {
+        let body = try composedBody(attachmentName: "report 2026.pdf")
+        #expect(header("Content-Disposition: attachment", in: body) == "attachment; filename=\"report 2026.pdf\"")
+        #expect(header("Content-Type: application/pdf", in: body) == "application/pdf; name=\"report 2026.pdf\"")
+        #expect(!body.contains("filename*"))
+    }
+
+    @Test func nonASCIIFilenameGetsFallbackAndExtendedValue() throws {
+        let body = try composedBody(attachmentName: "Résumé.pdf")
+        #expect(body.contains("Content-Disposition: attachment; filename=\"R_sum_.pdf\";\r\n filename*=utf-8''R%C3%A9sum%C3%A9.pdf\r\n"))
+        #expect(body.contains("Content-Type: application/pdf; name=\"R_sum_.pdf\";\r\n name*=utf-8''R%C3%A9sum%C3%A9.pdf\r\n"))
+        #expect(!body.contains("Résumé"), "raw UTF-8 must not appear in headers")
+    }
+
+    @Test func spacesAndQuotesAreEncoded() throws {
+        let name = "mon cv \"final\" é.pdf"
+        let body = try composedBody(attachmentName: name)
+        let disposition = try #require(header("Content-Disposition: attachment", in: body))
+        #expect(disposition.contains("filename=\"mon cv \\\"final\\\" _.pdf\""))
+        #expect(disposition.contains("filename*=utf-8''mon%20cv%20%22final%22%20%C3%A9.pdf"))
+        #expect(decodeExtended("filename", in: disposition) == name)
+    }
+
+    @Test func longFilenameUsesContinuationsWithinLineLength() throws {
+        let name = String(repeating: "日本語のファイル名", count: 6) + ".pdf"
+        let body = try composedBody(attachmentName: name)
+        let disposition = try #require(header("Content-Disposition: attachment", in: body))
+        #expect(disposition.contains("filename*0*=utf-8''"))
+        #expect(disposition.contains("filename*1*="))
+        #expect(!disposition.contains("filename*="), "continuations replace the single extended value")
+        #expect(decodeExtended("filename", in: disposition) == name)
+        #expect(decodeExtended("name", in: try #require(header("Content-Type: application/pdf", in: body))) == name)
+        // Every continuation line fits, and no %XX escape is split across segments.
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~")
+        for line in body.components(separatedBy: "\r\n") where line.hasPrefix(" filename*") || line.hasPrefix(" name*") {
+            #expect(line.count <= 78, "\(line.count): \(line)")
+            let value = line.split(separator: "=", maxSplits: 1)[1].replacingOccurrences(of: "utf-8''", with: "").trimmingCharacters(in: CharacterSet(charactersIn: ";"))
+            var chars = Array(value)
+            while !chars.isEmpty {
+                if chars[0] == "%" {
+                    #expect(chars.count >= 3 && chars[1].isHexDigit && chars[2].isHexDigit, "split escape in \(line)")
+                    chars.removeFirst(min(3, chars.count))
+                } else {
+                    #expect(allowed.contains(chars[0]), "unencoded \(chars[0]) in \(line)")
+                    chars.removeFirst()
+                }
+            }
+        }
+    }
+
+    @Test func inlineResourceNonASCIIFilename() throws {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.htmlBody = "<img src=\"cid:img1\">"
+        message.inlineImages = [InlineResource(contentID: "img1", filename: "café.png", contentType: "image/png", data: Data([0, 1, 2]))]
+        let body = String(decoding: try MIMEComposer(message).compose().body, as: UTF8.self)
+        #expect(body.contains("Content-Disposition: inline; filename=\"caf_.png\";\r\n filename*=utf-8''caf%C3%A9.png\r\n"))
+        #expect(body.contains("name*=utf-8''caf%C3%A9.png"))
+    }
+}
