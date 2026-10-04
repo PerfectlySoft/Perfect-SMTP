@@ -121,6 +121,47 @@ struct SMTPMailerStreamingSendTests {
         #expect(await tracker.totalSends == totalMessages)
     }
 
+    // MARK: - Regression: ResultChannel waiter state lost isolation
+
+    /// Regression test for the `ResultChannel` isolation bug. The channel
+    /// was an actor whose `push` re-parked in a loop from inside
+    /// `withTaskCancellationHandler { withCheckedContinuation { ... } }`.
+    /// Under Swift 6.4 in optimized builds, that continuation body ran off
+    /// the actor's executor, so the process either aborted ("Incorrect actor
+    /// executor assumption ... ResultChannel") or lost waiters, which
+    /// dropped results or hung. A tiny channel, several results per message
+    /// and a consumer that yields between reads keep every child task
+    /// parking and re-parking in `push`, which is the path that broke.
+    @Test(.timeLimit(.minutes(1)))
+    func heavilyContendedStreamDeliversEveryResultExactlyOnce() async throws {
+        let rounds = 20
+        let messagesPerRound = 300
+        let recipientsPerMessage = 3
+
+        for round in 0..<rounds {
+            let transport = StreamingCountingTransport(tracker: StreamingInFlightTracker())
+            let mailer = SMTPMailer(transport: transport, configuration: .init(maxInFlightBatchSends: 2))
+            let source = AsyncStream<EmailMessage> { continuation in
+                for i in 0..<messagesPerRound {
+                    var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+                    message.to = (0..<recipientsPerMessage).map { EmailAddress(address: "r\(i)-\($0)@example.com") }
+                    message.textBody = "hello \(i)"
+                    continuation.yield(message)
+                }
+                continuation.finish()
+            }
+
+            var seen: [String: Int] = [:]
+            for try await result in mailer.send(source, envelopeFrom: .address("bounce@example.com")) {
+                seen[result.recipient, default: 0] += 1
+                await Task.yield()
+            }
+
+            #expect(seen.count == messagesPerRound * recipientsPerMessage, "round \(round)")
+            #expect(seen.values.allSatisfy { $0 == 1 }, "round \(round): a result was delivered more than once")
+        }
+    }
+
     // MARK: - Cancellation
 
     @Test func cancellingTheConsumingTaskStopsThePipelinePromptly() async throws {

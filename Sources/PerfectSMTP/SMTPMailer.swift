@@ -12,6 +12,7 @@
 
 import Foundation
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 
 public struct SMTPMailer: Sendable {
@@ -218,7 +219,7 @@ public struct SMTPMailer: Sendable {
     /// produced element has been handed back to the caller -- there is no
     /// intermediate buffer to overflow at all, so there is nothing to drop.
     /// `produce` here is `try await channel.pull()`, where `channel` is a
-    /// small internal `ResultChannel` actor (below) with an explicit,
+    /// small internal lock-protected `ResultChannel` (below) with an explicit,
     /// bounded `capacity` (reusing `configuration.maxInFlightBatchSends` as
     /// that bound -- one small, explicit number governs both the input-side
     /// sliding window and the output-side channel, rather than inventing a
@@ -248,6 +249,12 @@ public struct SMTPMailer: Sendable {
     /// reports as data) is caught there and mapped to `.failed(error)`
     /// `DeliveryResult`s for that message's own would-be recipients, pushed
     /// to the channel exactly like a successful send's results would be.
+    /// **Single consumer.** Iterate the returned stream from one task only.
+    /// `AsyncThrowingStream(unfolding:)` doesn't serialize `next()` across
+    /// tasks, and the channel supports one parked reader at a time, so a
+    /// second concurrent consumer traps (`precondition`) rather than
+    /// silently stranding the first one.
+    ///
     /// The returned stream itself only ever terminates by throwing for a
     /// genuinely stream-level failure -- `messages`' own `AsyncIterator`
     /// throwing -- never for an individual message's delivery outcome.
@@ -259,10 +266,9 @@ public struct SMTPMailer: Sendable {
     ///   itself suspended inside `channel.pull()` awaiting the next result.
     ///   `ResultChannel.pull` (like `push`) is wrapped in
     ///   `withTaskCancellationHandler`, so it wakes promptly on the calling
-    ///   task's cancellation (mirroring `SMTPConnectionPool`'s own
-    ///   established `withTaskCancellationHandler` / single-owner-resolve
-    ///   waiter pattern, plan §4.4) and `produce` then cancels `driver` and
-    ///   ends the sequence.
+    ///   task's cancellation (the handler removes the parked waiter under
+    ///   the channel's lock and resumes it right after) and `produce`
+    ///   then cancels `driver` and ends the sequence.
     /// - **The stream/iterator is torn down without being drained** (e.g. a
     ///   consumer that `break`s out of a `for await` loop early, or simply
     ///   never iterates the returned stream at all) -- no task cancellation
@@ -346,7 +352,7 @@ public struct SMTPMailer: Sendable {
                     _ = await startNextIfPossible()
                 }
 
-                await channel.finish(throwing: sourceError)
+                channel.finish(throwing: sourceError)
             }
         }
 
@@ -421,74 +427,80 @@ public struct SMTPMailer: Sendable {
 
 // MARK: - `ResultChannel`: the streaming send's actual backpressure mechanism
 
-/// A small actor-based bounded channel bridging the sliding-window
-/// task-group producer in `SMTPMailer.send<S>` to the single pull-based
-/// consumer driving `AsyncThrowingStream(unfolding:)`. See that method's
-/// doc comment for the full rationale -- summary:
-/// `AsyncThrowingStream.Continuation.yield` is synchronous and cannot
-/// suspend, so no `bufferingPolicy` choice can make it genuinely block a
-/// fast producer (confirmed empirically, not assumed -- it silently drops
-/// once full); this type exists to provide real (suspending, non-dropping)
-/// backpressure instead, bounded to an explicit `capacity`.
+/// A small bounded channel bridging the sliding-window task-group producer
+/// in `SMTPMailer.send<S>` to the single pull-based consumer driving
+/// `AsyncThrowingStream(unfolding:)`. See that method's doc comment for the
+/// full rationale -- summary: `AsyncThrowingStream.Continuation.yield` is
+/// synchronous and cannot suspend, so no `bufferingPolicy` choice can make
+/// it genuinely block a fast producer (confirmed empirically, not assumed --
+/// it silently drops once full); this type exists to provide real
+/// (suspending, non-dropping) backpressure instead, bounded to an explicit
+/// `capacity`.
 ///
-/// Cancellation handling on both `push` and `pull` mirrors
-/// `SMTPConnectionPool`'s established `withTaskCancellationHandler` +
-/// single-owner-resolve waiter pattern (plan §4.4) rather than inventing a
-/// new idiom: each parks behind a waiter object that can be resolved
-/// exactly once by whichever of {the complementary operation, the parked
-/// task's own cancellation, `finish` being called} gets there first.
-private actor ResultChannel<Element: Sendable> {
-    /// Mirrors `SMTPConnectionPool.Waiter`'s double-resume guard: a parked
-    /// push can be resolved by room freeing up, by `finish`, or by the
-    /// pushing task's own cancellation -- exactly one of those must win.
-    /// `wasCancelled` lets `push` distinguish, after being woken, which of
-    /// those actually happened (a non-throwing continuation is used here
-    /// deliberately -- `push` has nothing useful to throw; it just needs to
-    /// know whether to keep waiting/proceed or give up).
-    private final class PushWaiter: @unchecked Sendable {
-        private var continuation: CheckedContinuation<Void, Never>?
-        private var resolved = false
-        private(set) var wasCancelled = false
-        init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
-        @discardableResult
-        func resolve(cancelled: Bool = false) -> Bool {
-            guard !resolved else { return false }
-            resolved = true
-            wasCancelled = cancelled
-            let cont = continuation
-            continuation = nil
-            cont?.resume()
-            return true
+/// **Why a lock, not an actor.** This used to be an actor whose `push` and
+/// `pull` registered their waiters from inside
+/// `withTaskCancellationHandler { withCheckedContinuation { ... } }`
+/// closures, relying on those closures inheriting the actor's isolation.
+/// Under Swift 6.4, whose `withTaskCancellationHandler` and
+/// `withCheckedContinuation` are `nonisolated(nonsending)`, optimized builds
+/// ran `push`'s continuation body *off* the actor's executor on the second
+/// pass through its wait loop. The runtime's isolation check then aborted
+/// the process ("Incorrect actor executor assumption"), and when it didn't,
+/// the unsynchronized waiter-list mutations lost wakeups and results. All
+/// state here is behind one `NIOLockedValueBox`, so correctness no longer
+/// depends on which executor any closure happens to run on, and the
+/// cancellation handlers remove their waiter under the lock and resume it
+/// directly instead of hopping through an unstructured `Task`.
+///
+/// A parked pusher hands its element over with its waiter: when `pull`
+/// frees a buffer slot, it moves the oldest parked pusher's element into
+/// the buffer and resumes that pusher, so a woken pusher never has to
+/// re-check for room and FIFO order is preserved.
+private final class ResultChannel<Element: Sendable>: Sendable {
+    private struct PushWaiter {
+        let id: UInt64
+        let element: Element
+        /// Resumed with `true` once `element` has been accepted, or `false`
+        /// when it was discarded (the channel finished, or the pushing task
+        /// was cancelled while parked).
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private struct PullWaiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<Element?, any Error>
+    }
+
+    private struct State {
+        var buffer: [Element] = []
+        var isFinished = false
+        var terminalError: (any Error)?
+        var pushWaiters: [PushWaiter] = []
+        var pullWaiter: PullWaiter?
+        var nextWaiterID: UInt64 = 0
+
+        mutating func makeWaiterID() -> UInt64 {
+            nextWaiterID &+= 1
+            return nextWaiterID
         }
     }
 
-    /// The `pull()`-side counterpart -- throwing, since `pull()` itself
-    /// throws (`CancellationError` on the calling task's cancellation, or
-    /// the source `AsyncSequence`'s own error via `finish(throwing:)`).
-    private final class PullWaiter: @unchecked Sendable {
-        private var continuation: CheckedContinuation<Element?, any Error>?
-        private var resolved = false
-        init(_ continuation: CheckedContinuation<Element?, any Error>) { self.continuation = continuation }
-        @discardableResult
-        func resolve(_ result: Result<Element?, any Error>) -> Bool {
-            guard !resolved else { return false }
-            resolved = true
-            let cont = continuation
-            continuation = nil
-            switch result {
-            case .success(let value): cont?.resume(returning: value)
-            case .failure(let error): cont?.resume(throwing: error)
-            }
-            return true
-        }
+    /// What `push` does once it has released the lock.
+    private enum PushAction {
+        case resume(Bool)
+        case handOff(CheckedContinuation<Element?, any Error>)
+        case parked
     }
 
-    private var buffer: [Element] = []
+    /// What `pull` does once it has released the lock.
+    private enum PullAction {
+        case element(Element, admitted: CheckedContinuation<Bool, Never>?)
+        case finished((any Error)?)
+        case parked
+    }
+
     private let capacity: Int
-    private var isFinished = false
-    private var terminalError: (any Error)?
-    private var pushWaiters: [(id: UUID, waiter: PushWaiter)] = []
-    private var pullWaiter: (id: UUID, waiter: PullWaiter)?
+    private let state = NIOLockedValueBox(State())
 
     init(capacity: Int) {
         self.capacity = max(1, capacity)
@@ -496,32 +508,49 @@ private actor ResultChannel<Element: Sendable> {
 
     /// Suspends until there is room in the buffer, the channel finishes, or
     /// this call's own `Task` is cancelled -- never drops silently and
-    /// never busy-polls. Once `isFinished` (or cancellation) is observed,
-    /// the element is discarded rather than pushed: at that point nothing
-    /// will ever `pull()` it, matching "stop promptly" rather than hanging
-    /// forever trying to deliver a result nobody will read.
+    /// never busy-polls. Once `isFinished` (or cancellation while it would
+    /// have to wait) is observed, the element is discarded rather than
+    /// pushed: at that point nothing will ever `pull()` it, matching "stop
+    /// promptly" rather than hanging forever trying to deliver a result
+    /// nobody will read.
     func push(_ element: Element) async {
-        guard !isFinished else { return }
-        while buffer.count >= capacity, !isFinished {
-            let waiterID = UUID()
-            var parkedWaiter: PushWaiter?
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    let waiter = PushWaiter(continuation)
-                    parkedWaiter = waiter
-                    pushWaiters.append((id: waiterID, waiter: waiter))
+        let id = state.withLockedValue { $0.makeWaiterID() }
+        _ = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                let action: PushAction = state.withLockedValue { state in
+                    if state.isFinished { return .resume(false) }
+                    if let waiter = state.pullWaiter {
+                        state.pullWaiter = nil
+                        return .handOff(waiter.continuation)
+                    }
+                    if state.buffer.count < capacity {
+                        state.buffer.append(element)
+                        return .resume(true)
+                    }
+                    // Checked under the lock: the cancellation flag is set
+                    // before `onCancel` runs, so either this sees it, or
+                    // `onCancel` (which takes the same lock) finds this
+                    // waiter registered below.
+                    if Task.isCancelled { return .resume(false) }
+                    state.pushWaiters.append(PushWaiter(id: id, element: element, continuation: continuation))
+                    return .parked
                 }
-            } onCancel: {
-                Task { await self.cancelPushWaiter(id: waiterID) }
+                switch action {
+                case .resume(let accepted):
+                    continuation.resume(returning: accepted)
+                case .handOff(let puller):
+                    puller.resume(returning: element)
+                    continuation.resume(returning: true)
+                case .parked:
+                    break
+                }
             }
-            if parkedWaiter?.wasCancelled == true || Task.isCancelled { return }
-        }
-        guard !isFinished else { return }
-        if let pullWaiter {
-            self.pullWaiter = nil
-            _ = pullWaiter.waiter.resolve(.success(element))
-        } else {
-            buffer.append(element)
+        } onCancel: {
+            let waiter: PushWaiter? = state.withLockedValue { state in
+                guard let index = state.pushWaiters.firstIndex(where: { $0.id == id }) else { return nil }
+                return state.pushWaiters.remove(at: index)
+            }
+            waiter?.continuation.resume(returning: false)
         }
     }
 
@@ -531,62 +560,74 @@ private actor ResultChannel<Element: Sendable> {
     /// iterator, so there is only ever at most one `pullWaiter` parked at
     /// a time.
     func pull() async throws -> Element? {
-        if !buffer.isEmpty {
-            let element = buffer.removeFirst()
-            wakeOnePusher()
-            return element
-        }
-        if isFinished {
-            if let terminalError { throw terminalError }
-            return nil
-        }
-        let waiterID = UUID()
+        let id = state.withLockedValue { $0.makeWaiterID() }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Element?, any Error>) in
-                pullWaiter = (id: waiterID, waiter: PullWaiter(continuation))
+                let action: PullAction = state.withLockedValue { state in
+                    if !state.buffer.isEmpty {
+                        let element = state.buffer.removeFirst()
+                        var admitted: CheckedContinuation<Bool, Never>?
+                        if !state.pushWaiters.isEmpty {
+                            let pusher = state.pushWaiters.removeFirst()
+                            state.buffer.append(pusher.element)
+                            admitted = pusher.continuation
+                        }
+                        return .element(element, admitted: admitted)
+                    }
+                    if state.isFinished { return .finished(state.terminalError) }
+                    if Task.isCancelled { return .finished(CancellationError()) }
+                    precondition(state.pullWaiter == nil, "ResultChannel.pull() called concurrently")
+                    state.pullWaiter = PullWaiter(id: id, continuation: continuation)
+                    return .parked
+                }
+                switch action {
+                case .element(let element, let admitted):
+                    admitted?.resume(returning: true)
+                    continuation.resume(returning: element)
+                case .finished(let error?):
+                    continuation.resume(throwing: error)
+                case .finished(nil):
+                    continuation.resume(returning: nil)
+                case .parked:
+                    break
+                }
             }
         } onCancel: {
-            Task { await self.cancelPull(id: waiterID) }
+            let waiter: PullWaiter? = state.withLockedValue { state in
+                guard let current = state.pullWaiter, current.id == id else { return nil }
+                state.pullWaiter = nil
+                return current
+            }
+            waiter?.continuation.resume(throwing: CancellationError())
         }
     }
 
-    /// Marks the channel finished: no more elements will ever be
-    /// delivered. A parked puller (if any) is resolved with `error` (the
-    /// source `AsyncSequence` itself threw) or `nil` (clean end of
-    /// sequence); every currently-parked pusher is woken so none of them
-    /// hang -- their `push` calls simply discard their element instead
-    /// (see `push`'s doc comment).
+    /// Marks the channel finished: no more elements will ever be accepted.
+    /// Already-buffered elements are still delivered by `pull()` before it
+    /// reports the end (or `error`). A parked puller (if any -- the buffer
+    /// is necessarily empty then) is resolved with `error` (the source
+    /// `AsyncSequence` itself threw) or `nil` (clean end of sequence); every
+    /// currently-parked pusher is woken so none of them hang -- their
+    /// elements are discarded (see `push`'s doc comment).
     func finish(throwing error: (any Error)?) {
-        guard !isFinished else { return }
-        isFinished = true
-        terminalError = error
-        if let pullWaiter {
-            self.pullWaiter = nil
-            _ = pullWaiter.waiter.resolve(error.map { .failure($0) } ?? .success(nil))
+        let (puller, pushers): (PullWaiter?, [PushWaiter]) = state.withLockedValue { state in
+            guard !state.isFinished else { return (nil, []) }
+            state.isFinished = true
+            state.terminalError = error
+            let puller = state.pullWaiter
+            state.pullWaiter = nil
+            let pushers = state.pushWaiters
+            state.pushWaiters.removeAll()
+            return (puller, pushers)
         }
-        let waiters = pushWaiters
-        pushWaiters.removeAll()
-        for (_, waiter) in waiters { waiter.resolve() }
-    }
-
-    private func cancelPushWaiter(id: UUID) {
-        guard let idx = pushWaiters.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = pushWaiters[idx].waiter
-        if waiter.resolve(cancelled: true) {
-            pushWaiters.remove(at: idx)
+        if let puller {
+            if let error {
+                puller.continuation.resume(throwing: error)
+            } else {
+                puller.continuation.resume(returning: nil)
+            }
         }
-    }
-
-    private func cancelPull(id: UUID) {
-        guard let current = pullWaiter, current.id == id else { return }
-        pullWaiter = nil
-        _ = current.waiter.resolve(.failure(CancellationError()))
-    }
-
-    private func wakeOnePusher() {
-        guard !pushWaiters.isEmpty else { return }
-        let (_, waiter) = pushWaiters.removeFirst()
-        waiter.resolve()
+        for pusher in pushers { pusher.continuation.resume(returning: false) }
     }
 }
 
