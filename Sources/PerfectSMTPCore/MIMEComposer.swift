@@ -637,11 +637,12 @@ public struct MIMEComposer: Sendable {
         try Self.requireNoInjection(attachment.contentType, field: "attachment.contentType")
         let disposition = attachment.disposition ?? message.defaultDisposition
         let name = sanitizedFilename(attachment.filename)
+        let separator = Self.parameterSeparator(for: name)
         return MIMEPart(
             headers: [
-                ("Content-Type", "\(attachment.contentType); \(Self.filenameParameter("name", name))"),
+                ("Content-Type", "\(attachment.contentType)\(separator)\(Self.nameParameter(name))"),
                 ("Content-Transfer-Encoding", "base64"),
-                ("Content-Disposition", "\(disposition.rawValue); \(Self.filenameParameter("filename", name))"),
+                ("Content-Disposition", "\(disposition.rawValue)\(separator)\(Self.filenameParameter(name))"),
             ],
             body: .leaf(Array(Encoders.base64Wrapped(attachment.data).utf8))
         )
@@ -652,10 +653,11 @@ public struct MIMEComposer: Sendable {
         var headers: [(name: String, value: String)] = []
         if let filename = resource.filename {
             let name = sanitizedFilename(filename)
-            headers.append(("Content-Type", "\(resource.contentType); \(Self.filenameParameter("name", name))"))
+            let separator = Self.parameterSeparator(for: name)
+            headers.append(("Content-Type", "\(resource.contentType)\(separator)\(Self.nameParameter(name))"))
             headers.append(("Content-Transfer-Encoding", "base64"))
             headers.append(("Content-ID", "<\(resource.contentID)>"))
-            headers.append(("Content-Disposition", "inline; \(Self.filenameParameter("filename", name))"))
+            headers.append(("Content-Disposition", "inline\(separator)\(Self.filenameParameter(name))"))
         } else {
             headers.append(("Content-Type", resource.contentType))
             headers.append(("Content-Transfer-Encoding", "base64"))
@@ -699,8 +701,8 @@ public struct MIMEComposer: Sendable {
     /// Strips control characters (including CR/LF) from a caller-supplied
     /// filename before it's embedded in a header parameter — defensive
     /// against header injection via an attacker-controlled upload
-    /// filename. Non-ASCII filenames are then encoded by
-    /// `filenameParameter` (RFC 2231).
+    /// filename. Bidirectional controls are dropped too (extension spoofing). Non-ASCII
+    /// filenames are then encoded by `filenameParameter` (RFC 2231) and `nameParameter`.
     ///
     /// Also hardened against path traversal (milestone review finding):
     /// a filename like "../../../../etc/passwd" previously passed straight
@@ -710,8 +712,14 @@ public struct MIMEComposer: Sendable {
     /// caller input, including stripping a leading drive letter as a side
     /// effect of basenaming) — then strip any remaining leading dots.
     private func sanitizedFilename(_ name: String) -> String {
+        // Also drop bidirectional controls (U+202A-202E, U+2066-2069, U+200E/F, U+061C): with
+        // them "\u{202E}fdp.exe" displays as "exe.pdf" in clients that decode the name.
         let controlFree = String(
-            String.UnicodeScalarView(name.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F })
+            String.UnicodeScalarView(name.unicodeScalars.filter {
+                $0.value >= 0x20 && $0.value != 0x7F
+                    && !(0x202A...0x202E).contains($0.value) && !(0x2066...0x2069).contains($0.value)
+                    && $0.value != 0x200E && $0.value != 0x200F && $0.value != 0x061C
+            })
         )
         let lastSeparator = controlFree.lastIndex(where: { $0 == "/" || $0 == "\\" })
         let base = lastSeparator.map { String(controlFree[controlFree.index(after: $0)...]) } ?? controlFree
@@ -723,28 +731,28 @@ public struct MIMEComposer: Sendable {
         value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    /// A `name` / `filename` parameter for a (sanitized) filename.
+    /// The `filename` parameter for Content-Disposition, from a (sanitized) filename.
     ///
-    /// Printable ASCII is sent as before: `filename="report.pdf"`. Anything else gets an
-    /// ASCII fallback for old clients plus the RFC 2231 extended value modern clients read:
+    /// Printable ASCII is sent as before: `filename="report.pdf"`. Anything else is sent only as
+    /// the RFC 2231 extended value, as Thunderbird and Python's email package do:
     ///
-    ///     filename="R_sum_.pdf";
-    ///      filename*=utf-8''R%C3%A9sum%C3%A9.pdf
+    ///     filename*=utf-8''R%C3%A9sum%C3%A9.pdf
     ///
-    /// A long extended value is split into `filename*0*=`, `filename*1*=`, ... continuations
-    /// (RFC 2231 §3-4) on folded lines, never inside a `%XX` escape.
-    static func filenameParameter(_ parameter: String, _ value: String) -> String {
-        if value.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value < 0x7F }) {
+    /// No plain `filename=` fallback: when both are present, common parsers (e.g. Python's
+    /// email package) read the fallback and lose the real name. A long value is split into
+    /// `filename*0*=`, `filename*1*=`, ... continuations (RFC 2231 §3-4) on folded lines of at
+    /// most 78 characters, never inside a `%XX` escape.
+    static func filenameParameter(_ value: String) -> String {
+        let parameter = "filename"
+        if isPrintableASCII(value) {
             return "\(parameter)=\"\(quotedParam(value))\""
         }
-        let fallback = String(String.UnicodeScalarView(value.unicodeScalars.map { $0.value < 0x7F ? $0 : "_" }))
         // RFC 2231 attribute-char: printable ASCII except space, "*", "'", "%" and tspecials.
         let attributeChars = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~".utf8)
         let tokens = value.utf8.map { byte in
             attributeChars.contains(byte) ? String(UnicodeScalar(byte)) : String(format: "%%%02X", byte)
         }
-        // Keep every folded line within RFC 5322's 78-character recommendation: leading space,
-        // `name*NN*=`, the `utf-8''` prefix (first segment only, but budget it everywhere) and `;`.
+        // Leading space, `filename*NN*=`, the `utf-8''` prefix (budgeted on every line) and `;`.
         let segmentLength = 78 - (1 + parameter.count + "*99*=".count + "utf-8''".count + 1)
         var segments: [String] = [""]
         for token in tokens {
@@ -753,15 +761,48 @@ public struct MIMEComposer: Sendable {
             }
             segments[segments.count - 1] += token
         }
-        let extended: String
         if segments.count == 1 {
-            extended = "\(parameter)*=utf-8''\(segments[0])"
-        } else {
-            extended = segments.enumerated().map { index, segment in
-                "\(parameter)*\(index)*=" + (index == 0 ? "utf-8''" : "") + segment
-            }.joined(separator: ";\r\n ")
+            return "\(parameter)*=utf-8''\(segments[0])"
         }
-        return "\(parameter)=\"\(quotedParam(fallback))\";\r\n \(extended)"
+        return segments.enumerated().map { index, segment in
+            "\(parameter)*\(index)*=" + (index == 0 ? "utf-8''" : "") + segment
+        }.joined(separator: ";\r\n ")
+    }
+
+    /// The `name` parameter for Content-Type, from a (sanitized) filename.
+    ///
+    /// Printable ASCII is sent as before: `name="report.pdf"`. Anything else uses RFC 2047
+    /// encoded-words inside the quoted value -- not what RFC 2047 §5 allows, but what Outlook,
+    /// Apple Mail and Thunderbird read for `name` (Thunderbird sends exactly this alongside
+    /// RFC 2231 `filename*`). Long names are split into several encoded-words on folded lines
+    /// of at most 78 characters, never inside a UTF-8 sequence.
+    static func nameParameter(_ value: String) -> String {
+        if isPrintableASCII(value) {
+            return "name=\"\(quotedParam(value))\""
+        }
+        // Each line is at most ` name="` + `=?utf-8?B?` + base64 + `?=` + `"` -> 42 bytes of
+        // UTF-8 per encoded-word (56 base64 characters) keeps it within 78.
+        let maxBytesPerWord = 42
+        var chunks: [[UInt8]] = [[]]
+        for scalar in value.unicodeScalars {
+            let bytes = Array(String(scalar).utf8)
+            if chunks[chunks.count - 1].count + bytes.count > maxBytesPerWord {
+                chunks.append([])
+            }
+            chunks[chunks.count - 1] += bytes
+        }
+        let words = chunks.map { "=?utf-8?B?\(Data($0).base64EncodedString())?=" }
+        return "name=\"" + words.joined(separator: "\r\n ") + "\""
+    }
+
+    /// "; " for printable-ASCII names (output unchanged from before); for encoded names, fold
+    /// so the parameter starts its own line and every line stays within 78 characters.
+    private static func parameterSeparator(for name: String) -> String {
+        isPrintableASCII(name) ? "; " : ";\r\n "
+    }
+
+    private static func isPrintableASCII(_ value: String) -> Bool {
+        value.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value < 0x7F }
     }
 
     private func synthesizeMessageID() -> String {
