@@ -47,38 +47,63 @@ enum FakeDNSServer {
         "\(type.rawValue)|\(name.lowercased())"
     }
 
+    /// Binds UDP to a free port, then TCP to the same port number (a
+    /// resolver falls back to TCP on the nameserver's own port). The TCP
+    /// port can already be taken -- under a parallel test run another
+    /// test's connection may hold it -- which made the TCP-fallback test
+    /// fail intermittently with "Address already in use". The TCP listener
+    /// sets `SO_REUSEADDR` (covers a lingering TIME_WAIT socket), and on a
+    /// TCP bind failure this closes the UDP channel and tries a fresh port,
+    /// up to `maxAttempts` times (covers a live socket on that port).
     static func start(
         group: any EventLoopGroup,
         udpResponses: [String: FakeDNSUDPHandler.ScriptedResponse],
-        tcpResponses: [String: [UInt8]] = [:]
+        tcpResponses: [String: [UInt8]] = [:],
+        maxAttempts: Int = 20
     ) async throws -> Running {
-        let udpChannel = try await DatagramBootstrap(group: group)
-            .channelInitializer { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.addHandler(FakeDNSUDPHandler(responses: udpResponses))
-                }
-            }
-            .bind(host: "127.0.0.1", port: 0)
-            .get()
-        guard let port = udpChannel.localAddress?.port else { throw ServerError.noLocalPort }
-
-        var tcpChannel: Channel?
-        if !tcpResponses.isEmpty {
-            tcpChannel = try await ServerBootstrap(group: group)
-                .childChannelInitializer { channel in
+        var attempt = 1
+        while true {
+            let udpChannel = try await DatagramBootstrap(group: group)
+                .channelInitializer { channel in
                     channel.eventLoop.makeCompletedFuture {
-                        try channel.pipeline.syncOperations.addHandler(
-                            ByteToMessageHandler(DNSTCPFrameDecoder()), name: "dns-tcp-frame-decoder"
-                        )
-                        try channel.pipeline.syncOperations.addHandler(FakeDNSTCPHandler(responses: tcpResponses))
+                        try channel.pipeline.syncOperations.addHandler(FakeDNSUDPHandler(responses: udpResponses))
                     }
                 }
-                .bind(host: "127.0.0.1", port: port)
+                .bind(host: "127.0.0.1", port: 0)
                 .get()
-        }
+            guard let port = udpChannel.localAddress?.port else {
+                try? await udpChannel.close()
+                throw ServerError.noLocalPort
+            }
 
-        let nameserver = try SocketAddress(ipAddress: "127.0.0.1", port: port)
-        return Running(nameserver: nameserver, udpChannel: udpChannel, tcpChannel: tcpChannel)
+            var tcpChannel: Channel?
+            if !tcpResponses.isEmpty {
+                do {
+                    tcpChannel = try await ServerBootstrap(group: group)
+                        // A TIME_WAIT socket from an earlier connection on
+                        // this port number would otherwise block the bind.
+                        .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+                        .childChannelInitializer { channel in
+                            channel.eventLoop.makeCompletedFuture {
+                                try channel.pipeline.syncOperations.addHandler(
+                                    ByteToMessageHandler(DNSTCPFrameDecoder()), name: "dns-tcp-frame-decoder"
+                                )
+                                try channel.pipeline.syncOperations.addHandler(FakeDNSTCPHandler(responses: tcpResponses))
+                            }
+                        }
+                        .bind(host: "127.0.0.1", port: port)
+                        .get()
+                } catch {
+                    try? await udpChannel.close()
+                    guard attempt < maxAttempts else { throw error }
+                    attempt += 1
+                    continue
+                }
+            }
+
+            let nameserver = try SocketAddress(ipAddress: "127.0.0.1", port: port)
+            return Running(nameserver: nameserver, udpChannel: udpChannel, tcpChannel: tcpChannel)
+        }
     }
 }
 
