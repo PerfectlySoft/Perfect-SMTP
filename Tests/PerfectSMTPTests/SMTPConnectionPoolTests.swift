@@ -261,7 +261,6 @@ struct SMTPConnectionPoolTests {
     @Test(.timeLimit(.minutes(1)))
     func parkHandOffAndCancelUnderContentionNeverLeaksOrOvershoots() async throws {
         let inUse = InUseTracker()
-        let keepAlive = ConnectionKeeper()
         let pool = SMTPConnectionPool(
             configuration: .init(maxPerHost: 2, maxTotal: 4),
             group: NIOAsyncTestingEventLoop(),
@@ -269,10 +268,6 @@ struct SMTPConnectionPoolTests {
                 await Task.yield()
                 let (connection, channel) = try await ConnectionHarness.make()
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
-                // Dropping a connection whose channel is still open trips
-                // NIOAsyncWriter's "deinited without calling finish()"
-                // check; keep every dialed one alive for the test.
-                await keepAlive.keep(connection)
                 return connection
             }
         )
@@ -319,11 +314,6 @@ private actor DialCounter {
         count += 1
         return count
     }
-}
-
-private actor ConnectionKeeper {
-    private var connections: [SMTPConnection] = []
-    func keep(_ connection: SMTPConnection) { connections.append(connection) }
 }
 
 private actor InUseTracker {
