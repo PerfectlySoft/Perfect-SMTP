@@ -27,6 +27,7 @@
 //  the upgrade.
 //
 
+import Foundation
 import NIOCore
 import NIOPosix
 import NIOSSL
@@ -50,18 +51,35 @@ public enum TLSMode: Sendable, Hashable {
 /// optional implicit TLS / the STARTTLS dance, and hands back a
 /// pipeline-clean `NIOAsyncChannel<SMTPReply, SMTPCommand>` ready for Phase
 /// B.
+///
+/// Two timeouts bound Phase A. `connectTimeout` covers only the TCP
+/// connect. `replyTimeout` (seconds) covers each wait after that: the
+/// greeting (including the implicit-TLS handshake that precedes it), the
+/// pre-STARTTLS EHLO reply, the `STARTTLS` reply, and the STARTTLS
+/// handshake. The clock restarts at each step, matching RFC 5321
+/// §4.5.3.2's per-command timeouts (5 minutes for the greeting, hence the
+/// 300-second default, which is also `SMTPConnectionPool.Configuration`'s
+/// and `DirectMXConfig`'s default `replyTimeout`), so the whole bootstrap
+/// is bounded by `connectTimeout` plus up to four `replyTimeout`s (with
+/// STARTTLS), not by a single `replyTimeout`. When it fires, or when
+/// the peer closes the connection before bootstrap completes, `connect`
+/// throws and the channel is closed; without this a peer that accepted TCP
+/// and then went silent, or hung up before greeting, left `connect`
+/// suspended forever.
 public enum SMTPBootstrap {
     public static func connect(
         host: String,
         port: Int,
         tls: TLSMode,
         connectTimeout: TimeAmount = .seconds(30),
+        replyTimeout: TimeInterval = 300,
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         try await connect(
             target: .hostPort(host: host, port: port), sniHostname: host, tls: tls,
-            connectTimeout: connectTimeout, tlsConfiguration: tlsConfiguration, group: group
+            connectTimeout: connectTimeout, replyTimeout: replyTimeout,
+            tlsConfiguration: tlsConfiguration, group: group
         )
     }
 
@@ -84,12 +102,14 @@ public enum SMTPBootstrap {
         sniHostname: String,
         tls: TLSMode,
         connectTimeout: TimeAmount = .seconds(30),
+        replyTimeout: TimeInterval = 300,
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         try await connect(
             target: .socketAddress(socketAddress), sniHostname: sniHostname, tls: tls,
-            connectTimeout: connectTimeout, tlsConfiguration: tlsConfiguration, group: group
+            connectTimeout: connectTimeout, replyTimeout: replyTimeout,
+            tlsConfiguration: tlsConfiguration, group: group
         )
     }
 
@@ -107,9 +127,11 @@ public enum SMTPBootstrap {
         sniHostname: String,
         tls: TLSMode,
         connectTimeout: TimeAmount,
+        replyTimeout: TimeInterval,
         tlsConfiguration: TLSConfiguration,
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
+        let stepTimeout = Self.timeAmount(seconds: replyTimeout)
         let promise = group.next().makePromise(of: NIOAsyncChannel<SMTPReply, SMTPCommand>.self)
 
         let bootstrap = ClientBootstrap(group: group)
@@ -137,6 +159,7 @@ public enum SMTPBootstrap {
                         tls: tls,
                         host: sniHostname,
                         tlsConfiguration: tlsConfiguration,
+                        stepTimeout: stepTimeout,
                         readyPromise: promise,
                         initialDecoder: decoder
                     )
@@ -156,7 +179,8 @@ public enum SMTPBootstrap {
         } catch {
             promise.fail(error)
             // A failure after the TCP connect (TLS handshake, greeting,
-            // STARTTLS) has started closing the channel; wait for it to
+            // STARTTLS, a hang-up or a bootstrap timeout) has started
+            // closing the channel; wait for it to
             // finish before throwing, so a pool freeing this dial's slot
             // never has the socket still open.
             if let connected {
@@ -165,6 +189,15 @@ public enum SMTPBootstrap {
             }
             throw error
         }
+    }
+
+    /// `replyTimeout` as a `TimeAmount`, clamped so a huge or non-finite
+    /// value means "effectively never" instead of trapping in the
+    /// `Int64` conversion.
+    static func timeAmount(seconds: TimeInterval) -> TimeAmount {
+        guard seconds.isFinite else { return seconds > 0 ? .nanoseconds(.max) : .zero }
+        let nanoseconds = max(0, seconds) * 1_000_000_000
+        return nanoseconds >= Double(Int64.max) ? .nanoseconds(.max) : .nanoseconds(Int64(nanoseconds))
     }
 
     enum Names {
@@ -236,6 +269,10 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
     private let tls: TLSMode
     private let host: String
     private let tlsConfiguration: TLSConfiguration
+    /// How long each bootstrap step (greeting, pre-TLS EHLO reply,
+    /// STARTTLS reply, STARTTLS handshake) may take; see `SMTPBootstrap`.
+    private let stepTimeout: TimeAmount
+    private var stepTimer: Scheduled<Void>?
     private let readyPromise: EventLoopPromise<NIOAsyncChannel<SMTPReply, SMTPCommand>>
     /// The pre-upgrade decoder — same reference `ByteToMessageHandler` was
     /// constructed with in the channel initializer. Queried, never
@@ -249,14 +286,56 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         tls: TLSMode,
         host: String,
         tlsConfiguration: TLSConfiguration,
+        stepTimeout: TimeAmount = .seconds(300),
         readyPromise: EventLoopPromise<NIOAsyncChannel<SMTPReply, SMTPCommand>>,
         initialDecoder: SMTPResponseDecoder
     ) {
         self.tls = tls
         self.host = host
         self.tlsConfiguration = tlsConfiguration
+        self.stepTimeout = stepTimeout
         self.readyPromise = readyPromise
         self.initialDecoder = initialDecoder
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        // `SMTPBootstrap` adds this handler before connecting, so the
+        // greeting clock normally starts in `channelActive`; this covers a
+        // handler added to an already-connected channel.
+        if context.channel.isActive {
+            armStepTimer(context: context)
+        }
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        // TCP is up (`connectTimeout` no longer applies): start the clock
+        // on the greeting.
+        armStepTimer(context: context)
+        context.fireChannelActive()
+    }
+
+    /// The peer hung up (or the connection otherwise dropped) before
+    /// bootstrap finished. Nothing else would complete `readyPromise` in
+    /// that case. Before the upgrade this is an ordinary connection
+    /// failure; inside the fenced `.upgrading` window it is reported the
+    /// same way as every other failure there (see `errorCaught`), so it
+    /// never becomes a plaintext-fallback trigger for opportunistic TLS.
+    /// In practice a close mid-handshake usually reaches `errorCaught`
+    /// first, as NIOSSL's `.handshakeFailed(eofDuringHandshake)`.
+    func channelInactive(context: ChannelHandlerContext) {
+        switch state {
+        case .awaitingGreeting, .awaitingPreTLSEHLOReply, .awaitingStartTLSReply:
+            fail(context: context, .connectionFailed(SMTPConnectionError.channelClosedByPeer))
+        case .upgrading:
+            fail(context: context, .starttlsInjection(underlying: SMTPConnectionError.channelClosedByPeer))
+        case .finished, .failed:
+            break
+        }
+        context.fireChannelInactive()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        cancelStepTimer()
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -340,6 +419,7 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             finish(context: context)
         case .startTLS:
             state = .awaitingPreTLSEHLOReply
+            armStepTimer(context: context)
             writeLine(context: context, "EHLO \(Self.probeHostname)")
         }
     }
@@ -355,6 +435,7 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             return
         }
         state = .awaitingStartTLSReply
+        armStepTimer(context: context)
         writeLine(context: context, "STARTTLS")
         // NOTE: `autoRead = false` is deliberately NOT set here. Setting it
         // at this point -- before the server's `220` has even arrived --
@@ -420,6 +501,8 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
 
     private func performTLSUpgrade(context: ChannelHandlerContext) {
         state = .upgrading
+        // The handshake gets its own full step.
+        armStepTimer(context: context)
         // Step 4: remove the plaintext decoder. Its `decodeLast` override
         // re-validates no residual bytes remain and throws
         // `.residualBytesOnRemoval` otherwise, surfacing via `errorCaught`
@@ -492,6 +575,7 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
     private func finish(context: ChannelHandlerContext) {
         guard state != .finished, state != .failed else { return }
         state = .finished
+        cancelStepTimer()
         let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
         context.pipeline.syncOperations.removeHandler(context: context).whenComplete { [weak self] result in
             guard let self else { return }
@@ -514,8 +598,29 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
     private func fail(context: ChannelHandlerContext, _ error: SMTPError) {
         guard state != .finished, state != .failed else { return }
         state = .failed
+        cancelStepTimer()
         context.close(promise: nil)
         readyPromise.fail(error)
+    }
+
+    /// (Re)starts the per-step clock. On expiry the bootstrap fails with
+    /// `SMTPConnectionError.replyTimedOut`, wrapped the same way
+    /// `channelInactive` wraps a hang-up, and `fail` closes the channel.
+    private func armStepTimer(context: ChannelHandlerContext) {
+        cancelStepTimer()
+        let boundContext = NIOLoopBoundBox(context, eventLoop: context.eventLoop)
+        stepTimer = context.eventLoop.scheduleTask(in: stepTimeout) { [weak self] in
+            guard let self else { return }
+            let error: SMTPError = self.state == .upgrading
+                ? .starttlsInjection(underlying: SMTPConnectionError.replyTimedOut)
+                : .connectionFailed(SMTPConnectionError.replyTimedOut)
+            self.fail(context: boundContext.value, error)
+        }
+    }
+
+    private func cancelStepTimer() {
+        stepTimer?.cancel()
+        stepTimer = nil
     }
 
     private func writeLine(context: ChannelHandlerContext, _ line: String) {

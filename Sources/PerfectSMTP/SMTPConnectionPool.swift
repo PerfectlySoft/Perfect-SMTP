@@ -95,6 +95,10 @@ public final class SMTPConnectionPool: Sendable {
         /// `SMTPConnection`, so a hung/black-holed remote server can't pin
         /// a pooled connection indefinitely (see `SMTPConnection`'s own
         /// doc comments). RFC 5321 §4.5.3.2's general per-command minimum.
+        /// Also bounds each step of the dial's bootstrap (greeting,
+        /// STARTTLS exchange and handshake; see `SMTPBootstrap`), so a peer
+        /// that accepts TCP and then stalls holds a reserved slot for at
+        /// most `replyTimeout` per step rather than forever.
         public var replyTimeout: TimeInterval
         /// FIX #4's phase-specific exception: RFC 5321 §4.5.3.2's longer
         /// minimum specifically for the final reply after the DATA
@@ -235,7 +239,7 @@ public final class SMTPConnectionPool: Sendable {
         self.dialer = { key in
             let asyncChannel = try await SMTPBootstrap.connect(
                 host: key.host, port: key.port, tls: key.tls,
-                connectTimeout: capturedTimeout, group: capturedGroup
+                connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout, group: capturedGroup
             )
             let connection = SMTPConnection(
                 asyncChannel: asyncChannel,
