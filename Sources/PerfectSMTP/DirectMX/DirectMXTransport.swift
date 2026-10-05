@@ -945,7 +945,15 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                         // codes.
                         backoffPolicy: retryQueueConfiguration.backoff
                     )
-                    try await connection.negotiateCapabilities()
+                    do {
+                        try await connection.negotiateCapabilities()
+                    } catch {
+                        // Close and wait before throwing (or trying the
+                        // next address): the pool frees this dial's slot
+                        // as soon as the dialer throws.
+                        await connection.closeAndWait()
+                        throw error
+                    }
                     return connection
                 } catch let error as SMTPError {
                     // Plan §9 Phase 4 security requirement: a detected
