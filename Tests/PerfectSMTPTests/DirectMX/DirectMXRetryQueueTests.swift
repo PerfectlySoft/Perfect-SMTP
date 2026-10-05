@@ -366,16 +366,107 @@ struct DirectMXRetryQueueTests {
         // resolved," which would pass even with a leaked duplicate loop
         // since `entries`' remove-before-`await` discipline already
         // prevents double-*redelivery* -- the bug is a leaked *task*, not
-        // corrupted delivery): exactly one `processDueEntries()` call per
-        // entry, proving only one loop task instance was ever actually
-        // driving this queue after the nudge. Before the fix, the
-        // cancelled-but-not-exited old loop task fell through its own
-        // `catch` and kept running as an independent duplicate -- it would
-        // wake on its own stale schedule and call `processDueEntries()`
-        // too (at least once, immediately, since a nudge-triggered
-        // cancellation resumes its sleep right away with nothing yet due),
-        // pushing this count above 2.
-        #expect(await queue.processDueEntriesInvocationCountForTesting == 2)
+        // corrupted delivery): no `processDueEntries()` pass ever ran on a
+        // superseded loop task. Before the fix, the cancelled-but-not-
+        // exited old loop task fell through its own `catch` and called
+        // `processDueEntries()` right away (its cancelled sleep resumes
+        // immediately), then kept running as an independent duplicate. A
+        // duplicate that was never cancelled at all counts here too.
+        //
+        // This used to assert exactly two passes in total, which flaked
+        // under heavy load on Linux (5/40 loaded full-suite runs). The
+        // total is timing-dependent: a scheduler starved past entry 1's
+        // due time folds both entries into one pass, and since the loop
+        // sleeps on the monotonic clock but judges "due" by `Date()`, a
+        // wall clock step can wake it early for a harmless extra pass.
+        // Neither is the zombie, so the total isn't asserted.
+        #expect(await queue.processDueEntriesFromSupersededLoopCountForTesting == 0)
+
+        await queue.shutdown()
+    }
+
+    // A nudge's superseded loop task resumes from its cancelled sleep at
+    // some point after the replacement has started. It must not touch
+    // `currentSleepTarget` on its way out: if it clears the replacement's
+    // target, the next earlier-due entry sees "not sleeping" and skips the
+    // nudge, so it waits for the replacement's later wake instead of being
+    // tried on time.
+    @Test func aSupersededLoopTaskDoesNotClearItsReplacementsSleepTarget() async throws {
+        let collector = OutcomeCollector()
+        let config = DirectMXRetryQueue.Configuration(
+            backoff: .init(serviceUnavailable: 60, greylist: 60, defaultTransient: 60),
+            maxAttempts: 10, maxAge: 3600
+        )
+        let queue = DirectMXRetryQueue(
+            configuration: config,
+            redeliver: { envelope, _ in
+                envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        func enqueue(_ recipient: String, dueIn seconds: TimeInterval) async {
+            await queue.enqueue(
+                recipients: [recipient], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+                outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(seconds), attempt: 1, last: reply)
+            )
+        }
+
+        // A starts the loop; B nudges it, so the first loop task is
+        // cancelled and a replacement sleeps until B is due.
+        await enqueue("a@example.com", dueIn: 30)
+        try await Task.sleep(nanoseconds: 20 * 1_000_000)
+        await enqueue("b@example.com", dueIn: 10)
+        // Give both loop tasks time to settle: the replacement asleep on
+        // B, the superseded one (most likely) resumed from its cancelled
+        // sleep and gone.
+        try await Task.sleep(nanoseconds: 100 * 1_000_000)
+        // C is due well before B, so it has to nudge the replacement.
+        let cEnqueued = ContinuousClock.now
+        await enqueue("c@example.com", dueIn: 0.05)
+
+        let first = try await collector.waitForFirst(timeoutSeconds: 20)
+        let elapsed = ContinuousClock.now - cEnqueued
+        #expect(first.recipient == "c@example.com")
+        // Generous for a loaded CI box; the failure mode waits ~10s for B.
+        #expect(elapsed < .seconds(3), "C took \(elapsed); the nudge was skipped")
+
+        await queue.shutdown()
+    }
+
+    // The loop exits when the queue empties. It has to clear `loopTask` as
+    // it goes, or `nudgeLoop` (which only starts a loop when `loopTask` is
+    // nil) never starts another, and nothing enqueued after the first
+    // drain is retried until `shutdown()` reports it as failed.
+    @Test func anEntryEnqueuedAfterTheQueueDrainsIsStillRetried() async throws {
+        let collector = OutcomeCollector()
+        let queue = DirectMXRetryQueue(
+            redeliver: { envelope, _ in
+                envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        func enqueue(_ recipient: String) async {
+            await queue.enqueue(
+                recipients: [recipient], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+                outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+            )
+        }
+
+        await enqueue("first@example.com")
+        let first = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(first.recipient == "first@example.com")
+        // Let the loop find the queue empty and exit.
+        try await Task.sleep(nanoseconds: 100 * 1_000_000)
+
+        await enqueue("second@example.com")
+        let second = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(second.recipient == "second@example.com")
+        guard case .delivered = second.outcome else {
+            Issue.record("expected the second entry to be retried and delivered, got \(second.outcome)")
+            return
+        }
 
         await queue.shutdown()
     }
@@ -400,12 +491,12 @@ private func backoffSeconds(_ outcome: DeliveryResult.Outcome, since: Date) -> D
 /// (bounded, polling) without a fixed `Task.sleep` guess.
 actor OutcomeCollector {
     private var results: [DeliveryResult] = []
-    private var waiters: [CheckedContinuation<DeliveryResult, Error>] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<DeliveryResult, Error>)] = []
+    private var expired: Set<UUID> = []
 
     func record(_ result: DeliveryResult) {
-        if let waiter = waiters.first {
-            waiters.removeFirst()
-            waiter.resume(returning: result)
+        if !waiters.isEmpty {
+            waiters.removeFirst().continuation.resume(returning: result)
         } else {
             results.append(result)
         }
@@ -413,30 +504,39 @@ actor OutcomeCollector {
 
     /// Bounded wait for the first recorded outcome -- resumes immediately
     /// if one is already recorded, otherwise parks until `record(_:)`
-    /// delivers one or `timeoutSeconds` elapses.
+    /// delivers one or `timeoutSeconds` elapses. On timeout the parked
+    /// waiter is removed and resumed with `.timedOut`, so a result that
+    /// never arrives fails the test instead of hanging it, and a late
+    /// result goes to the next wait rather than to an abandoned one.
     func waitForFirst(timeoutSeconds: Double = 2) async throws -> DeliveryResult {
         if !results.isEmpty { return results.removeFirst() }
-        return try await withThrowingTaskGroup(of: DeliveryResult.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DeliveryResult, Error>) in
-                    Task { await self.park(continuation) }
-                }
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(max(0, timeoutSeconds) * 1_000_000_000))
-                throw OutcomeCollectorError.timedOut
-            }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else { throw OutcomeCollectorError.timedOut }
-            return result
+        let id = UUID()
+        let timeout = Task {
+            try await Task.sleep(nanoseconds: UInt64(max(0, timeoutSeconds) * 1_000_000_000))
+            await self.expire(id)
+        }
+        defer { timeout.cancel() }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DeliveryResult, Error>) in
+            Task { await self.park(id, continuation) }
         }
     }
 
-    private func park(_ continuation: CheckedContinuation<DeliveryResult, Error>) {
-        if !results.isEmpty {
+    private func park(_ id: UUID, _ continuation: CheckedContinuation<DeliveryResult, Error>) {
+        if expired.remove(id) != nil {
+            continuation.resume(throwing: OutcomeCollectorError.timedOut)
+        } else if !results.isEmpty {
             continuation.resume(returning: results.removeFirst())
         } else {
-            waiters.append(continuation)
+            waiters.append((id, continuation))
+        }
+    }
+
+    private func expire(_ id: UUID) {
+        if let index = waiters.firstIndex(where: { $0.id == id }) {
+            waiters.remove(at: index).continuation.resume(throwing: OutcomeCollectorError.timedOut)
+        } else {
+            // Not parked yet; `park` will see this and fail the wait.
+            expired.insert(id)
         }
     }
 }

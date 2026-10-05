@@ -191,6 +191,11 @@ public actor DirectMXRetryQueue {
     private let redeliver: @Sendable (SMTPEnvelope, SignedMessage) async -> [DeliveryResult]
     private let onTerminalOutcome: (@Sendable (DeliveryResult) async -> Void)?
     private var loopTask: Task<Void, Never>?
+    /// Bumped every time `nudgeLoop` starts a loop task; each task is
+    /// handed the value current when it was started. Only the task
+    /// holding the current generation is `loopTask`, so a task can tell
+    /// whether it has been superseded.
+    private var loopGeneration = 0
     /// The wall-clock instant the currently-running loop iteration is
     /// asleep until, if any -- read by `enqueue`/`reschedule` to decide
     /// whether a newly-arrived entry is due earlier than what the loop is
@@ -200,15 +205,20 @@ public actor DirectMXRetryQueue {
     private var currentSleepTarget: Date?
     private var isShutDown = false
     /// FIX #3 regression-test instrumentation only (concurrency +
-    /// SMTP-protocol reviews): incremented once per `processDueEntries()`
-    /// call, regardless of whether any entry actually turned out to be
-    /// due. A leaked zombie loop task (the bug this counter exists to
-    /// make observable) wakes and calls `processDueEntries()` on its own,
-    /// independent schedule -- indistinguishable from the legitimate
-    /// loop's own calls except by counting how many happen in total.
+    /// SMTP-protocol reviews): incremented for every `processDueEntries()`
+    /// call made by a loop task that is no longer the current one. A
+    /// leaked zombie loop task (the bug this counter exists to make
+    /// observable) is exactly that -- whether it kept going after
+    /// `nudgeLoop` cancelled it, or was never cancelled at all -- so the
+    /// expected value is always 0. This counts the bug's signature rather
+    /// than the total number of passes, because the total depends on
+    /// timing: `Task.sleep` runs on the monotonic clock while "due" is
+    /// judged by `Date()`, so a wall clock step can wake the loop before
+    /// anything is due and cost one harmless extra pass, and a starved
+    /// scheduler can fold two due entries into one pass.
     /// Not `public` -- read via `@testable import` from
     /// `DirectMXRetryQueueTests`.
-    private(set) var processDueEntriesInvocationCountForTesting = 0
+    private(set) var processDueEntriesFromSupersededLoopCountForTesting = 0
 
     /// - Parameters:
     ///   - redeliver: Attempts delivery exactly once more for the
@@ -356,13 +366,19 @@ public actor DirectMXRetryQueue {
     private func nudgeLoop(forCandidate candidate: Date) {
         guard !isShutDown else { return }
         guard loopTask != nil else {
-            loopTask = Task { [weak self] in await self?.runLoop() }
+            startLoop()
             return
         }
         if let currentSleepTarget, candidate < currentSleepTarget {
             loopTask?.cancel()
-            loopTask = Task { [weak self] in await self?.runLoop() }
+            startLoop()
         }
+    }
+
+    private func startLoop() {
+        loopGeneration += 1
+        let generation = loopGeneration
+        loopTask = Task { [weak self] in await self?.runLoop(generation: generation) }
     }
 
     /// `[weak self]` at every `Task` creation site in this file (here and
@@ -375,13 +391,27 @@ public actor DirectMXRetryQueue {
     /// even after becoming unreachable. With `weak self`, once the last
     /// external reference drops, the actor can deinitialize; this loop's
     /// next wake finds `self == nil` and exits.
-    private func runLoop() async {
-        while !isShutDown {
+    private func runLoop(generation: Int) async {
+        // `!Task.isCancelled` here too: a replacement that `nudgeLoop`
+        // cancels before it ever runs must not publish a
+        // `currentSleepTarget` of its own on the way out. If it did while
+        // the live loop was mid-pass, a later nudge could cancel the live
+        // loop in the middle of `redeliver`. (Not covered by a test; the
+        // interleaving is too narrow to provoke reliably.)
+        while !isShutDown, !Task.isCancelled {
             guard let sleepUntil = entries.values.map(\.nextAttempt).min() else {
                 // Nothing pending -- exit; `nudgeLoop` restarts this loop
                 // the next time `enqueue` adds something, so no wakeup is
                 // wasted polling an empty queue (the efficiency point
-                // called out in this task's brief).
+                // called out in this task's brief). `loopTask` must be
+                // cleared for that restart to happen: `nudgeLoop` only
+                // starts a loop when `loopTask` is nil, and with no sleep
+                // target it never nudges either, so leaving it set meant
+                // nothing enqueued after the queue first drained was ever
+                // retried. A loop that got here is the current one (the
+                // `while` condition rules out a cancelled, superseded
+                // task); the generation check just makes that explicit.
+                if generation == loopGeneration { loopTask = nil }
                 return
             }
             currentSleepTarget = sleepUntil
@@ -395,7 +425,6 @@ public actor DirectMXRetryQueue {
                 // `isShutDown`) is what actually disambiguates and exits
                 // promptly on either.
             }
-            currentSleepTarget = nil
             // FIX #3 (concurrency + SMTP-protocol reviews, independently
             // converged on the same bug): a *nudge*-triggered cancellation
             // (`nudgeLoop` cancelling this exact task instance to start a
@@ -422,12 +451,19 @@ public actor DirectMXRetryQueue {
             // shutting down," never "keep going regardless of how the
             // sleep returned."
             guard !isShutDown, !Task.isCancelled else { return }
-            await processDueEntries()
+            // Cleared only after the check above. A cancelled task may
+            // resume after `nudgeLoop`'s replacement has already set its
+            // own target; clearing it from here wiped that target, so the
+            // next earlier-due `enqueue` skipped its nudge and the entry
+            // waited for the replacement's later wake. (`shutdown()`
+            // clears it itself.)
+            currentSleepTarget = nil
+            await processDueEntries(generation: generation)
         }
     }
 
-    private func processDueEntries() async {
-        processDueEntriesInvocationCountForTesting += 1
+    private func processDueEntries(generation: Int) async {
+        if generation != loopGeneration { processDueEntriesFromSupersededLoopCountForTesting += 1 }
         let now = Date()
         let due = entries.values.filter { $0.nextAttempt <= now }
         for entry in due {
