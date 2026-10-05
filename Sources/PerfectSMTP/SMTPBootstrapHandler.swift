@@ -144,16 +144,25 @@ public enum SMTPBootstrap {
                 }
             }
 
+        var connected: (any Channel)?
         do {
             switch target {
             case .hostPort(let host, let port):
-                _ = try await bootstrap.connect(host: host, port: port).get()
+                connected = try await bootstrap.connect(host: host, port: port).get()
             case .socketAddress(let address):
-                _ = try await bootstrap.connect(to: address).get()
+                connected = try await bootstrap.connect(to: address).get()
             }
             return try await promise.futureResult.get()
         } catch {
             promise.fail(error)
+            // A failure after the TCP connect (TLS handshake, greeting,
+            // STARTTLS) has started closing the channel; wait for it to
+            // finish before throwing, so a pool freeing this dial's slot
+            // never has the socket still open.
+            if let connected {
+                connected.close(promise: nil)
+                try? await connected.closeFuture.get()
+            }
             throw error
         }
     }
