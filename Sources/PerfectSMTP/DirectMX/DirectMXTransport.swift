@@ -633,7 +633,7 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// FIX #1 (milestone security review, CRITICAL -- "the circuit breaker
     /// launders a detected STARTTLS-injection attack into a silent
     /// plaintext downgrade"): before this fix, only `.starttlsInjection`
-    /// was excluded here. `SMTPConnectionPool.checkBreaker` throws a bare
+    /// was excluded here. `SMTPConnectionPool`'s breaker check throws a bare
     /// `SMTPError.circuitOpen` -- with **no** associated value carrying
     /// *why* the breaker opened -- and `SMTPConnectionPool.checkout` calls
     /// `recordFailure(key)` on every dial failure uniformly, including a
@@ -648,7 +648,7 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
     /// injection attempts -- trivially reachable across a handful of
     /// recipients or retries within seconds -- to flip that host's
     /// `Key(host, port, tls: .startTLS)` breaker open. Once open,
-    /// `checkBreaker` rejects with `.circuitOpen` *before ever dialing
+    /// the pool rejects with `.circuitOpen` *before ever dialing
     /// again*, so the previous code here (which only pattern-matched
     /// `.starttlsInjection` specifically) fell through to the plaintext-
     /// retry branch and connected the **same attacker-controlled host**

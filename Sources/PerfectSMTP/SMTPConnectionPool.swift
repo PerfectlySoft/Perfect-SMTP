@@ -2,12 +2,13 @@
 //  SMTPConnectionPool.swift
 //  PerfectSMTP
 //
-//  Connection pool actor (plan §4.4). Per-destination keying by
-//  `(host, port, tls)`. Bounded concurrency enforced inside the actor (no
-//  locks — the actor is the mutual-exclusion mechanism).
+//  Connection pool (plan §4.4). Per-destination keying by
+//  `(host, port, tls)`. Bounded concurrency enforced under one lock (see
+//  "Why a lock, not an actor" on `SMTPConnectionPool`).
 //
 
 import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 
 /// Milestone review finding (documentation-only, no `Key` redesign this
@@ -27,7 +28,31 @@ import NIOCore
 /// one identity being reused for another. If a future need justifies it,
 /// `Key` could be extended with a credential fingerprint, but that redesign
 /// is out of scope for this fix pass.
-public actor SMTPConnectionPool {
+///
+/// **Why a lock, not an actor.** This used to be an actor that parked
+/// waiters from inside `withTaskCancellationHandler {
+/// withCheckedThrowingContinuation { ... } }`, relying on those closures
+/// inheriting its isolation. The same construct in `SMTPMailer`'s
+/// `ResultChannel` ran off its actor's executor in Swift 6.4 optimized
+/// builds (see that type's doc comment). Stress tests never caught this
+/// pool doing it, but every pool decision (reuse, reserve, park, hand off,
+/// cancel, shut down) now happens under one `NIOLockedValueBox`, so
+/// correctness doesn't depend on executor inference. Cancellation removes
+/// a parked waiter under the lock and resumes it directly, with no
+/// unstructured `Task`. The lock is never held across an `await` or while
+/// resuming a continuation, dialing, or closing a channel.
+///
+/// Freed capacity always reaches a waiter that can use it: a healthy
+/// release hands its live connection to the oldest waiter for the same key;
+/// any other freed slot -- an unhealthy release, a failed dial, or a slot
+/// freed under the shared `maxTotal` -- is reserved for the oldest parked
+/// waiter (across all keys) that `maxPerHost`/`maxTotal` allow, which dials
+/// for itself. Waiters whose key's circuit breaker is open fail with
+/// `SMTPError.circuitOpen` instead, exactly as a fresh checkout would.
+/// (The actor version only handed a slot to same-key waiters, and only on
+/// release, so a waiter could stay parked forever after a failed dial or
+/// behind another host's `maxTotal` usage.)
+public final class SMTPConnectionPool: Sendable {
     public struct Key: Hashable, Sendable {
         public let host: String
         public let port: Int
@@ -83,51 +108,24 @@ public actor SMTPConnectionPool {
         case shutdown
     }
 
-    /// Resolved atomically, within a single actor activation, when a
-    /// parked waiter is woken (plan §4.4: "slot ownership transfers
-    /// atomically as part of the same actor activation that resumes a
-    /// waiter, so a fresh checkout can't race in and steal it").
-    private enum WaiterOutcome: Sendable {
-        /// A live, healthy connection handed directly to the waiter —
-        /// `activeCount` is intentionally left unchanged by the resolving
-        /// call, since ownership transferred rather than being released
-        /// then reacquired.
+    /// What a checkout ends up with once its decision is made under the
+    /// lock -- immediately, or later when a parked waiter is resolved.
+    /// Slot ownership transfers under the same lock acquisition that
+    /// dequeues the waiter (plan §4.4), so a fresh checkout can't race in
+    /// and steal it.
+    private enum CheckoutOutcome: Sendable {
+        /// A live connection: reused from idle, or handed over directly by
+        /// a healthy release. `activeCount` already includes it.
         case connection(SMTPConnection)
-        /// The freed capacity (not a live connection) was reserved for
-        /// this waiter — it must dial for itself, outside the atomic
-        /// section, but the reservation itself already happened inside it.
-        case reservedSlotDialYourself
+        /// A slot (not a connection) is reserved for this checkout, which
+        /// must dial for itself outside the lock. `activeCount` already
+        /// includes it.
+        case dialYourself
     }
 
-    /// `@unchecked Sendable`: every method that touches `resolved` is only
-    /// ever called from within this pool actor's isolated methods
-    /// (`cancelWaiter`/`handOff`), which the actor itself serializes —
-    /// never truly concurrent, matching this codebase's other
-    /// single-owner `@unchecked Sendable` precedents. The `resolved` flag
-    /// is a second, explicit line of defense against a double-resume
-    /// (plan §4.4's required single-owner guard) on top of the primary
-    /// mechanism (removing the waiter from the list before resolving it).
-    private final class Waiter: @unchecked Sendable {
-        let id = UUID()
-        private var continuation: CheckedContinuation<WaiterOutcome, Error>?
-        private var resolved = false
-
-        init(_ continuation: CheckedContinuation<WaiterOutcome, Error>) {
-            self.continuation = continuation
-        }
-
-        @discardableResult
-        func resolve(_ result: Result<WaiterOutcome, Error>) -> Bool {
-            guard !resolved else { return false }
-            resolved = true
-            let cont = continuation
-            continuation = nil
-            switch result {
-            case .success(let value): cont?.resume(returning: value)
-            case .failure(let error): cont?.resume(throwing: error)
-            }
-            return true
-        }
+    private struct Waiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<CheckoutOutcome, any Error>
     }
 
     private struct IdleEntry {
@@ -140,12 +138,30 @@ public actor SMTPConnectionPool {
         case open(until: DispatchTime)
     }
 
-    private var idle: [Key: [IdleEntry]] = [:]
-    private var activeCount: [Key: Int] = [:]
-    private var breaker: [Key: BreakerState] = [:]
-    private var waiters: [Key: [(id: UUID, waiter: Waiter)]] = [:]
-    private var isShutDown = false
+    /// Continuations to resume and channels to close once the lock is
+    /// released.
+    private struct Effects {
+        var resumes: [(CheckedContinuation<CheckoutOutcome, any Error>, Result<CheckoutOutcome, any Error>)] = []
+        var closes: [SMTPConnection] = []
 
+        func run() {
+            for connection in closes { connection.channel.close(promise: nil) }
+            for (continuation, result) in resumes { continuation.resume(with: result) }
+        }
+    }
+
+    private struct State {
+        var idle: [Key: [IdleEntry]] = [:]
+        var activeCount: [Key: Int] = [:]
+        var breaker: [Key: BreakerState] = [:]
+        var waiters: [Key: [Waiter]] = [:]
+        var isShutDown = false
+        var nextWaiterID: UInt64 = 0
+
+        var totalActive: Int { activeCount.values.reduce(0, +) }
+    }
+
+    private let state = NIOLockedValueBox(State())
     private let configuration: Configuration
     private let group: any EventLoopGroup
     private let ehloHostname: String
@@ -244,183 +260,242 @@ public actor SMTPConnectionPool {
         }
     }
 
+    /// Closes every idle connection, fails every parked checkout with
+    /// `PoolError.shutdown`, and makes later checkouts fail the same way.
+    /// Connections checked out at the time are closed when released.
+    /// (`async` for source compatibility with the actor version.)
     public func shutdown() async {
-        isShutDown = true
-        for (_, entries) in idle {
-            for entry in entries { entry.connection.channel.close(promise: nil) }
+        let effects: Effects = state.withLockedValue { state in
+            var effects = Effects()
+            state.isShutDown = true
+            for (_, entries) in state.idle {
+                effects.closes.append(contentsOf: entries.map(\.connection))
+            }
+            state.idle.removeAll()
+            for (_, list) in state.waiters {
+                for waiter in list { effects.resumes.append((waiter.continuation, .failure(PoolError.shutdown))) }
+            }
+            state.waiters.removeAll()
+            return effects
         }
-        idle.removeAll()
-        for (key, list) in waiters {
-            for entry in list { entry.waiter.resolve(.failure(PoolError.shutdown)) }
-            waiters[key] = []
-        }
-        waiters.removeAll()
+        effects.run()
     }
 
     // MARK: - Checkout
 
     private func checkout(_ key: Key) async throws -> SMTPConnection {
-        guard !isShutDown else { throw PoolError.shutdown }
-        try checkBreaker(key)
-
-        if let reused = popValidatedIdle(key) {
-            activeCount[key, default: 0] += 1
-            return reused
+        let id = state.withLockedValue { state in
+            state.nextWaiterID &+= 1
+            return state.nextWaiterID
+        }
+        let outcome: CheckoutOutcome = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CheckoutOutcome, any Error>) in
+                let effects: Effects = state.withLockedValue { state in
+                    var effects = Effects()
+                    let decision = decideCheckout(key, state: &state, closing: &effects.closes)
+                    switch decision {
+                    case .some(let result):
+                        effects.resumes.append((continuation, result))
+                    case .none:
+                        // Checked under the lock: the cancellation flag is
+                        // set before `onCancel` runs, so either this sees
+                        // it, or `onCancel` (same lock) finds the waiter.
+                        if Task.isCancelled {
+                            effects.resumes.append((continuation, .failure(CancellationError())))
+                        } else {
+                            state.waiters[key, default: []].append(Waiter(id: id, continuation: continuation))
+                        }
+                    }
+                    return effects
+                }
+                effects.run()
+            }
+        } onCancel: {
+            let waiter: Waiter? = state.withLockedValue { state in
+                guard var list = state.waiters[key], let index = list.firstIndex(where: { $0.id == id }) else { return nil }
+                let waiter = list.remove(at: index)
+                state.waiters[key] = list.isEmpty ? nil : list
+                return waiter
+            }
+            waiter?.continuation.resume(throwing: CancellationError())
         }
 
-        let currentActive = activeCount[key, default: 0]
-        let totalActive = activeCount.values.reduce(0, +)
-        if currentActive < configuration.maxPerHost, totalActive < configuration.maxTotal {
-            // Reentrancy discipline (plan §4.4): reserve the slot
-            // synchronously, in this same actor activation, before the
-            // first `await` -- closing the check-then-act race where a
-            // second concurrent checkout could observe the same
-            // not-yet-incremented count during the first checkout's dial.
-            activeCount[key, default: 0] += 1
+        switch outcome {
+        case .connection(let connection):
+            return connection
+        case .dialYourself:
             do {
                 let connection = try await dialer(key)
-                recordSuccess(key)
+                state.withLockedValue { recordSuccess(key, state: &$0) }
                 return connection
             } catch {
-                activeCount[key, default: 0] -= 1
-                recordFailure(key)
+                // The reservation is given up: pass it to a waiter that can
+                // use it, or free it.
+                let effects: Effects = state.withLockedValue { state in
+                    recordFailure(key, state: &state)
+                    var effects = Effects()
+                    state.activeCount[key, default: 1] -= 1
+                    admitWaiters(state: &state, effects: &effects)
+                    return effects
+                }
+                effects.run()
                 throw error
             }
         }
-
-        return try await parkAsWaiter(key)
     }
 
-    private func popValidatedIdle(_ key: Key) -> SMTPConnection? {
-        guard var list = idle[key], !list.isEmpty else { return nil }
+    /// The immediate checkout decision, made under the lock: a result, or
+    /// `nil` meaning "park". Reserving a slot here, before any `await`, is
+    /// what keeps concurrent checkouts from overshooting `maxPerHost`
+    /// (plan §4.4's reentrancy discipline).
+    private func decideCheckout(
+        _ key: Key, state: inout State, closing: inout [SMTPConnection]
+    ) -> Result<CheckoutOutcome, any Error>? {
+        if state.isShutDown { return .failure(PoolError.shutdown) }
+        if isBreakerOpen(key, state: &state) { return .failure(SMTPError.circuitOpen) }
+        if let reused = popValidatedIdle(key, state: &state, closing: &closing) {
+            state.activeCount[key, default: 0] += 1
+            return .success(.connection(reused))
+        }
+        if hasCapacity(for: key, state: state) {
+            state.activeCount[key, default: 0] += 1
+            return .success(.dialYourself)
+        }
+        return nil
+    }
+
+    private func hasCapacity(for key: Key, state: State) -> Bool {
+        state.activeCount[key, default: 0] < configuration.maxPerHost && state.totalActive < configuration.maxTotal
+    }
+
+    private func popValidatedIdle(_ key: Key, state: inout State, closing: inout [SMTPConnection]) -> SMTPConnection? {
+        guard var list = state.idle[key], !list.isEmpty else { return nil }
         var result: SMTPConnection?
         while !list.isEmpty {
             let entry = list.removeFirst()
             let ageNanoseconds = DispatchTime.now().uptimeNanoseconds &- entry.returnedAt.uptimeNanoseconds
             let ageSeconds = TimeInterval(ageNanoseconds) / 1_000_000_000
             if ageSeconds > configuration.idleTimeout || !entry.connection.channel.isActive {
-                entry.connection.channel.close(promise: nil)
+                closing.append(entry.connection)
                 continue
             }
             result = entry.connection
             break
         }
-        idle[key] = list
+        state.idle[key] = list
         return result
     }
 
-    private func parkAsWaiter(_ key: Key) async throws -> SMTPConnection {
-        let waiterID = UUID()
-        let outcome: WaiterOutcome = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<WaiterOutcome, Error>) in
-                let waiter = Waiter(continuation)
-                waiters[key, default: []].append((id: waiterID, waiter: waiter))
-            }
-        } onCancel: {
-            Task { await self.cancelWaiter(key, id: waiterID) }
-        }
-        switch outcome {
-        case .connection(let connection):
-            return connection
-        case .reservedSlotDialYourself:
-            do {
-                let connection = try await dialer(key)
-                await recordSuccessAsync(key)
-                return connection
-            } catch {
-                await releaseFailedReservation(key)
-                throw error
+    /// Settles parked waiters after capacity frees up or a breaker opens.
+    /// Waiters whose key's breaker is open fail with `.circuitOpen` (a
+    /// fresh checkout would too, and admitting them would only queue up
+    /// doomed dials against a host just seen failing). Then freed capacity
+    /// is reserved for the oldest remaining waiters -- across all keys, by
+    /// arrival order -- whose key `maxPerHost`/`maxTotal` allow; each
+    /// admitted waiter dials for itself.
+    private func admitWaiters(state: inout State, effects: inout Effects) {
+        for key in Array(state.waiters.keys) where isBreakerOpen(key, state: &state) {
+            for waiter in state.waiters.removeValue(forKey: key) ?? [] {
+                effects.resumes.append((waiter.continuation, .failure(SMTPError.circuitOpen)))
             }
         }
-    }
-
-    private func cancelWaiter(_ key: Key, id: UUID) {
-        guard var list = waiters[key], let idx = list.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = list[idx].waiter
-        // Single-owner guard: whichever of {cancellation, a concurrent
-        // release()} resolves the waiter first wins; the other no-ops.
-        if waiter.resolve(.failure(CancellationError())) {
-            list.remove(at: idx)
-            waiters[key] = list
+        var total = state.totalActive
+        while total < configuration.maxTotal {
+            // The oldest waiter (smallest id) among keys under maxPerHost.
+            var oldest: (key: Key, id: UInt64)?
+            for (key, list) in state.waiters where state.activeCount[key, default: 0] < configuration.maxPerHost {
+                if let first = list.first, first.id < oldest?.id ?? .max { oldest = (key, first.id) }
+            }
+            guard let key = oldest?.key, var list = state.waiters[key] else { return }
+            let waiter = list.removeFirst()
+            state.waiters[key] = list.isEmpty ? nil : list
+            state.activeCount[key, default: 0] += 1
+            total += 1
+            effects.resumes.append((waiter.continuation, .success(.dialYourself)))
         }
-    }
-
-    private func recordSuccessAsync(_ key: Key) async { recordSuccess(key) }
-    private func releaseFailedReservation(_ key: Key) async {
-        activeCount[key, default: 1] -= 1
-        recordFailure(key)
     }
 
     // MARK: - Release
 
     private func release(_ key: Key, connection: SMTPConnection, healthy: Bool) {
-        // Milestone review finding (correctness): a connection released
-        // after `shutdown()` has already run must not be appended to
-        // `idle[key]` -- `shutdown()` only closes/drains what's *already*
-        // idle/parked at the moment it runs, and nothing ever pops/closes
-        // an entry added afterward, leaking the connection (and its
-        // socket) for the lifetime of the process. Close it immediately
-        // instead.
-        guard !isShutDown else {
-            connection.channel.close(promise: nil)
-            return
+        let effects: Effects = state.withLockedValue { state in
+            var effects = Effects()
+            // Milestone review finding (correctness): a connection released
+            // after `shutdown()` has already run must not be appended to
+            // `idle[key]` -- `shutdown()` only closes/drains what's *already*
+            // idle/parked at the moment it runs, and nothing ever pops/closes
+            // an entry added afterward, leaking the connection (and its
+            // socket) for the lifetime of the process. Close it immediately
+            // instead.
+            guard !state.isShutDown else {
+                effects.closes.append(connection)
+                return effects
+            }
+            if healthy, connection.channel.isActive {
+                recordSuccess(key, state: &state)
+                if var list = state.waiters[key], !list.isEmpty {
+                    // The live connection (and its slot) goes straight to
+                    // the oldest waiter for this key.
+                    let waiter = list.removeFirst()
+                    state.waiters[key] = list.isEmpty ? nil : list
+                    effects.resumes.append((waiter.continuation, .success(.connection(connection))))
+                    return effects
+                }
+                state.activeCount[key, default: 1] -= 1
+                state.idle[key, default: []].append(IdleEntry(connection: connection, returnedAt: DispatchTime.now()))
+            } else {
+                if !healthy { recordFailure(key, state: &state) } else { recordSuccess(key, state: &state) }
+                effects.closes.append(connection)
+                state.activeCount[key, default: 1] -= 1
+            }
+            admitWaiters(state: &state, effects: &effects)
+            return effects
         }
-        if healthy, connection.channel.isActive {
-            recordSuccess(key)
-            if handOff(key, outcome: .connection(connection)) { return }
-            activeCount[key, default: 1] -= 1
-            idle[key, default: []].append(IdleEntry(connection: connection, returnedAt: DispatchTime.now()))
-            return
-        }
-        if !healthy { recordFailure(key) } else { recordSuccess(key) }
-        connection.channel.close(promise: nil)
-        if handOff(key, outcome: .reservedSlotDialYourself) { return }
-        activeCount[key, default: 1] -= 1
+        effects.run()
     }
 
-    /// Hands `outcome` to the first still-live waiter for `key`, if any,
-    /// atomically within this actor activation. Returns `true` if a waiter
-    /// was resolved.
-    private func handOff(_ key: Key, outcome: WaiterOutcome) -> Bool {
-        guard var list = waiters[key], !list.isEmpty else { return false }
-        while !list.isEmpty {
-            let entry = list.removeFirst()
-            if entry.waiter.resolve(.success(outcome)) {
-                waiters[key] = list
-                return true
-            }
+    /// Reserved slots and parked waiters across all keys, for tests that
+    /// check nothing is left behind.
+    func snapshotForTesting() -> (active: Int, waiters: Int) {
+        state.withLockedValue { state in
+            (state.totalActive, state.waiters.values.reduce(0) { $0 + $1.count })
         }
-        waiters[key] = list
-        return false
     }
 
     // MARK: - Circuit breaker (co-located, plan §4.4)
 
-    private func checkBreaker(_ key: Key) throws {
-        guard let state = breaker[key] else { return }
-        switch state {
-        case .closed:
-            return
-        case .open(let until):
-            if DispatchTime.now() >= until {
-                breaker[key] = .closed(consecutiveFailures: 0)
-            } else {
-                throw SMTPError.circuitOpen
-            }
+    /// `true` while `key`'s breaker is open; an expired open breaker is
+    /// reset to closed here (the next attempt is the trial).
+    private func isBreakerOpen(_ key: Key, state: inout State) -> Bool {
+        guard case .open(let until) = state.breaker[key] else { return false }
+        if DispatchTime.now() >= until {
+            state.breaker[key] = .closed(consecutiveFailures: 0)
+            return false
         }
+        return true
     }
 
-    private func recordFailure(_ key: Key) {
+    private func recordFailure(_ key: Key, state: inout State) {
         let current: Int
-        if case .closed(let n) = breaker[key] ?? .closed(consecutiveFailures: 0) { current = n } else { current = 0 }
+        switch state.breaker[key] ?? .closed(consecutiveFailures: 0) {
+        case .closed(let n):
+            current = n
+        case .open:
+            // A failure from an attempt that started before the breaker
+            // opened keeps it open, for a fresh reset timeout. (The actor
+            // version reset an open breaker to `.closed(1)` here, so a run
+            // of failures kept re-closing it.)
+            state.breaker[key] = .open(until: Self.dispatchDeadline(secondsFromNow: configuration.circuitBreakerResetTimeout))
+            return
+        }
         let next = current + 1
-        breaker[key] = next >= configuration.circuitBreakerThreshold
+        state.breaker[key] = next >= configuration.circuitBreakerThreshold
             ? .open(until: Self.dispatchDeadline(secondsFromNow: configuration.circuitBreakerResetTimeout))
             : .closed(consecutiveFailures: next)
     }
 
-    private func recordSuccess(_ key: Key) {
-        breaker[key] = .closed(consecutiveFailures: 0)
+    private func recordSuccess(_ key: Key, state: inout State) {
+        state.breaker[key] = .closed(consecutiveFailures: 0)
     }
 }
 
