@@ -142,6 +142,9 @@ public struct DirectMXConfig: Sendable {
     /// domains should likely raise it above the Phase-1 default (32).
     public var pool: SMTPConnectionPool.Configuration
     public var connectTimeout: TimeAmount
+    /// Per-reply timeout for every SMTP step, including each step of the
+    /// dial's bootstrap (greeting, STARTTLS exchange and handshake; see
+    /// `SMTPBootstrap`).
     public var replyTimeout: TimeInterval
     public var dataTerminationTimeout: TimeInterval
     /// FIX #2 (milestone security review): SSRF-class filtering is
@@ -929,7 +932,7 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                     let socketAddress = try SocketAddress(ipAddress: address.description, port: key.port)
                     let asyncChannel = try await SMTPBootstrap.connect(
                         to: socketAddress, sniHostname: key.host, tls: key.tls,
-                        connectTimeout: config.connectTimeout, group: group
+                        connectTimeout: config.connectTimeout, replyTimeout: config.replyTimeout, group: group
                     )
                     let connection = SMTPConnection(
                         asyncChannel: asyncChannel, ehloHostname: config.ehloHostname,
