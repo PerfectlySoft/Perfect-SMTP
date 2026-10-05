@@ -58,7 +58,8 @@ public enum SMTPConnectionError: Error, Sendable, Equatable {
 /// This is a deliberate, documented judgment call (see the Phase 1 report).
 public final class SMTPConnection: @unchecked Sendable {
     /// Exposed for the pool's liveness checks (`channel.isActive`) and for
-    /// closing a connection being evicted.
+    /// closing a connection being evicted. The connection owns this channel:
+    /// it is closed when the connection is deinitialized.
     public let channel: Channel
 
     private var iterator: NIOAsyncChannelInboundStream<SMTPReply>.AsyncIterator
@@ -113,6 +114,31 @@ public final class SMTPConnection: @unchecked Sendable {
         self.replyTimeout = replyTimeout
         self.dataTerminationTimeout = dataTerminationTimeout
         self.backoffPolicy = backoffPolicy
+    }
+
+    /// `NIOAsyncChannel(wrappingChannelSynchronously:)` creates the outbound
+    /// writer with `finishOnDeinit: false`, which traps ("Deinited
+    /// NIOAsyncWriter without calling finish()") if the last reference to
+    /// an unfinished writer goes away. Today the channel handler happens to
+    /// hold its own reference until the channel closes, because
+    /// `SMTPBootstrap` wraps an already-active channel, but a channel that
+    /// activates after wrapping makes this connection the only owner. The
+    /// pool closes connections with a fire-and-forget `close(promise: nil)`
+    /// and drops them at once, so finish the writer here rather than rely
+    /// on that NIO detail. With outbound half-closure disabled (the
+    /// default) finishing the writer doesn't touch the channel itself, so
+    /// close it too: nothing else owns the channel once its connection is
+    /// gone, and a connection dropped without being closed would otherwise
+    /// leak its socket. The `isActive` check skips channels the pool has
+    /// already closed: `close` always hops to the event loop, which logs an
+    /// error (or traps under `SWIFTNIO_STRICT`) if the group has since shut
+    /// down. Shutting down a group closes its channels, so an active
+    /// channel always has a live loop.
+    deinit {
+        outbound.finish()
+        if channel.isActive {
+            channel.close(promise: nil)
+        }
     }
 
     /// Reads the next reply, or throws if the connection closed
