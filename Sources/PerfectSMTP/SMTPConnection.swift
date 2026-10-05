@@ -115,6 +115,21 @@ public final class SMTPConnection: @unchecked Sendable {
         self.backoffPolicy = backoffPolicy
     }
 
+    /// `NIOAsyncChannel(wrappingChannelSynchronously:)` creates the outbound
+    /// writer with `finishOnDeinit: false`, which traps ("Deinited
+    /// NIOAsyncWriter without calling finish()") if the last reference to
+    /// an unfinished writer goes away. Today the channel handler happens to
+    /// hold its own reference until the channel closes, because
+    /// `SMTPBootstrap` wraps an already-active channel, but a channel that
+    /// activates after wrapping makes this connection the only owner. The
+    /// pool closes connections with a fire-and-forget `close(promise: nil)`
+    /// and drops them at once, so finish the writer here rather than rely
+    /// on that NIO detail. With outbound half-closure disabled (the
+    /// default) finishing the writer doesn't touch the channel itself.
+    deinit {
+        outbound.finish()
+    }
+
     /// Reads the next reply, or throws if the connection closed
     /// mid-conversation (plan §4.3's "mid-conversation disconnect" —
     /// `NIOAsyncChannel`'s inbound sequence terminating on channel close
