@@ -17,16 +17,19 @@
 //  finished. The real-socket tests below exercise every teardown path
 //  (pool close-then-drop, unhealthy release, shutdown with idle
 //  connections, and dropping a connection without closing it at all).
-//  They passed without `SMTPConnection.deinit`'s `finish()` on macOS and
-//  Linux, which is the evidence for the claim above; with the `deinit` in
-//  place they are smoke tests and can no longer detect a change in that
-//  NIO detail.
+//  Before `SMTPConnection` had a `deinit`, none of them trapped on macOS or
+//  Linux, which is the evidence for the claim above. Now that the `deinit`
+//  finishes the writer they can no longer detect a change in that NIO
+//  detail; the drop-without-close test instead checks that the `deinit`
+//  closes the socket.
 //
 //  A channel that becomes active *after* wrapping (as an
 //  `NIOAsyncTestingChannel` does when a test calls `connect(to:)`) has the
 //  handler drop its copy, leaving `SMTPConnection` the only owner -- that
-//  is the path that used to trap, and `SMTPConnection.deinit` now finishes
-//  the writer so it no longer depends on who else holds a reference.
+//  is the path that used to trap. `SMTPConnection.deinit` now finishes the
+//  writer, so it no longer depends on who else holds a reference, and
+//  closes the channel, so a connection dropped without being closed no
+//  longer leaks its socket.
 //
 
 import NIOCore
@@ -56,15 +59,13 @@ struct SMTPConnectionTeardownTests {
             }
             #expect(released == nil, "the connection must actually deinit for this test to mean anything")
         }
-        for channel in channels {
-            #expect(channel.isActive)
-            _ = try? await channel.finish()
-        }
+        // Dropping the connection closes its channel.
+        #expect(await Self.allBecomeInactive(channels), "dropping a connection didn't close its channel")
     }
 
     // MARK: - Real sockets
 
-    @Test func droppingADialedConnectionWithoutClosingItDoesNotTrap() async throws {
+    @Test func droppingADialedConnectionWithoutClosingItClosesItsSocket() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         let server = try await TeardownFakeServer.start(group: group)
         var channels: [Channel] = []
@@ -72,10 +73,8 @@ struct SMTPConnectionTeardownTests {
             let connection = try await Self.dial(port: server.port, group: group)
             channels.append(connection.channel)
         }
-        for channel in channels {
-            #expect(channel.isActive)
-            try? await channel.close()
-        }
+        // Nothing here closes the channels; each connection's deinit must.
+        #expect(await Self.allBecomeInactive(channels), "dropping a connection didn't close its channel")
         try await server.channel.close()
         try await group.shutdownGracefully()
     }
@@ -119,6 +118,16 @@ struct SMTPConnectionTeardownTests {
         await pool.shutdown()
         try await server.channel.close()
         try await group.shutdownGracefully()
+    }
+
+    /// Polls rather than awaiting `closeFuture`: a cancelled `get()` keeps
+    /// waiting, so a regression would hang instead of failing.
+    private static func allBecomeInactive(_ channels: [any Channel]) async -> Bool {
+        for _ in 0..<500 {
+            if !channels.contains(where: \.isActive) { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return !channels.contains(where: \.isActive)
     }
 
     private static func dial(port: Int, group: any EventLoopGroup) async throws -> SMTPConnection {
