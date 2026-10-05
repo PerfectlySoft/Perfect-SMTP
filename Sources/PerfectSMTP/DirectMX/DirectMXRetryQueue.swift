@@ -199,16 +199,33 @@ public actor DirectMXRetryQueue {
     /// practical" efficiency instruction).
     private var currentSleepTarget: Date?
     private var isShutDown = false
+    /// Incremented each time a loop task is started; a loop only acts
+    /// while its generation is current. See `startLoop()`.
+    private var loopGeneration: UInt64 = 0
+
     /// FIX #3 regression-test instrumentation only (concurrency +
-    /// SMTP-protocol reviews): incremented once per `processDueEntries()`
-    /// call, regardless of whether any entry actually turned out to be
-    /// due. A leaked zombie loop task (the bug this counter exists to
-    /// make observable) wakes and calls `processDueEntries()` on its own,
-    /// independent schedule -- indistinguishable from the legitimate
-    /// loop's own calls except by counting how many happen in total.
-    /// Not `public` -- read via `@testable import` from
-    /// `DirectMXRetryQueueTests`.
-    private(set) var processDueEntriesInvocationCountForTesting = 0
+    /// SMTP-protocol reviews). Not `public` -- read via `@testable import`
+    /// from `DirectMXRetryQueueTests`.
+    ///
+    /// The leaked zombie loop task that FIX #3 removed was a superseded
+    /// loop task that kept running after `nudgeLoop` replaced it. These
+    /// count it directly: `processDueEntries()` calls from a superseded
+    /// (or cancelled) loop, which the fixed loop never makes, and loop
+    /// tasks currently running, which settles at 1 or 0. (An earlier
+    /// version of the regression test counted every `processDueEntries()`
+    /// call and expected exactly 2. That depends on timing: a late wake-up
+    /// can handle both entries in one pass, and since `nextAttempt` is
+    /// wall-clock `Date` while `Task.sleep` is monotonic, a wake-up just
+    /// before `Date()` reaches the target can add an empty pass. Both are
+    /// harmless, but the test failed intermittently under load.)
+    private(set) var processDueEntriesFromSupersededLoopCountForTesting = 0
+    private(set) var liveLoopCountForTesting = 0
+    /// How many times `nudgeLoop` took its cancel-and-restart branch, so
+    /// the regression test can confirm it exercised that branch.
+    private(set) var loopRestartCountForTesting = 0
+    /// Whether the loop is currently asleep waiting for an entry, so a
+    /// test can wait for that state instead of guessing with a sleep.
+    var isLoopSleepingForTesting: Bool { currentSleepTarget != nil }
 
     /// - Parameters:
     ///   - redeliver: Attempts delivery exactly once more for the
@@ -328,6 +345,7 @@ public actor DirectMXRetryQueue {
         isShutDown = true
         loopTask?.cancel()
         loopTask = nil
+        loopGeneration &+= 1
         currentSleepTarget = nil
         let draining = entries
         entries.removeAll()
@@ -356,32 +374,46 @@ public actor DirectMXRetryQueue {
     private func nudgeLoop(forCandidate candidate: Date) {
         guard !isShutDown else { return }
         guard loopTask != nil else {
-            loopTask = Task { [weak self] in await self?.runLoop() }
+            startLoop()
             return
         }
         if let currentSleepTarget, candidate < currentSleepTarget {
+            loopRestartCountForTesting += 1
             loopTask?.cancel()
-            loopTask = Task { [weak self] in await self?.runLoop() }
+            startLoop()
         }
     }
 
-    /// `[weak self]` at every `Task` creation site in this file (here and
-    /// in `nudgeLoop`) deliberately: this loop is the *only* thing that
-    /// would otherwise keep this actor alive indefinitely once every
-    /// external strong reference to it is dropped (there is no other
-    /// self-referencing cycle in this type). A strong `self` capture here
-    /// would mean a `DirectMXRetryQueue` a caller stopped using -- without
-    /// ever calling `shutdown()` -- leaks for the lifetime of the process
-    /// even after becoming unreachable. With `weak self`, once the last
-    /// external reference drops, the actor can deinitialize; this loop's
-    /// next wake finds `self == nil` and exits.
-    private func runLoop() async {
-        while !isShutDown {
+    /// Starts a new loop task as the current generation. Only the current
+    /// generation's loop may touch `loopTask`, `currentSleepTarget` or
+    /// process entries; a superseded one exits as soon as it wakes.
+    private func startLoop() {
+        loopGeneration &+= 1
+        let generation = loopGeneration
+        loopTask = Task { [weak self] in await self?.runLoop(generation: generation) }
+    }
+
+    /// Lifetime: `startLoop()` captures `self` weakly, but
+    /// `await self?.runLoop(...)` holds it strongly for the whole call,
+    /// sleeps included. So a queue a caller stopped using without calling
+    /// `shutdown()` stays alive while it still has entries -- it keeps
+    /// retrying them -- and is released once the loop runs out of work and
+    /// returns. The weak capture only avoids retaining the queue from a
+    /// task that hasn't started running yet.
+    private func runLoop(generation: UInt64) async {
+        liveLoopCountForTesting += 1
+        defer { liveLoopCountForTesting -= 1 }
+        while !isShutDown, generation == loopGeneration {
             guard let sleepUntil = entries.values.map(\.nextAttempt).min() else {
                 // Nothing pending -- exit; `nudgeLoop` restarts this loop
                 // the next time `enqueue` adds something, so no wakeup is
                 // wasted polling an empty queue (the efficiency point
-                // called out in this task's brief).
+                // called out in this task's brief). Clearing `loopTask` is
+                // what lets it: `nudgeLoop` only starts a loop when
+                // `loopTask` is nil. (It used to stay set to this finished
+                // task, so once the queue had drained, every later entry
+                // sat in `entries` unprocessed until `shutdown()`.)
+                loopTask = nil
                 return
             }
             currentSleepTarget = sleepUntil
@@ -395,6 +427,13 @@ public actor DirectMXRetryQueue {
                 // `isShutDown`) is what actually disambiguates and exits
                 // promptly on either.
             }
+            // A superseded loop (a newer generation exists) or a cancelled
+            // one must leave before touching shared state: the
+            // replacement may already be asleep, and clearing
+            // `currentSleepTarget` here used to make the actor think no
+            // loop was sleeping, so a later earlier-due entry didn't wake
+            // it.
+            guard generation == loopGeneration, !isShutDown, !Task.isCancelled else { return }
             currentSleepTarget = nil
             // FIX #3 (concurrency + SMTP-protocol reviews, independently
             // converged on the same bug): a *nudge*-triggered cancellation
@@ -421,13 +460,12 @@ public actor DirectMXRetryQueue {
             // replacement may already be running or the queue is
             // shutting down," never "keep going regardless of how the
             // sleep returned."
-            guard !isShutDown, !Task.isCancelled else { return }
-            await processDueEntries()
+            await processDueEntries(generation: generation)
         }
     }
 
-    private func processDueEntries() async {
-        processDueEntriesInvocationCountForTesting += 1
+    private func processDueEntries(generation: UInt64) async {
+        if generation != loopGeneration || Task.isCancelled { processDueEntriesFromSupersededLoopCountForTesting += 1 }
         let now = Date()
         let due = entries.values.filter { $0.nextAttempt <= now }
         for entry in due {
