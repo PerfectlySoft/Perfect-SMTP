@@ -312,6 +312,92 @@ struct DirectMXRetryQueueTests {
         await queue.shutdown()
     }
 
+    // MARK: - A retry rescheduled after shutdown() is reported, not held
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRetryRescheduledAfterShutdownIsReportedAsShutdownWhilePending() async throws {
+        // `shutdown()` reports every pending entry. An entry whose
+        // redelivery is in flight isn't in `entries` at that moment; if
+        // that redelivery then comes back as another temporary failure,
+        // the reschedule must be reported too, not parked in a queue that
+        // will never run again.
+        let collector = OutcomeCollector()
+        let redeliveryStarted = AsyncFlag()
+        let finishRedelivery = AsyncFlag()
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        let queue = DirectMXRetryQueue(
+            redeliver: { envelope, _ in
+                await redeliveryStarted.set()
+                await finishRedelivery.wait()
+                return envelope.recipients.map {
+                    DeliveryResult(recipient: $0, outcome: .queuedForRetry(nextAttempt: Date(), attempt: 2, last: reply))
+                }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+
+        await queue.enqueue(
+            recipients: ["r@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+        )
+        await redeliveryStarted.wait()
+        await queue.shutdown()
+        await finishRedelivery.set()
+
+        let terminal = try await collector.waitForFirst(timeoutSeconds: 5)
+        guard case .failed(let error) = terminal.outcome,
+              let queueError = error as? DirectMXRetryQueueError,
+              case .shutdownWhilePending = queueError
+        else {
+            Issue.record("expected .failed(.shutdownWhilePending), got \(terminal.outcome)")
+            return
+        }
+        #expect(terminal.recipient == "r@example.com")
+        #expect(await queue.pendingEntriesSnapshot().isEmpty)
+    }
+
+    // MARK: - The loop must restart after the queue drains
+
+    @Test(.timeLimit(.minutes(1)))
+    func anEntryEnqueuedAfterTheQueueDrainsIsStillRetried() async throws {
+        // The loop task exits once `entries` is empty. A later enqueue has
+        // to start a new one; otherwise that entry sits in the queue,
+        // never retried, until `shutdown()`.
+        let collector = OutcomeCollector()
+        let queue = DirectMXRetryQueue(
+            redeliver: { envelope, _ in
+                envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+
+        await queue.enqueue(
+            recipients: ["first@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+        )
+        let first = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(first.recipient == "first@example.com")
+
+        // Wait until the first loop has run out of work and exited (not
+        // just until the entry left `entries`, which happens before the
+        // loop finishes) -- otherwise the still-running loop would pick up
+        // the next entry and the test would stop covering the bug.
+        try await waitUntil { await queue.liveLoopCountForTesting == 0 }
+
+        await queue.enqueue(
+            recipients: ["second@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+        )
+        let second = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(second.recipient == "second@example.com")
+        guard case .delivered = second.outcome else {
+            Issue.record("expected the second entry to be redelivered, got \(second.outcome)")
+            return
+        }
+        await queue.shutdown()
+    }
+
     // MARK: - FIX #3 (concurrency + SMTP-protocol reviews): a nudge-
     // triggered cancel-and-restart must not leak the superseded loop task
     // as a permanent duplicate. Every other test in this file enqueues
@@ -320,31 +406,25 @@ struct DirectMXRetryQueueTests {
     // entry arrives with an earlier `nextAttempt` while the loop is
     // already asleep on an earlier-enqueued, later-due entry.
 
-    @Test func nudgeRestartCancelsThePreviousLoopTaskInsteadOfLeakingAZombie() async throws {
+    @Test(.timeLimit(.minutes(1)))
+    func nudgeRestartCancelsThePreviousLoopTaskInsteadOfLeakingAZombie() async throws {
         let collector = OutcomeCollector()
-        let config = DirectMXRetryQueue.Configuration(
-            backoff: .init(serviceUnavailable: 0.001, greylist: 0.001, defaultTransient: 0.001),
-            maxAttempts: 10, maxAge: 3600
-        )
         let queue = DirectMXRetryQueue(
-            configuration: config,
             redeliver: { envelope, _ in
                 envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
             },
             onTerminalOutcome: { result in await collector.record(result) }
         )
-
         let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
-        // Entry 1: due comfortably later -- this is what starts the loop
-        // task sleeping on a target that the second enqueue below must
-        // then notice is stale.
+
+        // Entry 1: due far beyond this test, so the loop sleeps on it
+        // throughout and no timing assumption is involved.
         await queue.enqueue(
             recipients: ["slow@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
-            outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(0.4), attempt: 1, last: reply)
+            outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(30), attempt: 1, last: reply)
         )
-        // Give the loop time to actually start sleeping on entry 1's
-        // target before nudging it.
-        try await Task.sleep(nanoseconds: UInt64(20) * 1_000_000)
+        try await waitUntil { await queue.isLoopSleepingForTesting }
+
         // Entry 2: due much sooner than entry 1's `nextAttempt` -- forces
         // `nudgeLoop`'s cancel-and-restart branch (not just the
         // fresh-start branch every other test in this file exercises).
@@ -352,32 +432,83 @@ struct DirectMXRetryQueueTests {
             recipients: ["fast@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
             outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(0.05), attempt: 1, last: reply)
         )
+        #expect(await queue.loopRestartCountForTesting == 1, "the cancel-and-restart branch didn't run")
 
-        let first = try await collector.waitForFirst(timeoutSeconds: 3)
-        let second = try await collector.waitForFirst(timeoutSeconds: 3)
-        #expect(Set([first.recipient, second.recipient]) == Set(["fast@example.com", "slow@example.com"]))
-        guard case .delivered = first.outcome, case .delivered = second.outcome else {
-            Issue.record("expected both entries to resolve .delivered, got \(first.outcome) and \(second.outcome)")
+        let fast = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(fast.recipient == "fast@example.com")
+        guard case .delivered = fast.outcome else {
+            Issue.record("expected fast@example.com to be redelivered, got \(fast.outcome)")
             return
         }
 
-        // The decisive assertion (this is the regression coverage for the
-        // zombie-task leak itself, not just "both entries eventually
-        // resolved," which would pass even with a leaked duplicate loop
-        // since `entries`' remove-before-`await` discipline already
-        // prevents double-*redelivery* -- the bug is a leaked *task*, not
-        // corrupted delivery): exactly one `processDueEntries()` call per
-        // entry, proving only one loop task instance was ever actually
-        // driving this queue after the nudge. Before the fix, the
-        // cancelled-but-not-exited old loop task fell through its own
-        // `catch` and kept running as an independent duplicate -- it would
-        // wake on its own stale schedule and call `processDueEntries()`
-        // too (at least once, immediately, since a nudge-triggered
-        // cancellation resumes its sleep right away with nothing yet due),
-        // pushing this count above 2.
-        #expect(await queue.processDueEntriesInvocationCountForTesting == 2)
+        // The decisive assertions (regression coverage for the zombie-task
+        // leak itself, not just "the entry got delivered", which would
+        // pass even with a leaked duplicate loop, since `entries`' remove-
+        // before-`await` discipline already prevents double redelivery).
+        // Before the fix, the superseded loop task fell through its
+        // `catch`, called `processDueEntries()` right away and kept running
+        // as an independent duplicate. Now exactly one loop task survives
+        // (the replacement, asleep on entry 1) and no superseded one ever
+        // processed entries. Counting live loops also catches a superseded
+        // loop that was never cancelled at all, which would sleep on
+        // entry 1's 30 s target without calling anything.
+        let oneLoopLeft = try? await waitUntil(timeoutSeconds: 2) { await queue.liveLoopCountForTesting == 1 }
+        let liveLoops = await queue.liveLoopCountForTesting
+        #expect(oneLoopLeft != nil, "\(liveLoops) loop tasks still running after the restart")
+        #expect(await queue.processDueEntriesFromSupersededLoopCountForTesting == 0)
+        #expect(await queue.pendingEntriesSnapshot().map(\.recipients) == [["slow@example.com"]])
 
         await queue.shutdown()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSupersededLoopDoesNotHideTheReplacementsSleepTarget() async throws {
+        // After a restart, the superseded loop wakes from its cancelled
+        // sleep at about the same time the replacement goes to sleep. It
+        // used to clear `currentSleepTarget` on its way out; when that
+        // happened after the replacement was asleep, the actor believed
+        // nothing was sleeping, so an earlier-due entry enqueued next
+        // didn't trigger a restart and waited for the stale target. Which
+        // side runs first depends on scheduling, so this runs many queues
+        // at once to get both orders, and checks the invariant directly.
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        let failures = try await withThrowingTaskGroup(of: Int.self) { group in
+            for _ in 0..<40 {
+                group.addTask {
+                    let collector = OutcomeCollector()
+                    let queue = DirectMXRetryQueue(
+                        redeliver: { envelope, _ in
+                            envelope.recipients.map { DeliveryResult(recipient: $0, outcome: .delivered(SMTPReply(code: 250, lines: ["OK"]))) }
+                        },
+                        onTerminalOutcome: { result in await collector.record(result) }
+                    )
+                    func enqueue(_ recipient: String, dueIn seconds: TimeInterval) async {
+                        await queue.enqueue(
+                            recipients: [recipient], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+                            outcome: .queuedForRetry(nextAttempt: Date().addingTimeInterval(seconds), attempt: 1, last: reply)
+                        )
+                    }
+
+                    await enqueue("a@example.com", dueIn: 20)
+                    try await waitUntil { await queue.isLoopSleepingForTesting }
+                    await enqueue("b@example.com", dueIn: 10)
+                    try await waitUntil { await queue.liveLoopCountForTesting == 1 }
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                    // The replacement is asleep on b's target; the actor
+                    // must still know that.
+                    guard await queue.isLoopSleepingForTesting else {
+                        await queue.shutdown()
+                        return 1
+                    }
+                    await enqueue("c@example.com", dueIn: 0.01)
+                    let earliest = try await collector.waitForFirst(timeoutSeconds: 3)
+                    await queue.shutdown()
+                    return earliest.recipient == "c@example.com" ? 0 : 1
+                }
+            }
+            return try await group.reduce(0, +)
+        }
+        #expect(failures == 0, "\(failures) of 40 queues lost track of their sleeping loop")
     }
 
     private static func message() -> SignedMessage {
@@ -395,49 +526,48 @@ private func backoffSeconds(_ outcome: DeliveryResult.Outcome, since: Date) -> D
     return nextAttempt.timeIntervalSince(since)
 }
 
+/// A set-once flag a test can await.
+private actor AsyncFlag {
+    private var isSet = false
+    func set() { isSet = true }
+    func wait() async {
+        while !isSet { try? await Task.sleep(nanoseconds: 1_000_000) }
+    }
+}
+
+/// Polls `condition` every millisecond until it holds, throwing
+/// `OutcomeCollectorError.timedOut` after `timeoutSeconds`.
+private func waitUntil(timeoutSeconds: Double = 5, _ condition: () async -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    while await !condition() {
+        guard Date() < deadline else { throw OutcomeCollectorError.timedOut }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+}
+
 /// Collects every `DeliveryResult` reported via a `DirectMXRetryQueue`'s
 /// `onTerminalOutcome` callback, and lets a test await the first one
 /// (bounded, polling) without a fixed `Task.sleep` guess.
 actor OutcomeCollector {
     private var results: [DeliveryResult] = []
-    private var waiters: [CheckedContinuation<DeliveryResult, Error>] = []
 
     func record(_ result: DeliveryResult) {
-        if let waiter = waiters.first {
-            waiters.removeFirst()
-            waiter.resume(returning: result)
-        } else {
-            results.append(result)
-        }
+        results.append(result)
     }
 
-    /// Bounded wait for the first recorded outcome -- resumes immediately
-    /// if one is already recorded, otherwise parks until `record(_:)`
-    /// delivers one or `timeoutSeconds` elapses.
+    /// Bounded wait for the first recorded outcome: returns it as soon as
+    /// one is recorded, or throws `timedOut` after `timeoutSeconds`. Polls,
+    /// so the timeout always fires. (The previous version parked a
+    /// continuation inside a task group; that child ignored cancellation,
+    /// so the group could never return on timeout and a lost delivery hung
+    /// the test run instead of failing it.)
     func waitForFirst(timeoutSeconds: Double = 2) async throws -> DeliveryResult {
-        if !results.isEmpty { return results.removeFirst() }
-        return try await withThrowingTaskGroup(of: DeliveryResult.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DeliveryResult, Error>) in
-                    Task { await self.park(continuation) }
-                }
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(max(0, timeoutSeconds) * 1_000_000_000))
-                throw OutcomeCollectorError.timedOut
-            }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else { throw OutcomeCollectorError.timedOut }
-            return result
+        let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
+        while results.isEmpty {
+            guard Date() < deadline else { throw OutcomeCollectorError.timedOut }
+            try await Task.sleep(nanoseconds: 1_000_000)
         }
-    }
-
-    private func park(_ continuation: CheckedContinuation<DeliveryResult, Error>) {
-        if !results.isEmpty {
-            continuation.resume(returning: results.removeFirst())
-        } else {
-            waiters.append(continuation)
-        }
+        return results.removeFirst()
     }
 }
 
