@@ -381,8 +381,8 @@ public actor DirectMXRetryQueue {
         loopTask = Task { [weak self] in await self?.runLoop(generation: generation) }
     }
 
-    /// `[weak self]` at every `Task` creation site in this file (here and
-    /// in `nudgeLoop`) deliberately: this loop is the *only* thing that
+    /// `[weak self]` at the one `Task` creation site in this file
+    /// (`startLoop`) deliberately: this loop is the *only* thing that
     /// would otherwise keep this actor alive indefinitely once every
     /// external strong reference to it is dropped (there is no other
     /// self-referencing cycle in this type). A strong `self` capture here
@@ -536,6 +536,17 @@ public actor DirectMXRetryQueue {
                 let nextAttemptNumber = entry.attempt + 1
                 if configuration.isPastCeiling(attempt: nextAttemptNumber, firstQueuedAt: entry.firstQueuedAt) {
                     await reportTerminal(DeliveryResult(recipient: result.recipient, outcome: .expired(attempts: nextAttemptNumber, last: last)))
+                } else if isShutDown {
+                    // `shutdown()` ran while this entry's `redeliver` was
+                    // in flight. It already drained `entries` and reported
+                    // everything in them, and `nudgeLoop` won't run a loop
+                    // any more, so an entry put back here would never be
+                    // retried or reported. Report it the way `shutdown()`
+                    // reports the entries it drains.
+                    await reportTerminal(DeliveryResult(
+                        recipient: result.recipient,
+                        outcome: .failed(DirectMXRetryQueueError.shutdownWhilePending(attempt: nextAttemptNumber, last: last))
+                    ))
                 } else {
                     let rescheduled = Entry(
                         id: UUID(), recipients: [result.recipient], mailFrom: entry.mailFrom, message: entry.message,

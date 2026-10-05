@@ -471,6 +471,44 @@ struct DirectMXRetryQueueTests {
         await queue.shutdown()
     }
 
+    // `shutdown()` drains `entries`, but an entry whose `redeliver` is in
+    // flight isn't in `entries` at that moment. If that attempt comes back
+    // transient, it must be reported as `.shutdownWhilePending` rather
+    // than quietly put back into a queue that will never run again.
+    @Test func aRetryInFlightDuringShutdownIsReportedNotSilentlyRequeued() async throws {
+        let collector = OutcomeCollector()
+        let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        let queue = DirectMXRetryQueue(
+            redeliver: { envelope, _ in
+                enteredContinuation.yield()
+                for await _ in release { break }
+                return envelope.recipients.map {
+                    DeliveryResult(recipient: $0, outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply))
+                }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+        await queue.enqueue(
+            recipients: ["inflight@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+        )
+        for await _ in entered { break }
+        await queue.shutdown()
+        releaseContinuation.yield()
+
+        let result = try await collector.waitForFirst(timeoutSeconds: 5)
+        #expect(result.recipient == "inflight@example.com")
+        guard case .failed(let error) = result.outcome,
+              case .shutdownWhilePending(let attempt, _)? = error as? DirectMXRetryQueueError else {
+            Issue.record("expected .failed(.shutdownWhilePending), got \(result.outcome)")
+            return
+        }
+        #expect(attempt == 2)
+        #expect(await queue.pendingEntriesSnapshot().isEmpty)
+    }
+
     private static func message() -> SignedMessage {
         SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
     }
