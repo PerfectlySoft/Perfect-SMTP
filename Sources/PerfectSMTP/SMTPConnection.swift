@@ -141,6 +141,14 @@ public final class SMTPConnection: @unchecked Sendable {
         }
     }
 
+    /// Closes the channel and waits until it has closed. Used by dialers
+    /// that fail after the socket was opened, so the pool only frees the
+    /// dial's slot once the socket is really gone.
+    func closeAndWait() async {
+        channel.close(promise: nil)
+        try? await channel.closeFuture.get()
+    }
+
     /// Reads the next reply, or throws if the connection closed
     /// mid-conversation (plan §4.3's "mid-conversation disconnect" —
     /// `NIOAsyncChannel`'s inbound sequence terminating on channel close

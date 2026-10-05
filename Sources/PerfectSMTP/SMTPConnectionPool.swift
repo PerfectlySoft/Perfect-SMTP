@@ -47,8 +47,12 @@ import NIOCore
 /// any other freed slot -- an unhealthy release, a failed dial, or a slot
 /// freed under the shared `maxTotal` -- is reserved for the oldest parked
 /// waiter (across all keys) that `maxPerHost`/`maxTotal` allow, which dials
-/// for itself. Waiters whose key's circuit breaker is open fail with
-/// `SMTPError.circuitOpen` instead, exactly as a fresh checkout would.
+/// for itself. `maxTotal` counts idle and still-closing connections as well
+/// as checked-out ones, so making room may close the oldest idle connection
+/// of another key; a slot under `maxTotal` is freed only when a close has
+/// completed, from the close's own callback. Waiters whose key's circuit
+/// breaker is open fail with `SMTPError.circuitOpen` instead, exactly as a
+/// fresh checkout would.
 /// (The actor version only handed a slot to same-key waiters, and only on
 /// release, so a waiter could stay parked forever after a failed dial or
 /// behind another host's `maxTotal` usage.)
@@ -65,7 +69,22 @@ public final class SMTPConnectionPool: Sendable {
     }
 
     public struct Configuration: Sendable {
+        /// The most connections to one `Key` at once, checked out (or being
+        /// dialed) or idle. A connection the pool has started closing
+        /// doesn't count here (it counts toward `maxTotal` until the close
+        /// completes), so a replacement can be dialed right away; the
+        /// server may briefly see one extra connection while the old one
+        /// finishes closing.
         public var maxPerHost: Int
+        /// The most open connections across all keys at once: checked out
+        /// (or being dialed), idle, or still closing. When a new connection
+        /// is needed at this limit, the pool closes the oldest idle
+        /// connection (for any key), and the checkout waits until that
+        /// close completes; if none is idle, it waits for a connection to
+        /// be released. A close is usually immediate, but a TLS close waits
+        /// for the peer's close_notify, up to NIOSSL's shutdown timeout
+        /// (5 s by default) for an unresponsive peer -- so at this limit, a
+        /// checkout can wait that long for a slot.
         public var maxTotal: Int
         public var idleTimeout: TimeInterval
         public var connectTimeout: TimeAmount
@@ -143,15 +162,10 @@ public final class SMTPConnectionPool: Sendable {
     }
 
     /// Continuations to resume and channels to close once the lock is
-    /// released.
+    /// released (see `lockedEffects` and `run`).
     private struct Effects {
         var resumes: [(CheckedContinuation<CheckoutOutcome, any Error>, Result<CheckoutOutcome, any Error>)] = []
-        var closes: [SMTPConnection] = []
-
-        func run() {
-            for connection in closes { connection.channel.close(promise: nil) }
-            for (continuation, result) in resumes { continuation.resume(with: result) }
-        }
+        var closes: [(connection: SMTPConnection, isEviction: Bool)] = []
     }
 
     private struct State {
@@ -163,6 +177,37 @@ public final class SMTPConnectionPool: Sendable {
         var nextWaiterID: UInt64 = 0
 
         var totalActive: Int { activeCount.values.reduce(0, +) }
+        var totalIdle: Int { idle.values.reduce(0) { $0 + $1.count } }
+        /// Connections the pool has started closing whose close hasn't
+        /// completed yet.
+        var closing = 0
+        /// How many of `closing` are evictions -- idle connections closed
+        /// specifically to make room under `maxTotal` for a waiting
+        /// checkout. Other closes (an unhealthy release, a stale idle
+        /// connection) may be slow, so they don't count as room on its way.
+        var evicting = 0
+        /// Closes decided under the current lock acquisition, not yet
+        /// issued; `lockedEffects` hands them to `run(_:)`.
+        var queuedCloses: [(connection: SMTPConnection, isEviction: Bool)] = []
+
+        /// The only way the pool closes a connection: it keeps counting
+        /// toward `maxTotal` from this moment until `closeFinished()`.
+        mutating func beginClosing(_ connection: SMTPConnection, isEviction: Bool = false) {
+            closing += 1
+            if isEviction { evicting += 1 }
+            queuedCloses.append((connection, isEviction))
+        }
+        /// Every open connection the pool is responsible for: checked out,
+        /// being dialed (a reserved slot), idle, or still closing.
+        var totalOpen: Int { totalActive + totalIdle + closing }
+
+        /// Gives up one reserved or checked-out slot for `key`. Drops the
+        /// entry at zero, so the totals above stay proportional to the keys
+        /// in use rather than every key the pool has ever seen.
+        mutating func releaseSlot(_ key: Key) {
+            let remaining = activeCount[key, default: 1] - 1
+            activeCount[key] = remaining > 0 ? remaining : nil
+        }
     }
 
     private let state = NIOLockedValueBox(State())
@@ -202,14 +247,25 @@ public final class SMTPConnectionPool: Sendable {
                 replyTimeout: capturedReplyTimeout,
                 dataTerminationTimeout: capturedDataTerminationTimeout
             )
-            try await connection.negotiateCapabilities()
+            do {
+                try await connection.negotiateCapabilities()
+            } catch {
+                // Close and wait before throwing: the pool frees this
+                // dial's slot as soon as the dialer throws.
+                await connection.closeAndWait()
+                throw error
+            }
             return connection
         }
     }
 
     /// Test/internal-only initializer: overrides the dialer entirely so
     /// pool behavior (reentrancy, cancellation, breaker) can be exercised
-    /// without a real socket.
+    /// without a real socket. A dialer that fails after opening a socket
+    /// must close it, and wait for the close, before throwing: the pool
+    /// frees the dial's slot as soon as the dialer throws. (The default
+    /// dialer does; for TLS that wait can take up to NIOSSL's close_notify
+    /// timeout, 5 s by default, against an unresponsive peer.)
     init(configuration: Configuration = .init(), group: any EventLoopGroup, dialer: @escaping @Sendable (Key) async throws -> SMTPConnection) {
         self.configuration = configuration
         self.ehloHostname = "localhost"
@@ -269,20 +325,56 @@ public final class SMTPConnectionPool: Sendable {
     /// Connections checked out at the time are closed when released.
     /// (`async` for source compatibility with the actor version.)
     public func shutdown() async {
-        let effects: Effects = state.withLockedValue { state in
-            var effects = Effects()
+        let effects = lockedEffects { state, effects in
             state.isShutDown = true
             for (_, entries) in state.idle {
-                effects.closes.append(contentsOf: entries.map(\.connection))
+                for entry in entries { state.beginClosing(entry.connection) }
             }
             state.idle.removeAll()
             for (_, list) in state.waiters {
                 for waiter in list { effects.resumes.append((waiter.continuation, .failure(PoolError.shutdown))) }
             }
             state.waiters.removeAll()
+            return
+        }
+        run(effects)
+    }
+
+    // MARK: - Effects
+
+    /// Runs `body` under the lock and returns what it decided to do once
+    /// the lock is released. Every connection `body` closes keeps counting
+    /// toward `maxTotal` (`State.closing`) until its close has actually
+    /// completed, so open sockets never exceed `maxTotal`, even briefly;
+    /// see `run(_:)`.
+    private func lockedEffects(_ body: (inout State, inout Effects) -> Void) -> Effects {
+        state.withLockedValue { state in
+            var effects = Effects()
+            body(&state, &effects)
+            effects.closes = state.queuedCloses
+            state.queuedCloses.removeAll()
             return effects
         }
-        effects.run()
+    }
+
+    /// Closes and resumes what a `lockedEffects` block decided, outside the
+    /// lock. When each close completes, its slot is freed and parked
+    /// waiters are admitted.
+    private func run(_ effects: Effects) {
+        for (connection, isEviction) in effects.closes {
+            connection.channel.close(promise: nil)
+            connection.channel.closeFuture.whenComplete { _ in self.closeFinished(wasEviction: isEviction) }
+        }
+        for (continuation, result) in effects.resumes { continuation.resume(with: result) }
+    }
+
+    private func closeFinished(wasEviction: Bool) {
+        let effects = lockedEffects { state, effects in
+            state.closing -= 1
+            if wasEviction { state.evicting -= 1 }
+            admitWaiters(state: &state, effects: &effects)
+        }
+        run(effects)
     }
 
     // MARK: - Checkout
@@ -294,9 +386,8 @@ public final class SMTPConnectionPool: Sendable {
         }
         let outcome: CheckoutOutcome = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CheckoutOutcome, any Error>) in
-                let effects: Effects = state.withLockedValue { state in
-                    var effects = Effects()
-                    let decision = decideCheckout(key, state: &state, closing: &effects.closes)
+                let effects = lockedEffects { state, effects in
+                    let decision = decideCheckout(key, state: &state)
                     switch decision {
                     case .some(let result):
                         effects.resumes.append((continuation, result))
@@ -310,9 +401,9 @@ public final class SMTPConnectionPool: Sendable {
                             state.waiters[key, default: []].append(Waiter(id: id, continuation: continuation))
                         }
                     }
-                    return effects
+                    return
                 }
-                effects.run()
+                run(effects)
             }
         } onCancel: {
             let waiter: Waiter? = state.withLockedValue { state in
@@ -335,14 +426,13 @@ public final class SMTPConnectionPool: Sendable {
             } catch {
                 // The reservation is given up: pass it to a waiter that can
                 // use it, or free it.
-                let effects: Effects = state.withLockedValue { state in
+                let effects = lockedEffects { state, effects in
                     recordFailure(key, state: &state)
-                    var effects = Effects()
-                    state.activeCount[key, default: 1] -= 1
+                    state.releaseSlot(key)
                     admitWaiters(state: &state, effects: &effects)
-                    return effects
+                    return
                 }
-                effects.run()
+                run(effects)
                 throw error
             }
         }
@@ -353,26 +443,68 @@ public final class SMTPConnectionPool: Sendable {
     /// what keeps concurrent checkouts from overshooting `maxPerHost`
     /// (plan §4.4's reentrancy discipline).
     private func decideCheckout(
-        _ key: Key, state: inout State, closing: inout [SMTPConnection]
+        _ key: Key, state: inout State
     ) -> Result<CheckoutOutcome, any Error>? {
         if state.isShutDown { return .failure(PoolError.shutdown) }
         if isBreakerOpen(key, state: &state) { return .failure(SMTPError.circuitOpen) }
-        if let reused = popValidatedIdle(key, state: &state, closing: &closing) {
+        if let reused = popValidatedIdle(key, state: &state) {
             state.activeCount[key, default: 0] += 1
             return .success(.connection(reused))
         }
-        if hasCapacity(for: key, state: state) {
+        if makeRoomForNewConnection(to: key, isNewCheckout: true, state: &state) {
             state.activeCount[key, default: 0] += 1
             return .success(.dialYourself)
         }
         return nil
     }
 
-    private func hasCapacity(for key: Key, state: State) -> Bool {
-        state.activeCount[key, default: 0] < configuration.maxPerHost && state.totalActive < configuration.maxTotal
+    /// Whether a new connection to `key` may be opened now. `maxTotal`
+    /// counts idle and still-closing connections too. At the limit, this
+    /// starts closing the oldest idle connections (of any key), one per
+    /// checkout that `maxTotal` alone is holding back -- the parked
+    /// waiters, plus this checkout if it isn't parked yet, counting per key
+    /// no more than that key's remaining `maxPerHost` room -- minus
+    /// evictions already under way. The room appears as each close
+    /// completes, and `closeFinished()` then admits the oldest waiter, so
+    /// the caller parks meanwhile. Evictions run in parallel, and a slow
+    /// unrelated close (say, a TLS close_notify to an unresponsive peer)
+    /// doesn't stop them. (Idle connections for `key` itself never get
+    /// here: a checkout reuses them first.) Reusing an idle connection
+    /// never needs room -- it doesn't open one.
+    private func makeRoomForNewConnection(to key: Key, isNewCheckout: Bool = false, state: inout State) -> Bool {
+        guard state.activeCount[key, default: 0] < configuration.maxPerHost else { return false }
+        if state.totalOpen < configuration.maxTotal { return true }
+        // Per key, only as many checkouts as its `maxPerHost` room allows
+        // can ever be admitted, so evicting for more would only destroy
+        // other hosts' idle connections.
+        var demand = 0
+        var countedThisKey = false
+        for (waitingKey, list) in state.waiters {
+            let room = configuration.maxPerHost - state.activeCount[waitingKey, default: 0]
+            guard room > 0 else { continue }
+            let extra = isNewCheckout && waitingKey == key ? 1 : 0
+            if waitingKey == key { countedThisKey = true }
+            demand += min(list.count + extra, room)
+        }
+        if isNewCheckout, !countedThisKey { demand += 1 }
+        while state.evicting < demand, evictOldestIdle(state: &state) {}
+        return false
     }
 
-    private func popValidatedIdle(_ key: Key, state: inout State, closing: inout [SMTPConnection]) -> SMTPConnection? {
+    private func evictOldestIdle(state: inout State) -> Bool {
+        var oldest: (key: Key, returnedAt: DispatchTime)?
+        for (key, list) in state.idle {
+            if let first = list.first, first.returnedAt < oldest?.returnedAt ?? .distantFuture {
+                oldest = (key, first.returnedAt)
+            }
+        }
+        guard let key = oldest?.key, var list = state.idle[key] else { return false }
+        state.beginClosing(list.removeFirst().connection, isEviction: true)
+        state.idle[key] = list.isEmpty ? nil : list
+        return true
+    }
+
+    private func popValidatedIdle(_ key: Key, state: inout State) -> SMTPConnection? {
         guard var list = state.idle[key], !list.isEmpty else { return nil }
         var result: SMTPConnection?
         while !list.isEmpty {
@@ -380,13 +512,13 @@ public final class SMTPConnectionPool: Sendable {
             let ageNanoseconds = DispatchTime.now().uptimeNanoseconds &- entry.returnedAt.uptimeNanoseconds
             let ageSeconds = TimeInterval(ageNanoseconds) / 1_000_000_000
             if ageSeconds > configuration.idleTimeout || !entry.connection.channel.isActive {
-                closing.append(entry.connection)
+                state.beginClosing(entry.connection)
                 continue
             }
             result = entry.connection
             break
         }
-        state.idle[key] = list
+        state.idle[key] = list.isEmpty ? nil : list
         return result
     }
 
@@ -403,18 +535,18 @@ public final class SMTPConnectionPool: Sendable {
                 effects.resumes.append((waiter.continuation, .failure(SMTPError.circuitOpen)))
             }
         }
-        var total = state.totalActive
-        while total < configuration.maxTotal {
+        while true {
             // The oldest waiter (smallest id) among keys under maxPerHost.
             var oldest: (key: Key, id: UInt64)?
             for (key, list) in state.waiters where state.activeCount[key, default: 0] < configuration.maxPerHost {
                 if let first = list.first, first.id < oldest?.id ?? .max { oldest = (key, first.id) }
             }
-            guard let key = oldest?.key, var list = state.waiters[key] else { return }
+            guard let key = oldest?.key, var list = state.waiters[key],
+                  makeRoomForNewConnection(to: key, state: &state)
+            else { return }
             let waiter = list.removeFirst()
             state.waiters[key] = list.isEmpty ? nil : list
             state.activeCount[key, default: 0] += 1
-            total += 1
             effects.resumes.append((waiter.continuation, .success(.dialYourself)))
         }
     }
@@ -422,8 +554,7 @@ public final class SMTPConnectionPool: Sendable {
     // MARK: - Release
 
     private func release(_ key: Key, connection: SMTPConnection, healthy: Bool) {
-        let effects: Effects = state.withLockedValue { state in
-            var effects = Effects()
+        let effects = lockedEffects { state, effects in
             // Milestone review finding (correctness): a connection released
             // after `shutdown()` has already run must not be appended to
             // `idle[key]` -- `shutdown()` only closes/drains what's *already*
@@ -432,8 +563,8 @@ public final class SMTPConnectionPool: Sendable {
             // socket) for the lifetime of the process. Close it immediately
             // instead.
             guard !state.isShutDown else {
-                effects.closes.append(connection)
-                return effects
+                state.beginClosing(connection)
+                return
             }
             if healthy, connection.channel.isActive {
                 recordSuccess(key, state: &state)
@@ -443,26 +574,26 @@ public final class SMTPConnectionPool: Sendable {
                     let waiter = list.removeFirst()
                     state.waiters[key] = list.isEmpty ? nil : list
                     effects.resumes.append((waiter.continuation, .success(.connection(connection))))
-                    return effects
+                    return
                 }
-                state.activeCount[key, default: 1] -= 1
+                state.releaseSlot(key)
                 state.idle[key, default: []].append(IdleEntry(connection: connection, returnedAt: DispatchTime.now()))
             } else {
                 if !healthy { recordFailure(key, state: &state) } else { recordSuccess(key, state: &state) }
-                effects.closes.append(connection)
-                state.activeCount[key, default: 1] -= 1
+                state.beginClosing(connection)
+                state.releaseSlot(key)
             }
             admitWaiters(state: &state, effects: &effects)
-            return effects
+            return
         }
-        effects.run()
+        run(effects)
     }
 
     /// Reserved slots and parked waiters across all keys, for tests that
     /// check nothing is left behind.
-    func snapshotForTesting() -> (active: Int, waiters: Int) {
+    func snapshotForTesting() -> (active: Int, idle: Int, waiters: Int) {
         state.withLockedValue { state in
-            (state.totalActive, state.waiters.values.reduce(0) { $0 + $1.count })
+            (state.totalActive, state.totalIdle, state.waiters.values.reduce(0) { $0 + $1.count })
         }
     }
 

@@ -167,7 +167,7 @@ public enum SMTPBootstrap {
                 }
             }
 
-        var connected: Channel?
+        var connected: (any Channel)?
         do {
             switch target {
             case .hostPort(let host, let port):
@@ -178,10 +178,11 @@ public enum SMTPBootstrap {
             return try await promise.futureResult.get()
         } catch {
             promise.fail(error)
-            // The handler already closes the channel on every failure it
-            // detects; this covers anything else, and waiting for the close
-            // means the socket is gone before a caller (the pool) reuses
-            // the capacity it reserved for this dial.
+            // A failure after the TCP connect (TLS handshake, greeting,
+            // STARTTLS, a hang-up or a bootstrap timeout) has started
+            // closing the channel; wait for it to
+            // finish before throwing, so a pool freeing this dial's slot
+            // never has the socket still open.
             if let connected {
                 connected.close(promise: nil)
                 try? await connected.closeFuture.get()
