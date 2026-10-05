@@ -536,7 +536,16 @@ public actor DirectMXRetryQueue {
                 await reportTerminal(result)
             case .queuedForRetry(let nextAttempt, _, let last):
                 let nextAttemptNumber = entry.attempt + 1
-                if configuration.isPastCeiling(attempt: nextAttemptNumber, firstQueuedAt: entry.firstQueuedAt) {
+                if isShutDown {
+                    // `shutdown()` ran while this redelivery was in flight,
+                    // so it couldn't report this entry. Report it now, as
+                    // it would have been, instead of rescheduling into a
+                    // queue whose loop will never run again.
+                    await reportTerminal(DeliveryResult(
+                        recipient: result.recipient,
+                        outcome: .failed(DirectMXRetryQueueError.shutdownWhilePending(attempt: nextAttemptNumber, last: last))
+                    ))
+                } else if configuration.isPastCeiling(attempt: nextAttemptNumber, firstQueuedAt: entry.firstQueuedAt) {
                     await reportTerminal(DeliveryResult(recipient: result.recipient, outcome: .expired(attempts: nextAttemptNumber, last: last)))
                 } else {
                     let rescheduled = Entry(

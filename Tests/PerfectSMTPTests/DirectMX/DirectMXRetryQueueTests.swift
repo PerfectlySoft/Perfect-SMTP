@@ -312,6 +312,50 @@ struct DirectMXRetryQueueTests {
         await queue.shutdown()
     }
 
+    // MARK: - A retry rescheduled after shutdown() is reported, not held
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRetryRescheduledAfterShutdownIsReportedAsShutdownWhilePending() async throws {
+        // `shutdown()` reports every pending entry. An entry whose
+        // redelivery is in flight isn't in `entries` at that moment; if
+        // that redelivery then comes back as another temporary failure,
+        // the reschedule must be reported too, not parked in a queue that
+        // will never run again.
+        let collector = OutcomeCollector()
+        let redeliveryStarted = AsyncFlag()
+        let finishRedelivery = AsyncFlag()
+        let reply = SMTPReply(code: 450, lines: ["4.2.0 greylisted"])
+        let queue = DirectMXRetryQueue(
+            redeliver: { envelope, _ in
+                await redeliveryStarted.set()
+                await finishRedelivery.wait()
+                return envelope.recipients.map {
+                    DeliveryResult(recipient: $0, outcome: .queuedForRetry(nextAttempt: Date(), attempt: 2, last: reply))
+                }
+            },
+            onTerminalOutcome: { result in await collector.record(result) }
+        )
+
+        await queue.enqueue(
+            recipients: ["r@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: .queuedForRetry(nextAttempt: Date(), attempt: 1, last: reply)
+        )
+        await redeliveryStarted.wait()
+        await queue.shutdown()
+        await finishRedelivery.set()
+
+        let terminal = try await collector.waitForFirst(timeoutSeconds: 5)
+        guard case .failed(let error) = terminal.outcome,
+              let queueError = error as? DirectMXRetryQueueError,
+              case .shutdownWhilePending = queueError
+        else {
+            Issue.record("expected .failed(.shutdownWhilePending), got \(terminal.outcome)")
+            return
+        }
+        #expect(terminal.recipient == "r@example.com")
+        #expect(await queue.pendingEntriesSnapshot().isEmpty)
+    }
+
     // MARK: - The loop must restart after the queue drains
 
     @Test(.timeLimit(.minutes(1)))
@@ -480,6 +524,15 @@ private func backoffSeconds(_ outcome: DeliveryResult.Outcome, since: Date) -> D
         return -1
     }
     return nextAttempt.timeIntervalSince(since)
+}
+
+/// A set-once flag a test can await.
+private actor AsyncFlag {
+    private var isSet = false
+    func set() { isSet = true }
+    func wait() async {
+        while !isSet { try? await Task.sleep(nanoseconds: 1_000_000) }
+    }
 }
 
 /// Polls `condition` every millisecond until it holds, throwing
