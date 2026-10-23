@@ -622,18 +622,21 @@ struct RetryScheduleTests {
     }
 
     /// The queue applies the schedule from the entry's real attempt number,
-    /// not the redelivery's own (history-less) classification.
+    /// not the redelivery's own (history-less) classification. Each gap
+    /// between redeliveries must be at least the scheduled delay (a busy
+    /// machine can only make them later), and the count stays far below
+    /// what a flat 10 ms schedule would produce.
     @Test(.timeLimit(.minutes(1)))
     func theQueueReschedulesWithAGrowingDelay() async throws {
         let configuration = DirectMXRetryQueue.Configuration(
             backoff: .init(serviceUnavailable: 0.01, greylist: 0.01, defaultTransient: 0.01, maximumBackoff: 1000, jitter: 0),
             maxAttempts: 100, maxAge: 3600
         )
-        let attempts = CallCountBox()
+        let times = TimestampLog()
         let queue = DirectMXRetryQueue(
             configuration: configuration,
             redeliver: { envelope, _ in
-                await attempts.increment()
+                await times.record()
                 return envelope.recipients.map { DeliveryResult(recipient: $0, outcome: configuration.classify(Self.connectionFailure, attempt: 1)) }
             },
             onTerminalOutcome: { _ in }
@@ -642,16 +645,21 @@ struct RetryScheduleTests {
             recipients: ["r@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
             outcome: configuration.classify(Self.connectionFailure, attempt: 1)
         )
-        // 0.01 × (2 + 4 + 8 + 16 + 32 + 64) s ≈ 1.26 s for the first six
-        // redeliveries; a flat schedule would have done about 125 by then.
         try await Task.sleep(nanoseconds: 1_500_000_000)
-        let count = await attempts.count
-        let pending = await queue.pendingEntriesSnapshot()
         await queue.shutdown()
-        #expect((4...9).contains(count), "\(count) redeliveries in 1.5 s")
-        if let entry = pending.first {
-            let wait = entry.nextAttempt.timeIntervalSinceNow
-            #expect(wait > 0.1, "the next wait should have grown, got \(wait) s")
+        let stamps = await times.stamps
+        #expect(stamps.count >= 2 && stamps.count <= 9, "\(stamps.count) redeliveries in 1.5 s")
+        // Redelivery k (k = 2, 3, ...) follows redelivery k-1 by at least
+        // 0.01 × 2^(k-1) s (the failed attempt k sets the next wait).
+        for index in 1..<max(1, stamps.count) {
+            let gap = stamps[index].timeIntervalSince(stamps[index - 1])
+            let scheduled = 0.01 * pow(2, Double(index))
+            #expect(gap >= scheduled * 0.9, "gap \(index): \(gap) s, scheduled \(scheduled) s")
         }
     }
+}
+
+private actor TimestampLog {
+    private(set) var stamps: [Date] = []
+    func record() { stamps.append(Date()) }
 }
