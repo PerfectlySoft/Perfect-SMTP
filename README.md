@@ -211,8 +211,9 @@ You get these without configuring anything:
   - Unreachable hosts, timeouts, TLS failures and DNS timeouts or SERVFAIL
     are temporary and queued for retry (RFC 5321 §4.5.4.1), as is an
     MTA-STS `enforce` violation. NXDOMAIN, null MX and 5yz replies are
-    final. The retry queue is in memory only: pending retries are lost if
-    the process exits.
+    final. Retries back off exponentially (5 minutes doubling to a
+    4-hour cap, with jitter) for up to 5 days. The retry queue is in memory
+    only: pending retries are lost if the process exits.
 
 ## Migrating from 5.x
 

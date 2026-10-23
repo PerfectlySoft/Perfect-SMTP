@@ -21,7 +21,8 @@ struct DirectMXRetryQueueTests {
         let policy = RetryBackoffPolicy(
             serviceUnavailable: 111,
             greylist: 22,
-            defaultTransient: 3
+            defaultTransient: 3,
+            jitter: 0
         )
         let reply421 = SMTPReply(code: 421, lines: ["4.3.2 Service unavailable, closing channel"])
         let reply450 = SMTPReply(code: 450, lines: ["4.2.0 Greylisted, try again later"])
@@ -511,7 +512,7 @@ struct DirectMXRetryQueueTests {
         #expect(failures == 0, "\(failures) of 40 queues lost track of their sleeping loop")
     }
 
-    private static func message() -> SignedMessage {
+    static func message() -> SignedMessage {
         SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
     }
 }
@@ -573,4 +574,84 @@ actor OutcomeCollector {
 
 private enum OutcomeCollectorError: Error {
     case timedOut
+}
+
+
+/// Release review: retries used a flat 5-minute delay for every
+/// greylist-class reply (which includes the library's own 451 4.4.1
+/// connection failures) and gave up after 10 attempts, about 50 minutes.
+struct RetryScheduleTests {
+    private static let connectionFailure = SMTPReply(code: 451, lines: ["4.4.1 No usable connection"])
+
+    @Test func delaysDoubleFromTheClassBaseUpToTheCap() {
+        let policy = RetryBackoffPolicy(jitter: 0)
+        let delays = (1...9).map { policy.delay(for: Self.connectionFailure, attempt: $0) }
+        #expect(delays == [300, 600, 1200, 2400, 4800, 9600, 14400, 14400, 14400])
+        #expect(policy.delay(for: SMTPReply(code: 421, lines: ["busy"]), attempt: 1) == 900)
+        #expect(policy.delay(for: SMTPReply(code: 421, lines: ["busy"]), attempt: 3) == 3600)
+        #expect(policy.delay(for: SMTPReply(code: 441, lines: ["other"]), attempt: 2) == 240)
+        #expect(policy.delay(for: Self.connectionFailure, attempt: 1000) == 14400) // no overflow
+    }
+
+    @Test func jitterStaysWithinItsFraction() {
+        let policy = RetryBackoffPolicy() // ±10%
+        let samples = (0..<500).map { _ in policy.delay(for: Self.connectionFailure, attempt: 3) }
+        #expect(samples.allSatisfy { (1080...1320).contains($0) })
+        #expect(Set(samples.map { Int($0) }).count > 10, "jitter should actually vary the delay")
+    }
+
+    /// With the defaults, maxAge (5 days), not maxAttempts, ends retrying.
+    @Test func theDefaultScheduleRunsForTheWholeMaxAge() {
+        let configuration = DirectMXRetryQueue.Configuration(backoff: RetryBackoffPolicy(jitter: 0))
+        var elapsed: TimeInterval = 0
+        var attempt = 1
+        while elapsed < configuration.maxAge {
+            elapsed += configuration.backoff.delay(for: Self.connectionFailure, attempt: attempt)
+            attempt += 1
+        }
+        #expect(attempt <= configuration.maxAttempts, "\(attempt) attempts needed to span maxAge, maxAttempts is \(configuration.maxAttempts)")
+        // Even with jitter at its low end every attempt, maxAge still wins.
+        let low = DirectMXRetryQueue.Configuration()
+        var lowElapsed: TimeInterval = 0
+        var lowAttempt = 1
+        while lowElapsed < low.maxAge {
+            lowElapsed += RetryBackoffPolicy(jitter: 0).delay(for: Self.connectionFailure, attempt: lowAttempt) * (1 - low.backoff.jitter)
+            lowAttempt += 1
+        }
+        #expect(lowAttempt <= low.maxAttempts)
+    }
+
+    /// The queue applies the schedule from the entry's real attempt number,
+    /// not the redelivery's own (history-less) classification.
+    @Test(.timeLimit(.minutes(1)))
+    func theQueueReschedulesWithAGrowingDelay() async throws {
+        let configuration = DirectMXRetryQueue.Configuration(
+            backoff: .init(serviceUnavailable: 0.01, greylist: 0.01, defaultTransient: 0.01, maximumBackoff: 1000, jitter: 0),
+            maxAttempts: 100, maxAge: 3600
+        )
+        let attempts = CallCountBox()
+        let queue = DirectMXRetryQueue(
+            configuration: configuration,
+            redeliver: { envelope, _ in
+                await attempts.increment()
+                return envelope.recipients.map { DeliveryResult(recipient: $0, outcome: configuration.classify(Self.connectionFailure, attempt: 1)) }
+            },
+            onTerminalOutcome: { _ in }
+        )
+        await queue.enqueue(
+            recipients: ["r@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: configuration.classify(Self.connectionFailure, attempt: 1)
+        )
+        // 0.01 × (2 + 4 + 8 + 16 + 32 + 64) s ≈ 1.26 s for the first six
+        // redeliveries; a flat schedule would have done about 125 by then.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let count = await attempts.count
+        let pending = await queue.pendingEntriesSnapshot()
+        await queue.shutdown()
+        #expect((4...9).contains(count), "\(count) redeliveries in 1.5 s")
+        if let entry = pending.first {
+            let wait = entry.nextAttempt.timeIntervalSinceNow
+            #expect(wait > 0.1, "the next wait should have grown, got \(wait) s")
+        }
+    }
 }

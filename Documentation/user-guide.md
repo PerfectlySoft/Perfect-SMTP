@@ -541,6 +541,14 @@ DNS timeouts or SERVFAIL, and MTA-STS `enforce` violations all become
 the cause). A host name that doesn't exist (NXDOMAIN), a null MX, and 5yz
 replies are final.
 
+**The retry schedule** (`RetryBackoffPolicy`): each wait doubles from the
+reply class's base delay (5 minutes for greylisting, `451 4.4.1` and
+`4.7.5`; 15 minutes for `421`; 2 minutes for other 4yz) up to
+`maximumBackoff` (4 hours), with ±10% jitter. A domain that stays down is
+retried at about 5, 10, 20, 40 and 80 minutes, then every 4 hours, until
+`DirectMXRetryQueue.Configuration.maxAge` (5 days); `maxAttempts` (50) is
+only a backstop. The recipient then gets `.expired`.
+
 **The retry queue lives in memory only.** Pending retries are lost when the
 process exits; if you need durability, record `.queuedForRetry` results
 yourself (or deliver through a local MTA with its own spool). If you
