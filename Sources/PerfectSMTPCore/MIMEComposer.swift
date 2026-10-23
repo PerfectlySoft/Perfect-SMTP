@@ -197,6 +197,15 @@ public struct MIMEComposer: Sendable {
         "perfect-smtp-\(UUID().uuidString)"
     }
 
+    /// A single RFC 5322 §3.6.4 `msg-id`: `<`, one or more characters
+    /// other than whitespace and angle brackets, `>`. "<a@b> <c@d>" (two
+    /// IDs in one field) is refused.
+    private static func requireMessageID(_ value: String, field: String) throws {
+        guard value.count > 2, value.first == "<", value.last == ">",
+              !value.dropFirst().dropLast().contains(where: { $0 == "<" || $0 == ">" || $0.isWhitespace })
+        else { throw ComposerError.invalidHeaderValue(field) }
+    }
+
     /// RFC 5322 §3.6.8 `field-name = 1*ftext`, `ftext` = printable ASCII
     /// 33–126 except `:`.
     static func isValidFieldName(_ name: String) -> Bool {
@@ -268,6 +277,7 @@ public struct MIMEComposer: Sendable {
             // validated above via the "From" header's `encodeAddress`
             // call, so it can't carry an injection payload.
             try Self.requireNoInjection(messageID, field: "messageID")
+            try Self.requireMessageID(messageID, field: "messageID")
             headers.append(("Message-ID", messageID))
         } else {
             headers.append(("Message-ID", synthesizeMessageID()))
@@ -275,11 +285,13 @@ public struct MIMEComposer: Sendable {
 
         if let inReplyTo = message.inReplyTo {
             try Self.requireNoInjection(inReplyTo, field: "inReplyTo")
+            try Self.requireMessageID(inReplyTo, field: "inReplyTo")
             headers.append(("In-Reply-To", inReplyTo))
         }
         if !message.references.isEmpty {
             for reference in message.references {
                 try Self.requireNoInjection(reference, field: "references")
+                try Self.requireMessageID(reference, field: "references")
             }
             headers.append(("References", message.references.joined(separator: " ")))
         }
@@ -687,6 +699,10 @@ public struct MIMEComposer: Sendable {
         // a CR/LF in it would inject headers (or, with a blank line, body
         // content) into the inline part.
         try Self.requireNoInjection(resource.contentID, field: "inlineResource.contentID")
+        // It's wrapped in <...> below: no brackets or whitespace inside.
+        guard !resource.contentID.isEmpty, !resource.contentID.contains(where: { $0 == "<" || $0 == ">" || $0.isWhitespace }) else {
+            throw ComposerError.invalidHeaderValue("inlineResource.contentID")
+        }
         var headers: [(name: String, value: String)] = []
         if let filename = resource.filename {
             let name = sanitizedFilename(filename)

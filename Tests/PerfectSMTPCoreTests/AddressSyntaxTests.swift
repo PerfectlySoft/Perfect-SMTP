@@ -113,3 +113,29 @@ struct AddressSyntaxTests {
         }
     }
 }
+
+struct MessageIDSyntaxTests {
+    private func base() -> EmailMessage {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.textBody = "hi"
+        return message
+    }
+
+    @Test(arguments: ["<a@b> <c@d>", "a@b", "<>", "<a b@c>", "<a<b@c>"])
+    func aCallerMessageIDMustBeOneMsgID(id: String) {
+        var message = base(); message.messageID = id
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("messageID")) { _ = try MIMEComposer(message).compose() }
+        message = base(); message.inReplyTo = id
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("inReplyTo")) { _ = try MIMEComposer(message).compose() }
+        message = base(); message.references = ["<ok@example.com>", id]
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("references")) { _ = try MIMEComposer(message).compose() }
+    }
+
+    @Test(arguments: ["a> <b", "a b", "<a>", ""])
+    func aContentIDWithBracketsOrSpacesIsRejected(id: String) {
+        var message = base()
+        message.htmlBody = "<p>x</p>"
+        message.inlineImages = [InlineResource(contentID: id, contentType: "image/png", data: Data([1]))]
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("inlineResource.contentID")) { _ = try MIMEComposer(message).compose() }
+    }
+}
