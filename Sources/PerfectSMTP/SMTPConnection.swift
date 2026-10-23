@@ -209,6 +209,9 @@ public final class SMTPConnection: @unchecked Sendable {
         // The hostname comes from configuration, but it is written into a
         // command line verbatim: a CR/LF in it would inject commands.
         _ = try HeaderEncoder.rejectHeaderInjection(ehloHostname, field: "EHLO hostname")
+        guard AddressSyntax.isHostnameOrAddressLiteral(ehloHostname) else {
+            throw AddressSyntax.Error.invalidHostname(field: "EHLO hostname")
+        }
         try await writeLine("EHLO \(ehloHostname)")
         let reply = try await nextReply()
         if reply.replyClass == .permanentNegative {
@@ -295,7 +298,10 @@ public final class SMTPConnection: @unchecked Sendable {
             mailFromLine += " SIZE=\(message.estimatedSize)"
         }
         let recipientLines = try envelope.recipients.map { recipient -> String in
+            // Re-checked here: `SMTPEnvelope.recipients` is mutable after
+            // its validating init.
             let validated = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
+            try AddressSyntax.validateMailbox(validated, field: "RCPT TO address")
             return "RCPT TO:<\(validated)>"
         }
 

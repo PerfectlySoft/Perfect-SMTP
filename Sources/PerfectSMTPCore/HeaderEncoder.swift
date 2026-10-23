@@ -83,6 +83,9 @@ public enum HeaderEncoder {
     /// (`ComposerError.invalidHeaderValue`, thrown rather than stripped).
     public static func encodeAddress(_ address: EmailAddress) throws -> String {
         let addrSpec = try rejectHeaderInjection(address.address, field: "address")
+        // A plain mailbox only: `s@example.test>, <attacker@evil.test`
+        // would otherwise add a second mailbox to the header.
+        try AddressSyntax.validateMailbox(addrSpec, field: "address")
         guard let name = address.displayName, !name.isEmpty else {
             return addrSpec
         }

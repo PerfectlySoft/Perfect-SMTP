@@ -103,3 +103,24 @@ struct CredentialRedactionTests {
         #expect("\(config.auth)".contains("<redacted>"))
     }
 }
+
+struct WireInjectionTests {
+    @Test(arguments: ["client example.com", "client.example.com>", "-client", "client_example.com", "[1.2.3]"])
+    func anEHLOHostnameThatIsNotAnLDHNameIsRejected(hostname: String) async throws {
+        let (connection, channel) = try await ConnectionHarness.make(ehloHostname: hostname)
+        await #expect(throws: (any Error).self) { _ = try await connection.negotiateCapabilities() }
+        #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
+    }
+
+    /// `SMTPEnvelope.recipients` is mutable after its validating init, so
+    /// the connection re-checks: the reviewer's `NOTIFY=`/`ORCPT=` payload
+    /// must not reach the wire, and nothing (not even MAIL FROM) is sent.
+    @Test func aRecipientMutatedAfterValidationIsRejectedBeforeAnythingIsWritten() async throws {
+        let (connection, channel) = try await ConnectionHarness.make()
+        var envelope = try SMTPEnvelope(mailFrom: .address("from@sender.example"), recipients: ["ok@example.com"])
+        envelope.recipients = ["victim@example.test> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT=rfc822;spoof@evil.test"]
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
+        await #expect(throws: (any Error).self) { _ = try await connection.sendMessage(envelope, message) }
+        #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
+    }
+}

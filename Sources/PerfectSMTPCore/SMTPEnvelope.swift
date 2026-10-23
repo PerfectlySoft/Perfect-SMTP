@@ -38,6 +38,7 @@ public enum ReversePath: Sendable, Hashable {
             case .address(let address):
                 let validated = try HeaderEncoder.rejectHeaderInjection(address, field: "MAIL FROM address")
                 try Self.rejectLeadingHyphen(validated, field: "MAIL FROM address")
+                try AddressSyntax.validateMailbox(validated, field: "MAIL FROM address")
                 return "MAIL FROM:<\(validated)>"
             case .null:
                 return "MAIL FROM:<>"
@@ -124,6 +125,7 @@ public struct SMTPEnvelope: Sendable {
             // Recipients reach `LocalMTATransport`'s argv exactly the same
             // way the reverse-path address does.
             try ReversePath.rejectLeadingHyphen(recipient, field: "RCPT TO address")
+            try AddressSyntax.validateMailbox(recipient, field: "RCPT TO address")
         }
         self.mailFrom = mailFrom
         self.recipients = recipients

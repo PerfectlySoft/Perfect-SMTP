@@ -42,6 +42,11 @@ public struct MIMEComposer: Sendable {
         /// name like `"Bcc:x@y"` or `"To "` would otherwise slip past
         /// `forbiddenExtraHeaderNames` and still be read as `Bcc`/`To`.
         case invalidHeaderName(String)
+        /// `messageIDDomain` isn't an LDH hostname.
+        case invalidMessageIDDomain(String)
+        /// The boundary generator returned something that isn't an RFC 2046
+        /// boundary: 1–70 `bchars`, not ending in a space.
+        case invalidBoundary(String)
         /// `EmailMessage.listUnsubscribe.postOneClick` was `true` but `url`
         /// was `nil` — RFC 8058 §2's one-click mechanism is specifically
         /// for the HTTPS POST target, so there is no URL for
@@ -230,6 +235,9 @@ public struct MIMEComposer: Sendable {
         }
         guard message.textBody != nil || message.htmlBody != nil else {
             throw ComposerError.missingBody
+        }
+        if let messageIDDomain, !AddressSyntax.isHostnameOrAddressLiteral(messageIDDomain) {
+            throw ComposerError.invalidMessageIDDomain(messageIDDomain)
         }
 
         let top = try buildTopLevelPart()
@@ -444,7 +452,7 @@ public struct MIMEComposer: Sendable {
 
         let alternativeOrSingle: MIMEPart
         if bodyParts.count > 1 {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             alternativeOrSingle = MIMEPart(
                 headers: [("Content-Type", "multipart/alternative; boundary=\"\(boundary)\"")],
                 body: .multipart(boundary: boundary, parts: bodyParts)
@@ -455,7 +463,7 @@ public struct MIMEComposer: Sendable {
 
         let relatedOrSingle: MIMEPart
         if !message.inlineImages.isEmpty {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             var parts = [alternativeOrSingle]
             parts.append(contentsOf: try message.inlineImages.map(inlineLeaf))
             relatedOrSingle = MIMEPart(
@@ -467,7 +475,7 @@ public struct MIMEComposer: Sendable {
         }
 
         if !message.attachments.isEmpty {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             var parts = [relatedOrSingle]
             parts.append(contentsOf: try message.attachments.map(attachmentLeaf))
             return MIMEPart(
@@ -821,6 +829,18 @@ public struct MIMEComposer: Sendable {
 
     private static func isPrintableASCII(_ value: String) -> Bool {
         value.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value < 0x7F }
+    }
+
+    /// Calls `boundaryGenerator` and checks the result against RFC 2046
+    /// §5.1.1: 1–70 characters from `bchars`, not ending in a space.
+    private func makeBoundary() throws -> String {
+        let boundary = boundaryGenerator()
+        let bchars = Set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'()+_,-./:=? ".utf8)
+        guard (1...70).contains(boundary.utf8.count),
+              boundary.utf8.allSatisfy(bchars.contains),
+              boundary.utf8.last != UInt8(ascii: " ")
+        else { throw ComposerError.invalidBoundary(boundary) }
+        return boundary
     }
 
     private func synthesizeMessageID() -> String {

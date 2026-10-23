@@ -65,6 +65,10 @@ public struct DKIMSigner: Sendable, MessageSigner {
         /// directly from a key parsed some other way, bypassing that
         /// convenience initializer entirely.
         case rsaKeyTooSmall(bits: Int)
+        /// `domain` (the `d=` tag) isn't an LDH hostname.
+        case invalidDomain(String)
+        /// `selector` (the `s=` tag) isn't one or more LDH labels.
+        case invalidSelector(String)
     }
 
     let domain: String
@@ -175,6 +179,10 @@ public struct DKIMSigner: Sendable, MessageSigner {
         // construction time rather than at the point of use.
         self.domain = try HeaderEncoder.rejectHeaderInjection(domain, field: "domain")
         self.selector = try HeaderEncoder.rejectHeaderInjection(selector, field: "selector")
+        // RFC 6376 §3.5: `d=` is a domain name and `s=` a sequence of
+        // sub-domains; both end up in a DNS query (`s._domainkey.d`).
+        guard AddressSyntax.isHostname(domain) else { throw ConfigurationError.invalidDomain(domain) }
+        guard AddressSyntax.isHostname(selector) else { throw ConfigurationError.invalidSelector(selector) }
         self.signedHeaders = signedHeaders
         self.canon = canon
         self.keys = keys
