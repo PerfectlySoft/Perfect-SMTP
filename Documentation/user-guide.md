@@ -141,7 +141,14 @@ freshly-dialed connection once and reusing it across sends. `tls` is a
 `.startTLS` (explicit upgrade, typically port 587 — mandatory once
 requested: if the server doesn't advertise STARTTLS, the connection fails
 rather than silently continuing in plaintext), or `.implicit` (TLS from the
-first byte, typically port 465).
+first byte, typically port 465). Both TLS modes verify the server's
+certificate chain and hostname.
+
+`tls: .none` together with `auth` is refused: `send` throws
+`RelayTransportError.authenticationRequiresTLS` before opening a
+connection, so credentials are never sent in cleartext by accident. For a
+relay you trust (a loopback MTA, a MailHog/smtp4dev test server that wants
+AUTH), opt in with `allowsAuthenticationWithoutTLS: true`.
 
 ### `LocalMTATransport`
 
@@ -228,6 +235,12 @@ just-expired token.
 
 `SASLCramMD5`/`SASLScramSHA256` are not implemented (deliberately deferred,
 per the rewrite plan).
+
+AUTH is only sent over TLS unless you set
+`RelayConfig.allowsAuthenticationWithoutTLS` (see
+[`RelayTransport`](#relaytransport)). `RelayConfig.Auth`, `SASLPlain` and
+`SASLLogin` print redacted descriptions, so logging a configuration never
+prints the password.
 
 ## DKIM signing
 
@@ -350,6 +363,12 @@ restarts), and `DirectMXTransport` applies it automatically:
 - **No policy for the domain, or `mode: none`** — identical to not having
   configured a provider at all: plain opportunistic delivery per
   `tlsPolicy`.
+
+The policy fetch is bounded as a whole: `URLSessionMTASTSFetcher` (the
+default `httpFetcher`) gives up after `timeout` seconds (default 60) from
+connect to the last body byte and throws `MTASTSHTTPFetchError.timedOut`,
+so a slow policy host can't hold up delivery to its domain indefinitely.
+Redirects are never followed (RFC 8461 §3.3).
 
 MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above: the
 HTTPS policy-file fetch target is address-checked the same way when you
@@ -504,21 +523,22 @@ inspect what's still pending via `pendingRetryEntries()`.
 
 ## Testing your integration
 
-`swift test` runs the full suite (323 tests) with zero external
+`swift test` runs the full suite (about 400 tests) with zero external
 dependencies and zero environment variables — including tests that
-exercise a real STARTTLS handshake and a full `DirectMXTransport` delivery
-against an in-process fake SMTP server bound to `127.0.0.1`. None of this
-touches the real network.
+exercise a real STARTTLS handshake, a full `DirectMXTransport` delivery,
+the DNS resolver and the MTA-STS fetcher against in-process fake servers
+bound to `127.0.0.1`. None of it needs the internet or DNS: the 6.0.0
+release checks ran it in Linux containers with no network beyond loopback.
 
 **There is no built-in live-integration test tier against a real SMTP
 server**, despite one being described in the original rewrite plan
 (`Documentation/swift6-nio-rewrite-plan.md` §4.1/§5: an `SMTP_TESTS=1`-
 gated CI job against a MailHog/smtp4dev service container). That tier was
 never implemented — there's no `SMTP_TESTS` (or similarly-named) reference
-anywhere in `Tests/`, and this repository has no `.github/workflows`
-directory at all. If you want to verify your own integration against a
-real (or realistic fake) SMTP server, the straightforward approach is to
-run [MailHog](https://github.com/mailhog/MailHog) or
+anywhere in `Tests/`, and no test is opt-in. If you want to verify your own
+integration against a real (or realistic fake) SMTP server, the
+straightforward approach is to run
+[MailHog](https://github.com/mailhog/MailHog) or
 [smtp4dev](https://github.com/rnwood/smtp4dev) locally and point a
 `RelayTransport` at it:
 

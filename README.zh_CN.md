@@ -23,10 +23,10 @@
 
 <p align="center">
     <a href="https://www.swift.org/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
+        <img src="https://img.shields.io/badge/Swift-6.2%2B-orange.svg?style=flat" alt="Swift 6.2+">
     </a>
-    <a href="https://developer.apple.com/macos/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-macOS%2026%2B-lightgray.svg?style=flat" alt="Platforms macOS 26+">
+    <a href="https://www.swift.org/platform-support/" target="_blank">
+        <img src="https://img.shields.io/badge/Platforms-macOS%2012%2B%20%7C%20Linux-lightgray.svg?style=flat" alt="Platforms macOS 12+ | Linux">
     </a>
     <a href="LICENSE" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
@@ -49,10 +49,11 @@ libcurl 或其他邮件库的封装——它自己实现了 SMTP 线路协议，
 或自行解析 MX 记录直接投递），你可以选择与现有邮件运维方式匹配的一种，也可以
 让 Perfect-SMTP 本身充当最终的 MTA。
 
-> 这是 2026 年之前基于 libcurl 的旧版 Perfect-SMTP 的完整重写。如果你使用过旧版
-> `EMail`/`SMTPClient`/`Recipient` API，请参阅用户指南中的
+> 6.0.0 是对基于 libcurl 的 Perfect-SMTP 5.x 的完整重写。如果你使用过旧版
+> `EMail`/`SMTPClient`/`Recipient` API，请参阅英文 README 的
+> [Migrating from 5.x](README.md#migrating-from-5x) 一节和用户指南中的
 > [从旧版 Perfect-SMTP 迁移](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
-> 一节——这不是一次可以直接替换的升级。
+> 一节——这不是一次可以直接替换的升级。旧代码保留在 `legacy` 分支和 `5.0.0` 标签上。
 
 ## 功能特性
 
@@ -82,8 +83,10 @@ libcurl 或其他邮件库的封装——它自己实现了 SMTP 线路协议，
 
 ## 环境要求
 
-- Swift 6.2 工具链（`swift-tools-version: 6.2`，`.swiftLanguageMode(.v6)`）
-- macOS 26 或更高版本（`Package.swift` 声明 `platforms: [.macOS(.v26)]`）
+- Swift 6.2 或更高版本（`swift-tools-version: 6.2`，Swift 6 语言模式）
+- macOS 12 或更高版本，或 Linux（CI 覆盖 Ubuntu 24.04 上的 Swift 6.2 与 6.4）
+
+不支持 iOS/tvOS/watchOS：这是一个服务端软件包。
 
 ## 安装
 
@@ -111,8 +114,8 @@ libcurl 或其他邮件库的封装——它自己实现了 SMTP 线路协议，
 发送一封邮件：
 
 ```swift
-import PerfectSMTP
 import NIOPosix
+import PerfectSMTP
 
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
@@ -137,8 +140,15 @@ for result in results {
     print(result.recipient, result.outcome)
 }
 
+await transport.shutdown()
 try await group.shutdownGracefully()
 ```
+
+**安全默认值：** 所有 TLS 连接都会完整校验证书；`.startTLS` 在服务器未提供
+STARTTLS 时直接失败，绝不降级为明文；当 `tls: .none` 且配置了认证信息时，
+`send` 会抛出 `RelayTransportError.authenticationRequiresTLS`，除非显式设置
+`allowsAuthenticationWithoutTLS: true`。详见英文 README 的
+[Security defaults](README.md#security-defaults) 一节。
 
 基础用法就是这些。关于 DKIM 签名、直连 MX 投递、认证方式、批量发送以及
 送达率相关头字段，请参阅**[用户指南](Documentation/user-guide.md)**。
@@ -149,15 +159,15 @@ try await group.shutdownGracefully()
 swift test
 ```
 
-全部 323 个测试都无需任何外部服务或环境变量即可运行——其中包括会打开真实
-loopback 套接字的测试（一次 STARTTLS 握手和一次完整的 DirectMX 投递，各自
-针对 `127.0.0.1` 上一个进程内的伪 SMTP 服务器运行），但这里没有任何测试会
-连接真实网络或真实邮件服务器。
+全部测试都无需任何外部服务、环境变量、互联网或 DNS 即可运行——需要套接字的
+测试（STARTTLS 握手、完整的 DirectMX 投递、DNS 解析器、MTA-STS 获取）都针对
+`127.0.0.1` 上的进程内伪服务器运行。CI 在 Linux 和 macOS 上以 debug 和
+release 两种配置、带 `-warnings-as-errors` 运行全部测试。
 
 说明：原始重写计划文档（`Documentation/swift6-nio-rewrite-plan.md` §4.1/§5）
 中描述了另一层通过 `SMTP_TESTS=1` 环境变量启用、针对 MailHog/smtp4dev CI
 服务容器的实时集成测试。这一层从未被实现——`Tests/` 目录下没有任何地方引用
-这个环境变量，本仓库也没有任何 CI 工作流文件。如果你需要针对真实 SMTP 服务器
+这个环境变量，也没有任何需要手动开启的测试。如果你需要针对真实 SMTP 服务器
 做验证，可以自行将 `RelayTransport` 或 `DirectMXTransport` 指向本地的
 MailHog/smtp4dev 实例；参见用户指南中的
 [测试你的集成](Documentation/user-guide.md#testing-your-integration)一节。
