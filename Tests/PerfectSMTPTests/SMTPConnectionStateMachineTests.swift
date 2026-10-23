@@ -449,3 +449,35 @@ private actor CallCounter {
     private(set) var value = 0
     func increment() { value += 1 }
 }
+
+struct SASLHardeningTests {
+    @Test func anEndlessChallengeLoopIsCutOff() async throws {
+        let (connection, channel) = try await ConnectionHarness.make()
+        async let negotiate: Capabilities = connection.negotiateCapabilities()
+        _ = try await expectClientLine(channel)
+        try await serverSend(channel, "250-smtp.example.com")
+        try await serverSend(channel, "250 AUTH LOGIN")
+        _ = try await negotiate
+
+        let auth = Task { try await connection.authenticate(SASLLogin(username: "u", password: "p")) }
+        _ = try await expectClientLine(channel) // AUTH LOGIN
+        for _ in 0..<SMTPConnection.maximumSASLChallenges {
+            try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
+            _ = try await expectClientLine(channel)
+        }
+        try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
+        await #expect(throws: SMTPConnectionError.tooManySASLChallenges) { try await auth.value }
+    }
+
+    @Test func anXOAuth2UsernameOrTokenWithTheFieldSeparatorIsRejected() async {
+        var forged = XOAuth2(username: "victim@example.com\u{1}auth=Bearer stolen") { "token" }
+        await #expect(throws: SASLError.separatorInCredential(field: "username")) { _ = try await forged.initialResponse() }
+        var badToken = XOAuth2(username: "u@example.com") { "tok\u{1}en" }
+        await #expect(throws: SASLError.separatorInCredential(field: "token")) { _ = try await badToken.initialResponse() }
+    }
+
+    @Test func aPlainCredentialWithNULIsRejected() async {
+        var plain = SASLPlain(username: "u\u{0}admin", password: "p")
+        await #expect(throws: SASLError.separatorInCredential(field: "username")) { _ = try await plain.initialResponse() }
+    }
+}

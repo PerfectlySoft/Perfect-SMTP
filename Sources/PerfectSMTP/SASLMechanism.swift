@@ -53,6 +53,15 @@ public protocol SASLMechanism: Sendable {
 /// RFC 4616. `authzid` is almost always empty for SMTP AUTH (the
 /// authentication identity and authorization identity are the same
 /// mailbox); exposed for completeness.
+/// A credential can't be framed for its SASL mechanism.
+public enum SASLError: Error, Sendable, Equatable {
+    /// `field` contains the mechanism's field separator: NUL for PLAIN,
+    /// U+0001 for XOAUTH2. Sending it would let the value forge the
+    /// following fields (for example an XOAUTH2 username adding its own
+    /// `auth=` part).
+    case separatorInCredential(field: String)
+}
+
 public struct SASLPlain: SASLMechanism {
     public let name = "PLAIN"
     public let authzid: String
@@ -67,6 +76,9 @@ public struct SASLPlain: SASLMechanism {
     }
 
     public mutating func initialResponse() async throws -> [UInt8]? {
+        for (field, value) in [("authzid", authzid), ("username", username), ("password", password)] where value.utf8.contains(0) {
+            throw SASLError.separatorInCredential(field: field)
+        }
         sentInitial = true
         var bytes: [UInt8] = []
         bytes.append(contentsOf: Array(authzid.utf8))
@@ -130,8 +142,10 @@ public struct XOAuth2: SASLMechanism {
     }
 
     public mutating func initialResponse() async throws -> [UInt8]? {
+        guard !username.utf8.contains(1) else { throw SASLError.separatorInCredential(field: "username") }
         sentInitial = true
         let token = try await tokenProvider()
+        guard !token.utf8.contains(1) else { throw SASLError.separatorInCredential(field: "token") }
         let framed = "user=\(username)\u{1}auth=Bearer \(token)\u{1}\u{1}"
         return Array(framed.utf8)
     }
@@ -173,4 +187,31 @@ extension RelayConfig.Auth: CustomStringConvertible, CustomDebugStringConvertibl
     }
 
     public var debugDescription: String { description }
+}
+
+// Redacted mirrors too: `dump(_:)`, `Mirror(reflecting:)` and debuggers'
+// `po` walk stored properties through reflection and ignore the
+// descriptions above.
+extension SASLPlain: CustomReflectable {
+    public var customMirror: Mirror {
+        Mirror(self, children: ["username": username, "password": "<redacted>"], displayStyle: .struct)
+    }
+}
+
+extension SASLLogin: CustomReflectable {
+    public var customMirror: Mirror {
+        Mirror(self, children: ["username": username, "password": "<redacted>"], displayStyle: .struct)
+    }
+}
+
+extension XOAuth2: CustomReflectable {
+    public var customMirror: Mirror {
+        Mirror(self, children: ["username": username, "tokenProvider": "<redacted>"], displayStyle: .struct)
+    }
+}
+
+extension RelayConfig.Auth: CustomReflectable {
+    public var customMirror: Mirror {
+        Mirror(self, children: ["description": description], displayStyle: .enum)
+    }
 }

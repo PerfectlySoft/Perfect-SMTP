@@ -37,6 +37,9 @@ public enum SMTPConnectionError: Error, Sendable, Equatable {
     /// existing catch path exactly like any other thrown error, marking the
     /// connection unhealthy (closed, not returned to idle) via `release`.
     case replyTimedOut
+    /// The server kept answering an AUTH exchange with `334` continuations
+    /// past `SMTPConnection.maximumSASLChallenges`.
+    case tooManySASLChallenges
 }
 
 /// The live, TLS-ready connection's async conversation surface.
@@ -263,6 +266,10 @@ public final class SMTPConnection: @unchecked Sendable {
         isAuthenticated = true
     }
 
+    /// No supported mechanism needs more than two continuations (LOGIN's
+    /// username and password, or XOAUTH2's error detail); 10 is headroom.
+    static let maximumSASLChallenges = 10
+
     private func performSASLExchange(_ mechanism: inout any SASLMechanism) async throws {
         let initial = try await mechanism.initialResponse()
         var line = "AUTH \(mechanism.name)"
@@ -271,7 +278,14 @@ public final class SMTPConnection: @unchecked Sendable {
         }
         try await writeLine(line)
         var reply = try await nextReply()
+        var challenges = 0
         while reply.code == 334 {
+            // Bounded: a hostile or broken server could otherwise keep the
+            // exchange going forever, one reply timeout at a time.
+            challenges += 1
+            guard challenges <= Self.maximumSASLChallenges else {
+                throw SMTPConnectionError.tooManySASLChallenges
+            }
             guard let challengeText = reply.lines.first,
                   let challengeData = Data(base64Encoded: challengeText)
             else {

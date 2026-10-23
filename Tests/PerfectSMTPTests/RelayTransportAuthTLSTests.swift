@@ -102,6 +102,25 @@ struct CredentialRedactionTests {
         }
         #expect("\(config.auth)".contains("<redacted>"))
     }
+
+    @Test func dumpAndMirrorNeverExposeThePasswordOrToken() {
+        let secret = "S3CRET-PW"
+        let values: [Any] = [
+            RelayConfig(host: "h", port: 587, tls: .startTLS, auth: .plain(username: "u", password: secret)),
+            RelayConfig(host: "h", port: 587, tls: .startTLS, auth: .login(username: "u", password: secret)),
+            RelayConfig.Auth.plain(username: "u", password: secret),
+            SASLPlain(username: "u", password: secret),
+            SASLLogin(username: "u", password: secret),
+            XOAuth2(username: "u") { secret },
+        ]
+        for value in values {
+            var dumped = ""
+            dump(value, to: &dumped)
+            #expect(!dumped.contains(secret), "\(dumped)")
+            let children = Mirror(reflecting: value).children.map { "\($0.label ?? ""): \($0.value)" }.joined()
+            #expect(!children.contains(secret), "\(children)")
+        }
+    }
 }
 
 struct WireInjectionTests {
