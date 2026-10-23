@@ -15,7 +15,12 @@ let package = Package(
         // .removeHandler(context:)`); the tests need 2.86.0, the first
         // release whose `EmbeddedChannel` accepts the `autoRead` option.
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
-        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
+        // 2.31.0: the first release with the public `peerCertificate`,
+        // which the DNS-subjectAltName check reads after the handshake.
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.31.0"),
+        // Already in the graph through swift-crypto 4 (which requires
+        // 1.2.0); declared for the subjectAltName parser.
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.2.0"),
         // 1.5.4: 1.5.0-1.5.3 don't compile on Linux with Swift 6.2+
         // (`localtime` returns an optional there).
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.4"),
@@ -67,6 +72,7 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
                 .product(name: "NIOTLS", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
             ],

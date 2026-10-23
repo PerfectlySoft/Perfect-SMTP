@@ -75,12 +75,14 @@ public enum SMTPBootstrap {
         replyTimeout: TimeInterval = 300,
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
         ehloHostname: String = "localhost",
+        requireCertificateDNSName: Bool = false,
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         try await connect(
             target: .hostPort(host: host, port: port), sniHostname: host, tls: tls,
             connectTimeout: connectTimeout, replyTimeout: replyTimeout,
-            tlsConfiguration: tlsConfiguration, ehloHostname: ehloHostname, requireCertificateDNSName: false, group: group
+            tlsConfiguration: tlsConfiguration, ehloHostname: ehloHostname,
+            requireCertificateDNSName: requireCertificateDNSName, group: group
         )
     }
 
@@ -259,32 +261,26 @@ public enum SMTPBootstrap {
     /// passed. Any other name NIOSSL refuses now fails the connection.
     ///
     /// With `requireDNSName`, the certificate must additionally have a DNS
-    /// subjectAltName matching `host` (wildcards as in RFC 8461 §4.2's
-    /// `mx` matching); an IP literal can't satisfy that.
+    /// subjectAltName matching `host`; that is checked once the handshake
+    /// completes (`CertificateDNSNames`), since NIOSSL's own check also
+    /// accepts an IP SAN equal to the dialed address. An IP literal can't
+    /// satisfy it at all.
     static func makeSSLHandler(host: String, configuration: TLSConfiguration, requireDNSName: Bool = false) throws -> NIOSSLClientHandler {
         let context = try NIOSSLContext(configuration: configuration)
         if isIPAddressLiteral(host) {
             guard !requireDNSName else { throw SMTPError.tlsCertificateInvalid(underlying: CertificateNameError.noDNSName(host: host)) }
             return try NIOSSLClientHandler(context: context, serverHostname: nil)
         }
-        guard requireDNSName else {
-            return try NIOSSLClientHandler(context: context, serverHostname: host)
-        }
-        return try NIOSSLClientHandler._makeSSLClientHandler(context: context, serverHostname: host) { certificate, channel in
-            let names = certificate._subjectAlternativeNames().compactMap { name -> String? in
-                guard name.nameType == .dnsName else { return nil }
-                return String(decoding: name.contents, as: UTF8.self)
-            }
-            guard names.contains(where: { MXPatternMatcher.matches(pattern: $0, host: host) }) else {
-                return channel.eventLoop.makeFailedFuture(CertificateNameError.noDNSName(host: host))
-            }
-            return channel.eventLoop.makeSucceededVoidFuture()
-        }
+        return try NIOSSLClientHandler(context: context, serverHostname: host)
     }
 
     /// Whether `error`, seen while TLS is being set up, means the peer's
     /// certificate failed verification (as opposed to a malformed TLS
     /// stream, which during STARTTLS is how injected plaintext shows up).
+    /// Name failures are matched by type. A chain that doesn't verify only
+    /// shows up as `NIOSSLError.handshakeFailed` wrapping BoringSSL's
+    /// queue, whose error codes NIOSSL keeps private, so that one case is
+    /// recognized by BoringSSL's `CERTIFICATE_VERIFY_FAILED` reason text.
     static func isCertificateFailure(_ error: any Error) -> Bool {
         if error is CertificateNameError { return true }
         if let extra = error as? NIOSSLExtraError, extra == .failedToValidateHostname { return true }
@@ -293,13 +289,6 @@ public enum SMTPBootstrap {
         }
         return false
     }
-}
-
-/// The certificate verified as a chain but didn't name the host as
-/// required.
-public enum CertificateNameError: Error, Sendable, Equatable {
-    /// No DNS subjectAltName matches `host`.
-    case noDNSName(host: String)
 }
 
 /// Phase A's explicit state machine. `@unchecked Sendable`: constructed on,
@@ -429,6 +418,16 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
+            // The certificate has verified as a chain; where a DNS name is
+            // required, check it before any SMTP reply is processed.
+            if requireCertificateDNSName, state == .upgrading || tls == .implicit {
+                do {
+                    try CertificateDNSNames.requireMatch(in: context.pipeline.syncOperations, host: host)
+                } catch {
+                    fail(context: context, .tlsCertificateInvalid(underlying: error))
+                    return
+                }
+            }
             guard state == .upgrading else {
                 // A handshake-completed event outside the upgrade window
                 // (e.g. implicit TLS, where we never entered `.upgrading`
