@@ -22,11 +22,12 @@ struct MTASTSHTTPFetcherSizeLimitTests {
     func anEndlessBodyIsCutOffAtTheCapWithoutBufferingIt(declareHugeLength: Bool) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let sent = NIOLockedValueBox(0)
+        let closed = NIOLockedValueBox(false)
         let channel = try await ServerBootstrap(group: group)
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(
-                        EndlessBodyHTTPHandler(declareHugeLength: declareHugeLength, sent: sent)
+                        EndlessBodyHTTPHandler(declareHugeLength: declareHugeLength, sent: sent, closed: closed)
                     )
                 }
             }
@@ -35,16 +36,24 @@ struct MTASTSHTTPFetcherSizeLimitTests {
 
         let fetcher = URLSessionMTASTSFetcher(timeout: 30)
         let url = try #require(URL(string: "http://127.0.0.1:\(port)/.well-known/mta-sts.txt"))
+        let started = Date()
         await #expect(throws: MTASTSHTTPFetchError.responseTooLarge(limit: MTASTSPolicyManager.maximumPolicyResponseSizeBytes)) {
             _ = try await fetcher.fetch(url: url)
         }
+        #expect(Date().timeIntervalSince(started) < 10)
 
+        // The client must hang up rather than keep draining the body:
+        // wait for the server to see the connection close, then check the
+        // server didn't get far ahead (socket buffers allow some slack).
+        let deadline = Date().addingTimeInterval(10)
+        while !closed.withLockedValue({ $0 }), Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let total = sent.withLockedValue { $0 }
         try await channel.close()
         try await group.shutdownGracefully()
-        // Socket buffers let the server get some way ahead of the client,
-        // but nowhere near the unbounded amount an uncapped read would pull.
-        let total = sent.withLockedValue { $0 }
-        #expect(total < 64 * 1024 * 1024, "the server streamed \(total) bytes before the client stopped reading")
+        #expect(closed.withLockedValue { $0 }, "the client never closed the connection; the server streamed \(total) bytes")
+        #expect(total < 256 * 1024 * 1024, "the server streamed \(total) bytes before the client stopped reading")
     }
 
     @Test func aPolicyManagerTreatsAnOversizedFetchAsNoPolicy() async throws {
@@ -69,12 +78,19 @@ private final class EndlessBodyHTTPHandler: ChannelInboundHandler, @unchecked Se
     // Event-loop confined.
     private let declareHugeLength: Bool
     private let sent: NIOLockedValueBox<Int>
+    private let closed: NIOLockedValueBox<Bool>
     private var started = false
     private let chunk = ByteBuffer(repeating: UInt8(ascii: "#"), count: 64 * 1024)
 
-    init(declareHugeLength: Bool, sent: NIOLockedValueBox<Int>) {
+    init(declareHugeLength: Bool, sent: NIOLockedValueBox<Int>, closed: NIOLockedValueBox<Bool>) {
         self.declareHugeLength = declareHugeLength
         self.sent = sent
+        self.closed = closed
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        closed.withLockedValue { $0 = true }
+        context.fireChannelInactive()
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {

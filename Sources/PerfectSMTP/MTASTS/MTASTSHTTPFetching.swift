@@ -318,13 +318,28 @@ private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDeleg
     ) {
         // Reject a declared oversized body before reading any of it.
         guard response.expectedContentLength <= Int64(limit) else {
-            lock.lock()
-            tooLarge = true
-            lock.unlock()
             completionHandler(.cancel)
+            abandonTooLarge(dataTask, session: session)
             return
         }
         completionHandler(.allow)
+    }
+
+    /// Fails the fetch with `.responseTooLarge` right away and tears the
+    /// transfer down. corelibs doesn't stop reading promptly on `.cancel`
+    /// or `cancel()` alone (on Linux the reviewer's endless body kept
+    /// arriving), so the session is invalidated too and the caller isn't
+    /// left waiting for `didCompleteWithError`.
+    private func abandonTooLarge(_ task: URLSessionTask, session: URLSession) {
+        lock.lock()
+        tooLarge = true
+        body = Data()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: MTASTSHTTPFetchError.responseTooLarge(limit: limit))
+        task.cancel()
+        session.invalidateAndCancel()
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -334,11 +349,8 @@ private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDeleg
             return
         }
         if body.count + data.count > limit {
-            // Stop reading: drop what was buffered and cancel the task.
-            tooLarge = true
-            body = Data()
             lock.unlock()
-            dataTask.cancel()
+            abandonTooLarge(dataTask, session: session)
             return
         }
         body.append(data)

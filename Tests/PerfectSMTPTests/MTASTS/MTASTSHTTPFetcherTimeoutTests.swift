@@ -42,7 +42,7 @@ struct MTASTSHTTPFetcherTimeoutTests {
     }
 }
 
-/// Answers any request with a 200 whose 100 kB body arrives one byte every
+/// Answers any request with a 200 whose 60 kB body (under the 64 KiB cap) arrives one byte every
 /// 100 ms, so bytes never stop for long enough to trip an idle timeout.
 private final class TricklingHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
@@ -55,7 +55,7 @@ private final class TricklingHTTPHandler: ChannelInboundHandler, @unchecked Send
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         guard !started else { return }
         started = true
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n\r\n"
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 60000\r\n\r\n"
         context.writeAndFlush(Self.wrapOutboundOut(ByteBuffer(string: head)), promise: nil)
         let bound = NIOLoopBound(context, eventLoop: context.eventLoop)
         task = context.eventLoop.scheduleRepeatedTask(initialDelay: .milliseconds(100), delay: .milliseconds(100)) { _ in
