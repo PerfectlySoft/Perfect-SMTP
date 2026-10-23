@@ -381,6 +381,21 @@ public final class SMTPConnection: @unchecked Sendable {
         }
 
         let dataReply = try await nextReply()
+        // Release review: a server may still answer the pipelined DATA with
+        // 354 after rejecting every RCPT. It is then in DATA mode, and
+        // returning the connection to the pool as is would feed the next
+        // transaction's MAIL FROM into a message body. RFC 2920 §3.1: send
+        // the terminating dot without a body and read its reply. If that
+        // fails, close the channel so the pool drops the connection.
+        if !anyAccepted, dataReply.code == 354 {
+            do {
+                try await write(.line("."))
+                _ = try await nextReply()
+            } catch {
+                channel.close(promise: nil)
+            }
+            return results
+        }
         // DATA proceeds only if at least one RCPT was accepted -- otherwise
         // the pipelined DATA command itself draws a rejection and the body
         // must never be sent (plan §4.3's corrected PIPELINING semantics).

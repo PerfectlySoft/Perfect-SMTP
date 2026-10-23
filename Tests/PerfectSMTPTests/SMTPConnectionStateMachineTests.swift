@@ -263,6 +263,51 @@ struct SMTPConnectionStateMachineTests {
         }
     }
 
+    /// Release review: a server that answers the pipelined DATA with 354
+    /// even though every RCPT was rejected leaves the session in DATA mode.
+    /// The connection must end the empty message with a lone dot (never the
+    /// body) and be back in command mode afterwards.
+    @Test func a354AfterEveryRCPTWasRejectedIsClosedWithADotNotTheBody() async throws {
+        let (connection, channel) = try await ConnectionHarness.make()
+        try await negotiateWithCapabilities(connection, channel, lines: ["250-smtp.example.com", "250 PIPELINING"])
+
+        let envelope = try SMTPEnvelope(mailFrom: .address("from@example.com"), recipients: ["bad@example.com"])
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nSECRET BODY".utf8))
+
+        async let sendTask = connection.sendMessage(envelope, message)
+        _ = try await expectClientLine(channel) // MAIL
+        _ = try await expectClientLine(channel) // RCPT
+        _ = try await expectClientLine(channel) // DATA
+        try await serverSend(channel, "250 2.1.0 OK")
+        try await serverSend(channel, "550 5.1.1 User unknown")
+        try await serverSend(channel, "354 Start mail input")
+        #expect(try await expectClientLine(channel) == ".")
+        try await serverSend(channel, "554 5.5.1 No valid recipients")
+
+        let results = try await sendTask
+        guard case .permanentlyFailed(let reply)? = results.first?.outcome else {
+            Issue.record("expected the RCPT rejection, got \(String(describing: results.first?.outcome))")
+            return
+        }
+        #expect(reply.code == 550)
+
+        // Back in command mode: the next transaction's MAIL FROM is a command.
+        let next = try SMTPEnvelope(mailFrom: .address("from@example.com"), recipients: ["good@example.com"])
+        async let secondSend = connection.sendMessage(next, message)
+        #expect(try await expectClientLine(channel) == "MAIL FROM:<from@example.com>")
+        _ = try await expectClientLine(channel)
+        _ = try await expectClientLine(channel)
+        try await serverSend(channel, "250 OK")
+        try await serverSend(channel, "250 OK")
+        try await serverSend(channel, "354 go")
+        try await serverSend(channel, "250 queued")
+        let second = try await secondSend
+        guard case .delivered? = second.first?.outcome else {
+            Issue.record("expected the second message delivered, got \(String(describing: second.first?.outcome))")
+            return
+        }
+    }
+
     @Test func allRCPTRejectedNeverSendsMessageBody() async throws {
         let (connection, channel) = try await ConnectionHarness.make()
         try await negotiateWithCapabilities(connection, channel, lines: ["250-smtp.example.com", "250 PIPELINING"])
