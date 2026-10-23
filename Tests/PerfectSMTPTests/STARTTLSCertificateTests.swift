@@ -217,3 +217,50 @@ private final class TLSFakeSMTPHandler: ChannelInboundHandler, @unchecked Sendab
         context.writeAndFlush(Self.wrapOutboundOut(ByteBuffer(string: line + "\r\n")), promise: nil)
     }
 }
+
+/// Release review: every relay TLS connection to a host name needs a DNS
+/// subjectAltName, so a DNS attacker holding an IP certificate for the
+/// address they redirect to can't collect AUTH credentials.
+struct RelayCertificateNameTests {
+    @Test func theDefaultDialerRequiresADNSNameForTLSToAHostName() {
+        typealias Key = SMTPConnectionPool.Key
+        #expect(SMTPConnectionPool.requiresCertificateDNSName(Key(host: "smtp.example.com", port: 587, tls: .startTLS)))
+        #expect(SMTPConnectionPool.requiresCertificateDNSName(Key(host: "smtp.example.com", port: 465, tls: .implicit)))
+        #expect(!SMTPConnectionPool.requiresCertificateDNSName(Key(host: "192.0.2.10", port: 465, tls: .implicit)))
+        #expect(!SMTPConnectionPool.requiresCertificateDNSName(Key(host: "smtp.example.com", port: 25, tls: .none)))
+    }
+
+    /// The attack itself, by name (localhost resolves without DNS): an
+    /// IP-only certificate for the dialed address passes NIOSSL's check,
+    /// and only the DNS-name requirement refuses it.
+    @Test(.timeLimit(.minutes(1)), arguments: [TLSMode.startTLS, .implicit])
+    func anIPOnlyCertificateForARelayHostNameIsRefused(tls: TLSMode) async throws {
+        func connect(host: String = "localhost", require: Bool) async throws -> (any Error)? {
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let server = try await TLSFakeSMTPServer.start(leaf: .ipOnly, implicit: tls == .implicit, group: group)
+            var configuration = TLSConfiguration.makeClientConfiguration()
+            configuration.trustRoots = .certificates([try NIOSSLCertificate(bytes: Array(TestCertificates.caPEM.utf8), format: .pem)])
+            var failure: (any Error)?
+            do {
+                let channel = try await SMTPBootstrap.connect(
+                    host: host, port: server.port, tls: tls, replyTimeout: 10,
+                    tlsConfiguration: configuration, requireCertificateDNSName: require, group: group
+                )
+                try? await channel.channel.close()
+            } catch { failure = error }
+            try? await server.channel.close()
+            try await group.shutdownGracefully()
+            return failure
+        }
+        // NIOSSL alone accepts the IP certificate for the name...
+        #expect(try await connect(require: false) == nil)
+        // ...the DNS-name requirement refuses it...
+        let refused = try await connect(require: true)
+        guard case SMTPError.tlsCertificateInvalid? = refused else {
+            Issue.record("expected tlsCertificateInvalid, got \(String(describing: refused))")
+            return
+        }
+        // ...and an IP-literal relay is still checked against its IP SAN.
+        #expect(try await connect(host: "127.0.0.1", require: false) == nil)
+    }
+}

@@ -18,16 +18,25 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 import NIOSSL
+import NIOTLS
 
 /// Fetches MTA-STS policy files with a plain HTTP/1.1 GET over SwiftNIO.
 ///
-/// - TLS uses `tlsConfiguration` (default: full certificate verification
-///   against the system trust store) with the URL's host as SNI and
-///   expected name; an `http://` URL (tests, local tooling) is fetched in
-///   the clear.
+/// - **Address vetting (SSRF):** the host is resolved once, through
+///   `addressResolver` (default: this library's `DNSResolver`), every
+///   address is checked with `DNSAddress.isRoutable`, and the connection is
+///   made to a vetted address, so what was checked is what is dialed. The
+///   name still goes in SNI and `Host`. With no permitted address the fetch
+///   throws `MTASTSHTTPFetchError.noPermittedAddress` without connecting.
+///   `allowPrivateAddresses` turns this off (tests, internal setups).
+/// - **TLS** uses `tlsConfiguration` (default: full certificate
+///   verification against the system trust store). For a host name, the
+///   certificate must also carry a DNS subjectAltName for it: NIOSSL alone
+///   accepts an IP SAN equal to the dialed address (release review). An
+///   `http://` URL (tests, local tooling) is fetched in the clear.
 /// - Redirects are never followed (RFC 8461 §3.3): a 3xx is returned as
 ///   is, and `MTASTSPolicyManager` treats any non-200 as a failed fetch.
-/// - `timeout` bounds the whole fetch, connect to last byte
+/// - `timeout` bounds the whole fetch, resolution to last byte
 ///   (`MTASTSHTTPFetchError.timedOut`).
 /// - At most `maximumBodySize` body bytes are read. A larger
 ///   `Content-Length` is refused before the body, and the connection is
@@ -38,17 +47,23 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
     private let timeout: TimeInterval
     private let maximumBodySize: Int
     private let tlsConfiguration: TLSConfiguration
+    private let addressResolver: any MTASTSAddressResolving
+    private let allowPrivateAddresses: Bool
 
     public init(
         group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         timeout: TimeInterval = 60,
         maximumBodySize: Int = MTASTSPolicyManager.maximumPolicyResponseSizeBytes,
-        tlsConfiguration: TLSConfiguration = .makeClientConfiguration()
+        tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
+        addressResolver: (any MTASTSAddressResolving)? = nil,
+        allowPrivateAddresses: Bool = false
     ) {
         self.group = group
         self.timeout = timeout
         self.maximumBodySize = max(0, maximumBodySize)
         self.tlsConfiguration = tlsConfiguration
+        self.addressResolver = addressResolver ?? DNSResolver(group: group)
+        self.allowPrivateAddresses = allowPrivateAddresses
     }
 
     public enum FetchError: Error, Sendable, Equatable {
@@ -60,42 +75,70 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
 
     public func fetch(url: URL) async throws -> MTASTSHTTPResponse {
         guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
-              let host = url.host, !host.isEmpty
+              let rawHost = url.host, !rawHost.isEmpty
         else { throw FetchError.unsupportedURL(url.absoluteString) }
+        let host = rawHost.hasPrefix("[") && rawHost.hasSuffix("]") ? String(rawHost.dropFirst().dropLast()) : rawHost
         let useTLS = scheme == "https"
         let port = url.port ?? (useTLS ? 443 : 80)
         let basePath = url.path.isEmpty ? "/" : url.path
         let path = url.query.map { basePath + "?" + $0 } ?? basePath
+        let literal = Self.addressLiteral(host)
+        // Host header: name or address, IPv6 in brackets, port if explicit.
+        let hostField = (literal.map { if case .v6 = $0 { return "[\(host)]" } else { return host } } ?? host)
+            + (url.port.map { ":\($0)" } ?? "")
 
         let limit = maximumBodySize
         let sslContext = useTLS ? try NIOSSLContext(configuration: tlsConfiguration) : nil
         let group = self.group
         let connectTimeout = Self.timeAmount(timeout)
+        let resolver = addressResolver
+        let allowPrivate = allowPrivateAddresses
         let promise = group.next().makePromise(of: MTASTSHTTPResponse.self)
 
         return try await Self.withDeadline(timeout, onTimeout: { promise.fail(MTASTSHTTPFetchError.timedOut) }) {
+            // Resolve once and vet; the vetted address is what gets dialed.
+            let resolved: [DNSAddress]
+            if let literal {
+                resolved = [literal]
+            } else {
+                resolved = try await resolver.resolveAddresses(hostname: host)
+            }
+            let permitted = allowPrivate ? resolved : resolved.filter(\.isRoutable)
+            guard !permitted.isEmpty else {
+                promise.fail(MTASTSHTTPFetchError.noPermittedAddress(host: host))
+                throw MTASTSHTTPFetchError.noPermittedAddress(host: host)
+            }
             let bootstrap = ClientBootstrap(group: group)
                 .connectTimeout(connectTimeout)
                 .channelInitializer { channel in
                     channel.eventLoop.makeCompletedFuture {
                         if let sslContext {
-                            let isIPLiteral = (try? SocketAddress(ipAddress: host, port: 0)) != nil
-                            let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: isIPLiteral ? nil : host)
+                            let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
                             try channel.pipeline.syncOperations.addHandler(tls)
+                            if literal == nil {
+                                try channel.pipeline.syncOperations.addHandler(PeerDNSNameCheck(host: host))
+                            }
                         }
                         try channel.pipeline.syncOperations.addHTTPClientHandlers()
                         try channel.pipeline.syncOperations.addHandler(CappedResponseCollector(limit: limit, promise: promise))
                     }
                 }
-            let channel: any Channel
-            do {
-                channel = try await bootstrap.connect(host: host, port: port).get()
-            } catch {
-                promise.fail(error)
-                throw error
+            var channel: (any Channel)?
+            var lastError: any Error = MTASTSHTTPFetchError.noPermittedAddress(host: host)
+            for address in permitted {
+                do {
+                    channel = try await bootstrap.connect(to: SocketAddress(ipAddress: address.description, port: port)).get()
+                    break
+                } catch {
+                    lastError = error
+                }
+            }
+            guard let channel else {
+                promise.fail(lastError)
+                throw lastError
             }
             var headers = HTTPHeaders()
-            headers.add(name: "Host", value: url.port.map { "\(host):\($0)" } ?? host)
+            headers.add(name: "Host", value: hostField)
             headers.add(name: "User-Agent", value: "PerfectSMTP-MTA-STS")
             headers.add(name: "Accept", value: "text/plain")
             headers.add(name: "Connection", value: "close")
@@ -110,6 +153,19 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
                 channel.close(promise: nil)
                 throw error
             }
+        }
+    }
+
+    /// `host` as an address if it is an IP literal.
+    static func addressLiteral(_ host: String) -> DNSAddress? {
+        guard let address = try? SocketAddress(ipAddress: host, port: 0) else { return nil }
+        switch address {
+        case .v4(let v4):
+            return .v4(withUnsafeBytes(of: v4.address.sin_addr) { Array($0) })
+        case .v6(let v6):
+            return .v6(withUnsafeBytes(of: v6.address.sin6_addr) { Array($0) })
+        default:
+            return nil
         }
     }
 
@@ -131,6 +187,28 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
             guard let result = try await race.next() else { throw MTASTSHTTPFetchError.timedOut }
             return result
         }
+    }
+}
+
+/// After the handshake, requires a DNS subjectAltName for `host` on the
+/// verified certificate; on failure the error reaches the collector, which
+/// fails the fetch and closes. Event-loop confined.
+private final class PeerDNSNameCheck: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = NIOAny
+    private let host: String
+    init(host: String) { self.host = host }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
+            do {
+                try CertificateDNSNames.requireMatch(in: context.pipeline.syncOperations, host: host)
+            } catch {
+                context.fireErrorCaught(error)
+                context.close(promise: nil)
+                return
+            }
+        }
+        context.fireUserInboundEventTriggered(event)
     }
 }
 

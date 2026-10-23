@@ -236,6 +236,13 @@ public final class SMTPConnectionPool: Sendable {
         DispatchTime(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0, secondsFromNow) * 1_000_000_000))
     }
 
+    /// Whether the default dialer requires a DNS subjectAltName for `key`:
+    /// always for a TLS connection to a host name, never for an IP literal
+    /// or plaintext.
+    static func requiresCertificateDNSName(_ key: Key) -> Bool {
+        key.tls != .none && (key.requireCertificateDNSName || !SMTPBootstrap.isIPAddressLiteral(key.host))
+    }
+
     public init(configuration: Configuration = .init(), ehloHostname: String = "localhost", group: any EventLoopGroup) {
         self.configuration = configuration
         self.ehloHostname = ehloHostname
@@ -246,10 +253,18 @@ public final class SMTPConnectionPool: Sendable {
         let capturedReplyTimeout = configuration.replyTimeout
         let capturedDataTerminationTimeout = configuration.dataTerminationTimeout
         self.dialer = { key in
+            // Release review: a relay reached by name must present a
+            // certificate with a DNS subjectAltName for that name. NIOSSL
+            // alone also accepts an IP SAN equal to the dialed address, so
+            // someone able to redirect the relay's DNS to an address they
+            // hold an IP certificate for could otherwise collect AUTH
+            // credentials. An IP-literal relay is checked against its IP.
             let asyncChannel = try await SMTPBootstrap.connect(
                 host: key.host, port: key.port, tls: key.tls,
                 connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout,
-                ehloHostname: capturedHostname, group: capturedGroup
+                ehloHostname: capturedHostname,
+                requireCertificateDNSName: Self.requiresCertificateDNSName(key),
+                group: capturedGroup
             )
             let connection = SMTPConnection(
                 asyncChannel: asyncChannel,

@@ -78,6 +78,9 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
     /// `maximumBodySize` bytes of body. The fetch stops reading at that
     /// point instead of buffering the rest.
     case responseTooLarge(limit: Int)
+    /// Every address `host` resolved to is private or otherwise not
+    /// globally routable (see `DNSAddress.isRoutable`); nothing was dialed.
+    case noPermittedAddress(host: String)
 }
 
 /// The production `MTASTSHTTPFetching` implementation: a plain `URLSession`
