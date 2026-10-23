@@ -71,6 +71,9 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
     /// expected for an `https://` URL in practice, handled defensively
     /// rather than force-cast.
     case notAnHTTPResponse
+    /// The whole fetch (connect, TLS, headers and body) did not finish
+    /// within the fetcher's `timeout`.
+    case timedOut
 }
 
 /// The production `MTASTSHTTPFetching` implementation: a plain `URLSession`
@@ -120,6 +123,7 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
 /// used there, not the session itself.
 public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     private let session: URLSession
+    private let timeout: TimeInterval
 
     /// - Parameter session: On Darwin, the session every fetch runs on. On
     ///   platforms that use `FoundationNetworking` (Linux), only its
@@ -127,19 +131,30 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     ///   session whose delegate refuses redirects, so a delegate set on
     ///   `session` (e.g. one handling authentication challenges) is not
     ///   consulted there.
-    public init(session: URLSession = .shared) {
+    /// - Parameter timeout: Seconds the whole fetch may take, from connect
+    ///   to the last body byte; past it the fetch is cancelled and throws
+    ///   `MTASTSHTTPFetchError.timedOut`. `URLSession`'s own request
+    ///   timeout only bounds the gap between bytes, and its resource
+    ///   timeout defaults to seven days, so without this a policy host
+    ///   trickling bytes could hold up every direct-MX send to its domain.
+    public init(session: URLSession = .shared, timeout: TimeInterval = 60) {
         self.session = session
+        self.timeout = timeout
     }
 
     public func fetch(url: URL) async throws -> MTASTSHTTPResponse {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        #if canImport(FoundationNetworking)
-        let (data, response) = try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration)
-        #else
-        let (data, response) = try await session.data(for: request, delegate: RedirectRefusingTaskDelegate())
-        #endif
+        request.timeoutInterval = max(0, timeout)
+        let session = self.session
+        let (data, response) = try await Self.withDeadline(timeout) { [request] in
+            #if canImport(FoundationNetworking)
+            try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration)
+            #else
+            try await session.data(for: request, delegate: RedirectRefusingTaskDelegate())
+            #endif
+        }
         guard let http = response as? HTTPURLResponse else {
             throw MTASTSHTTPFetchError.notAnHTTPResponse
         }
@@ -148,6 +163,23 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
             contentType: http.value(forHTTPHeaderField: "Content-Type"),
             body: Array(data)
         )
+    }
+
+    /// Runs `operation`, cancelling it and throwing `.timedOut` if it is
+    /// still running after `seconds`.
+    private static func withDeadline<T: Sendable>(
+        _ seconds: TimeInterval, _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { race in
+            race.addTask { try await operation() }
+            race.addTask {
+                try await Task.sleep(nanoseconds: UInt64(min(max(0, seconds), 86_400) * 1_000_000_000))
+                throw MTASTSHTTPFetchError.timedOut
+            }
+            defer { race.cancelAll() }
+            guard let result = try await race.next() else { throw MTASTSHTTPFetchError.timedOut }
+            return result
+        }
     }
 }
 
