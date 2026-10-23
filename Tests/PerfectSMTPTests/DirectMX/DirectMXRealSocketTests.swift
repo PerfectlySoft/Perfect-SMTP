@@ -107,6 +107,37 @@ struct DirectMXRealSocketTests {
         }
         #expect(host == "mx.ssrf.example")
     }
+
+    /// Release review: `0.0.0.0` (and its IPv4-mapped and 6to4 forms)
+    /// reaches the local host on macOS and Linux, and used to pass the
+    /// private-address filter. With a real listener on 127.0.0.1, the dial
+    /// must be refused rather than reaching it.
+    @Test(arguments: [DNSAddress.v4([0, 0, 0, 0]), .v6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0])])
+    func productionDialerRefusesTheUnspecifiedAddressThatReachesLocalhost(address: DNSAddress) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let server = try await AcceptingFakeSMTPServer.start(group: group)
+        let resolver = FakeMXResolver(
+            mxRecords: ["zero.example": [DNSResolver.MXRecord(preference: 10, exchange: "mx.zero.example")]],
+            addresses: ["mx.zero.example": [address]]
+        )
+        let transport = DirectMXTransport(
+            resolver: resolver, config: DirectMXConfig(port: server.port, tlsPolicy: .fixed(.none)), group: group
+        )
+        let envelope = try SMTPEnvelope(mailFrom: .address("from@sender.example"), recipients: ["rcpt@zero.example"])
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\nFrom: from@sender.example\r\n\r\nbody".utf8))
+
+        let results = try await transport.send(envelope, message)
+        await transport.shutdown()
+        try await server.channel.close()
+        try await group.shutdownGracefully()
+
+        guard case .failed(let error)? = results.first?.outcome,
+              case .allResolvedAddressesFilteredAsPrivate? = error as? DirectMXError
+        else {
+            Issue.record("expected the address to be filtered as private, got \(String(describing: results.first?.outcome))")
+            return
+        }
+    }
 }
 
 /// A minimal, real-socket fake SMTP server that accepts a full EHLO / MAIL
