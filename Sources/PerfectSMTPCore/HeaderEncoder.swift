@@ -114,7 +114,7 @@ public enum HeaderEncoder {
         case leadingHyphenInField(String)
     }
 
-    /// True for any C0 control character (0x00–0x1F) or DEL (0x7F) — the
+    /// True for any C0 control character (0x00–0x1F), DEL (0x7F) — the
     /// character class that must never survive, unescaped, into a string
     /// bound for an RFC 5322 header line or an SMTP command line. This is
     /// broader than just CR/LF: it also covers other C0 controls such as
@@ -124,8 +124,12 @@ public enum HeaderEncoder {
     /// review finding — a `quoted-string` only escapes `\` and `"`, not
     /// control characters, so a control byte in a display name survives
     /// straight through `quotedString` below).
-    private static func isForbiddenControlScalar(_ scalar: Unicode.Scalar) -> Bool {
-        scalar.value <= 0x1F || scalar.value == 0x7F
+    ///
+    /// Release review: also the C1 controls (U+0080–U+009F, including NEL
+    /// U+0085) and the Unicode line and paragraph separators U+2028/U+2029,
+    /// which some receivers and tools treat as line breaks.
+    static func isForbiddenControlScalar(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value <= 0x1F || (0x7F...0x9F).contains(scalar.value) || scalar.value == 0x2028 || scalar.value == 0x2029
     }
 
     /// The single, uniformly-applied discipline for every caller-controlled

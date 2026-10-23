@@ -37,6 +37,11 @@ public struct MIMEComposer: Sendable {
         /// upstream, but composition fails loudly rather than silently
         /// emitting a malformed header.
         case invalidHeaderValue(String)
+        /// An `extraHeaders` name isn't an RFC 5322 §3.6.8 field name: one
+        /// or more printable ASCII characters (33–126) other than `:`. A
+        /// name like `"Bcc:x@y"` or `"To "` would otherwise slip past
+        /// `forbiddenExtraHeaderNames` and still be read as `Bcc`/`To`.
+        case invalidHeaderName(String)
         /// `EmailMessage.listUnsubscribe.postOneClick` was `true` but `url`
         /// was `nil` — RFC 8058 §2's one-click mechanism is specifically
         /// for the HTTPS POST target, so there is no URL for
@@ -183,6 +188,12 @@ public struct MIMEComposer: Sendable {
         "perfect-smtp-\(UUID().uuidString)"
     }
 
+    /// RFC 5322 §3.6.8 `field-name = 1*ftext`, `ftext` = printable ASCII
+    /// 33–126 except `:`.
+    static func isValidFieldName(_ name: String) -> Bool {
+        !name.isEmpty && name.utf8.allSatisfy { (33...126).contains($0) && $0 != UInt8(ascii: ":") }
+    }
+
     /// Routes a caller-controlled string through `HeaderEncoder`'s shared
     /// `rejectHeaderInjection`, re-surfacing any control-character rejection
     /// as this composer's own `ComposerError.invalidHeaderValue` — the
@@ -209,6 +220,9 @@ public struct MIMEComposer: Sendable {
             // first, before the denylist lookup, so a mangled name is
             // caught regardless of what it lowercases to.
             try Self.requireNoInjection(name, field: name)
+            guard Self.isValidFieldName(name) else {
+                throw ComposerError.invalidHeaderName(name)
+            }
             if Self.forbiddenExtraHeaderNames.contains(name.lowercased()) {
                 throw ComposerError.forbiddenHeader(name)
             }
