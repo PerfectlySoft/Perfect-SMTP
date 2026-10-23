@@ -55,7 +55,10 @@ struct DNSResolverCNAMEFollowingTests {
         let server = try await FakeDNSServer.start(group: group, udpResponses: responses)
         defer { Task { await server.shutdown() } }
 
-        let resolver = DNSResolver(nameservers: [server.nameserver], group: group, queryTimeout: .seconds(2))
+        // A long query timeout, so any path that waits for one stands out
+        // clearly from three local round trips even under TSan or
+        // emulation (where those alone took over a second).
+        let resolver = DNSResolver(nameservers: [server.nameserver], group: group, queryTimeout: .seconds(10))
 
         let start = DispatchTime.now()
         await #expect(throws: DNSResolver.ResolveError.cnameLoop) {
@@ -64,10 +67,10 @@ struct DNSResolverCNAMEFollowingTests {
         let elapsedSeconds = TimeInterval(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000_000
         // The cycle is caught the moment "a.loop.test" is revisited (the
         // third hop: a -> b -> a) -- three fast local queries, not
-        // anywhere close to `queryTimeout`'s 2s budget. A regression that
+        // anywhere close to `queryTimeout`'s 10 s budget. A regression that
         // turned this into a hang (or fell through to exhausting the
-        // 8-hop bound via repeated timeouts) would blow well past this.
-        #expect(elapsedSeconds < 1, "cycle detection took \(elapsedSeconds)s -- expected it to be caught almost immediately via the visited-name guard, not by exhausting retries/hops")
+        // 8-hop bound via repeated timeouts) would take at least that.
+        #expect(elapsedSeconds < 8, "cycle detection took \(elapsedSeconds)s -- expected it to be caught almost immediately via the visited-name guard, not by exhausting retries/hops")
     }
 
     @Test func aChainLongerThanTheHopBoundIsRejectedWithoutACycle() async throws {
