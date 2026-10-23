@@ -139,3 +139,27 @@ struct MessageIDSyntaxTests {
         #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("inlineResource.contentID")) { _ = try MIMEComposer(message).compose() }
     }
 }
+
+/// Release review nits: total length, and IPv6 literals.
+struct AddressLiteralAndLengthTests {
+    @Test func addressesAreCappedAt254Octets() {
+        let domain = Array(repeating: String(repeating: "d", count: 63), count: 3).joined(separator: ".") + "." + String(repeating: "e", count: 57)
+        let local62 = String(repeating: "l", count: 62)
+        #expect(AddressSyntax.isMailbox(local62 + "@" + domain) == ((local62 + "@" + domain).utf8.count <= 254))
+        #expect(!AddressSyntax.isMailbox(String(repeating: "l", count: 64) + "@" + domain))
+        #expect(AddressSyntax.isMailbox("a@" + domain))
+    }
+
+    @Test(arguments: ["a@[IPv6:2001:db8::1]", "a@[ipv6:2001:db8::1]", "a@[IPV6:::1]", "a@[IPv6:1:2:3:4:5:6:7:8]",
+                      "a@[IPv6:::ffff:192.0.2.1]", "a@[IPv6:fe80::]", "a@[IPv6:1::]"])
+    func validIPv6LiteralsAreAccepted(address: String) {
+        #expect(AddressSyntax.isMailbox(address))
+    }
+
+    @Test(arguments: ["a@[IPv6:::::]", "a@[IPv6:1::2::3]", "a@[IPv6:12345::1]", "a@[IPv6:1:2:3:4:5:6:7:8:9]",
+                      "a@[IPv6:1:2:3:4:5:6:7]", "a@[IPv6::1]", "a@[IPv6:1:]", "a@[IPv6:]", "a@[IPv6:g::1]",
+                      "a@[IPv6:::1.2.3]", "a@[IPv6:1.2.3.4::]", "a@[IPv6:1:2:3:4:5:6:7::8]"])
+    func invalidIPv6LiteralsAreRejected(address: String) {
+        #expect(!AddressSyntax.isMailbox(address))
+    }
+}

@@ -456,17 +456,27 @@ struct SASLHardeningTests {
         async let negotiate: Capabilities = connection.negotiateCapabilities()
         _ = try await expectClientLine(channel)
         try await serverSend(channel, "250-smtp.example.com")
-        try await serverSend(channel, "250 AUTH LOGIN")
+        try await serverSend(channel, "250 AUTH XOAUTH2")
         _ = try await negotiate
 
-        let auth = Task { try await connection.authenticate(SASLLogin(username: "u", password: "p")) }
-        _ = try await expectClientLine(channel) // AUTH LOGIN
+        // XOAUTH2 answers any number of 334s with an empty response, so it
+        // exercises the connection's own bound.
+        let auth = Task { try await connection.authenticate(XOAuth2(username: "u@example.com") { "token" }) }
+        _ = try await expectClientLine(channel) // AUTH XOAUTH2 <initial response>
         for _ in 0..<SMTPConnection.maximumSASLChallenges {
             try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
             _ = try await expectClientLine(channel)
         }
         try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
         await #expect(throws: SMTPConnectionError.tooManySASLChallenges) { try await auth.value }
+    }
+
+    /// Release review: LOGIN re-sent the password for every further 334.
+    @Test func loginSendsThePasswordOnceAndRefusesAThirdChallenge() async throws {
+        var login = SASLLogin(username: "u", password: "secret")
+        #expect(try await login.respond(to: []) == Array("u".utf8))
+        #expect(try await login.respond(to: []) == Array("secret".utf8))
+        await #expect(throws: SASLError.unexpectedChallenge) { _ = try await login.respond(to: []) }
     }
 
     @Test func anXOAuth2UsernameOrTokenWithTheFieldSeparatorIsRejected() async {

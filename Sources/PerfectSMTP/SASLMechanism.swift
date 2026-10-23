@@ -60,6 +60,9 @@ public enum SASLError: Error, Sendable, Equatable {
     /// following fields (for example an XOAUTH2 username adding its own
     /// `auth=` part).
     case separatorInCredential(field: String)
+    /// The server sent more continuation challenges than the mechanism
+    /// has steps (LOGIN has two: username, then password).
+    case unexpectedChallenge
 }
 
 public struct SASLPlain: SASLMechanism {
@@ -117,7 +120,13 @@ public struct SASLLogin: SASLMechanism {
 
     public mutating func respond(to challenge: [UInt8]) async throws -> [UInt8] {
         step += 1
-        return step == 1 ? Array(username.utf8) : Array(password.utf8)
+        switch step {
+        case 1: return Array(username.utf8)
+        case 2: return Array(password.utf8)
+        // Release review: a third 334 used to get the password again.
+        // LOGIN has exactly two steps; anything more is refused.
+        default: throw SASLError.unexpectedChallenge
+        }
     }
 
     public var isComplete: Bool { step >= 2 }

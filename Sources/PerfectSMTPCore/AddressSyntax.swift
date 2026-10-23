@@ -47,7 +47,9 @@ public enum AddressSyntax {
 
     public static func isMailbox(_ address: String) -> Bool {
         let bytes = Array(address.utf8)
-        guard bytes.allSatisfy({ $0 < 0x80 }) else { return false }
+        // RFC 5321 §4.5.3.1.3: a path is at most 256 octets including the
+        // angle brackets, so the address itself at most 254.
+        guard bytes.count <= 254, bytes.allSatisfy({ $0 < 0x80 }) else { return false }
         let parts = bytes.split(separator: UInt8(ascii: "@"), omittingEmptySubsequences: false)
         guard parts.count == 2 else { return false }
         return isDotAtom(Array(parts[0])) && parts[0].count <= 64 && isDomainOrLiteral(Array(parts[1]))
@@ -86,19 +88,49 @@ public enum AddressSyntax {
         return isHostname(bytes)
     }
 
-    /// RFC 5321 §4.1.3: an IPv4 dotted quad, or `IPv6:` followed by an IPv6
-    /// address. The IPv6 form is checked for its character set and shape,
-    /// not fully parsed.
+    /// RFC 5321 §4.1.3: an IPv4 dotted quad, or `IPv6:` (any case)
+    /// followed by an IPv6 address in RFC 4291 §2.2 text form.
     private static func isAddressLiteral(_ text: String) -> Bool {
-        if text.hasPrefix("IPv6:") {
-            let rest = text.dropFirst(5)
-            guard rest.contains(":"), rest.count <= 45 else { return false }
-            return rest.utf8.allSatisfy { isHexDigit($0) || $0 == UInt8(ascii: ":") || $0 == UInt8(ascii: ".") }
+        if text.utf8.count > 5, text.prefix(5).lowercased() == "ipv6:" {
+            return isIPv6(String(text.dropFirst(5)))
         }
+        return isIPv4(text)
+    }
+
+    static func isIPv4(_ text: String) -> Bool {
         let octets = text.split(separator: ".", omittingEmptySubsequences: false)
         return octets.count == 4 && octets.allSatisfy { octet in
             (1...3).contains(octet.count) && octet.utf8.allSatisfy(isDigit) && Int(octet).map { $0 <= 255 } == true
         }
+    }
+
+    /// Eight 1–4 digit hex groups, or fewer with exactly one `::`
+    /// standing for one or more zero groups; the last 32 bits may be a
+    /// dotted quad. `::::`, `1::2::3`, `12345::` and similar are refused.
+    static func isIPv6(_ text: String) -> Bool {
+        guard !text.isEmpty, text.utf8.count <= 45 else { return false }
+        let halves = text.components(separatedBy: "::")
+        guard halves.count <= 2 else { return false }
+        func groups(_ part: String, allowIPv4Tail: Bool) -> Int? {
+            if part.isEmpty { return 0 }
+            let pieces = part.split(separator: ":", omittingEmptySubsequences: false)
+            var count = 0
+            for (index, piece) in pieces.enumerated() {
+                if allowIPv4Tail, index == pieces.count - 1, piece.contains(".") {
+                    guard isIPv4(String(piece)) else { return nil }
+                    count += 2
+                } else {
+                    guard (1...4).contains(piece.count), piece.utf8.allSatisfy(isHexDigit) else { return nil }
+                    count += 1
+                }
+            }
+            return count
+        }
+        if halves.count == 1 {
+            return groups(halves[0], allowIPv4Tail: true) == 8
+        }
+        guard let head = groups(halves[0], allowIPv4Tail: false), let tail = groups(halves[1], allowIPv4Tail: true) else { return false }
+        return head + tail <= 7
     }
 
     private static func isDotAtom(_ bytes: [UInt8]) -> Bool {

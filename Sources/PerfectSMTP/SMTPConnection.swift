@@ -145,14 +145,25 @@ public final class SMTPConnection: @unchecked Sendable {
         }
     }
 
-    /// Best effort: sends `QUIT` (bounded by `timeout`, without waiting for
-    /// the `221`), then closes the channel. Used when the pool retires an
+    /// Best effort: sends `QUIT` and waits up to `timeout` for the `221`
+    /// (RFC 5321 §4.1.1.10), then closes the channel. Used when the pool retires an
     /// idle connection, and by `RelayTransport.shutdown()` through it, so
     /// the server sees an orderly end of session rather than a dropped
     /// socket (RFC 5321 §4.1.1.10).
-    func quitAndClose(timeout: TimeInterval = 2) async {
+    func quitAndClose(timeout: TimeInterval = 0.5) async {
         if channel.isActive {
-            _ = try? await raceAgainstTimeout(timeout) { try await self.outbound.write(.line("QUIT")) }
+            // Closing the channel is what ends a pending read, so the
+            // deadline closes it rather than relying on task cancellation
+            // to interrupt `rawNextReply()`.
+            let channel = self.channel
+            let deadline = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                channel.close(promise: nil)
+            }
+            if (try? await raceAgainstTimeout(timeout) { try await self.outbound.write(.line("QUIT")) }) != nil {
+                _ = try? await rawNextReply()
+            }
+            deadline.cancel()
         }
         channel.close(promise: nil)
     }

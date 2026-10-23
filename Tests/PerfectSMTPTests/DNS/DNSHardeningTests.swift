@@ -25,18 +25,42 @@ struct DNSHardeningTests {
 
     /// The reviewer's packet: an MX whose exchange label is `mx\0`. It used
     /// to decode to "mx\u{0}.victim.test", which matches `*.victim.test`.
-    @Test func aLabelWithANULByteIsRejected() {
+    /// The label is now escaped, and the exchange is refused as a host name.
+    @Test func aLabelWithANULByteIsEscapedAndRefusedAsAnExchange() throws {
         var packet: [UInt8] = [0, 1, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 15, 0, 1, 0, 0, 0, 60]
         let rdata: [UInt8] = [0, 10, 3, 0x6D, 0x78, 0x00, 6] + Array("victim".utf8) + [4] + Array("test".utf8) + [0]
         packet += [0, UInt8(rdata.count)] + rdata
-        #expect(throws: DNSWireError.invalidLabel) { _ = try DNSMessage.decode(packet) }
+        let message = try DNSMessage.decode(packet)
+        guard case .mx(_, let exchange) = message.answers.first?.rdata else {
+            Issue.record("expected an MX record")
+            return
+        }
+        #expect(exchange == "mx\\000.victim.test")
+        // It still looks like one label under *.victim.test, but it is not a
+        // host name, so it is never dialed or used for SNI.
+        #expect(!AddressSyntax.isHostname(exchange))
+        #expect(throws: DNSResolver.ResolveError.malformedResponse) { _ = try DNSResolver.processMXAnswers(message.answers) }
     }
 
-    @Test(arguments: [[0x61, 0x2E, 0x62], [0x61, 0x20], [0x61, 0x7F], [0xC3, 0xA9], [0x0A]] as [[UInt8]])
-    func aLabelWithADotSpaceControlOrNonASCIIByteIsRejected(label: [UInt8]) {
+    @Test(arguments: [([0x61, 0x2E, 0x62], "a\\046b"), ([0x61, 0x20], "a\\032"), ([0x61, 0x7F], "a\\127"), ([0xC3, 0xA9], "\\195\\169"), ([0x0A], "\\010"), ([0x5C], "\\092")] as [([UInt8], String)])
+    func unusualLabelBytesAreEscapedNotTrusted(label: [UInt8], expected: String) throws {
         var packet = TestDNSMessageBuilder.header(id: 1, isResponse: true, ancount: 0)
         packet += [UInt8(label.count)] + label + [0, 0, 1, 0, 1]
-        #expect(throws: DNSWireError.invalidLabel) { _ = try DNSMessage.decode(packet) }
+        let message = try DNSMessage.decode(packet)
+        #expect(message.questions.first?.name == expected)
+        #expect(!AddressSyntax.isHostname(expected))
+    }
+
+    /// An odd name in another record no longer rejects the whole response.
+    @Test func anOddNameElsewhereDoesNotRejectAValidAnswer() throws {
+        let odd: [UInt8] = [3, 0x6D, 0x00, 0x78, 0] // one label: "m", NUL, "x"
+        let bytes = TestDNSMessageBuilder.response(id: 7, qname: "mx.victim.test", qtype: 1, records: [
+            odd + [0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1],
+            Self.aRecord(owner: "mx.victim.test", address: [93, 184, 216, 34]),
+        ])
+        let message = try DNSMessage.decode(bytes)
+        let (addresses, _) = DNSResolver.extractAddresses(from: message, type: .a, name: "mx.victim.test")
+        #expect(addresses == [.v4([93, 184, 216, 34])])
     }
 
     @Test func aNameLongerThan255OctetsIsRejectedOnDecodeAndEncode() {
