@@ -133,14 +133,14 @@ struct DirectMXOpportunisticTLSTests {
         try await group.shutdownGracefully()
 
         #expect(results.count == 1)
-        guard case .failed(let error) = results[0].outcome else {
-            Issue.record("expected .failed (an injection must hard-fail, never silently degrade to plaintext delivery), got \(results[0].outcome)")
+        // Release review: a connection-level failure is now temporary
+        // (queued for retry) rather than final, but it must still carry the
+        // injection classification and never have degraded to plaintext.
+        guard case .queuedForRetry(_, _, let last) = results[0].outcome, last.code == 451 else {
+            Issue.record("expected a temporary failure (an injection must never silently degrade to plaintext delivery), got \(results[0].outcome)")
             return
         }
-        guard let smtpError = error as? SMTPError, case .starttlsInjection = smtpError else {
-            Issue.record("expected the failure to be classified as SMTPError.starttlsInjection specifically -- got \(error) -- a different classification here would mean the injection went undetected or was misclassified as an ordinary opportunistic-fallback trigger")
-            return
-        }
+        #expect(last.lines.joined().contains("starttlsInjection"), "expected the failure to be classified as SMTPError.starttlsInjection specifically -- got \(last.lines)")
     }
 
     // MARK: - (4) FIX #1, CRITICAL (milestone security review): the pool's
@@ -204,8 +204,8 @@ struct DirectMXOpportunisticTLSTests {
         for attempt in 1...5 {
             let recipientEnvelope = try envelope(recipients: ["rcpt\(attempt)@breakerlaundering.example"])
             let results = try await transport.send(recipientEnvelope, message())
-            guard results.count == 1, case .failed(let error) = results[0].outcome,
-                  let smtpError = error as? SMTPError, case .starttlsInjection = smtpError
+            guard results.count == 1, case .queuedForRetry(_, _, let last) = results[0].outcome,
+                  last.lines.joined().contains("starttlsInjection")
             else {
                 Issue.record("attempt \(attempt): expected a detected STARTTLS-injection failure (to prime the circuit breaker), got \(results.map(\.outcome))")
                 await transport.shutdown()

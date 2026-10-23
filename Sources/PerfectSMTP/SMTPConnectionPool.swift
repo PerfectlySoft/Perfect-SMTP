@@ -61,10 +61,17 @@ public final class SMTPConnectionPool: Sendable {
         public let host: String
         public let port: Int
         public let tls: TLSMode
-        public init(host: String, port: Int, tls: TLSMode) {
+        /// Whether the server certificate must carry a DNS subjectAltName
+        /// for `host` (DirectMX under an MTA-STS policy; see
+        /// `SMTPBootstrap.connect(to:...)`). Part of the key, so a
+        /// connection verified without that check is never reused where
+        /// it is required.
+        public let requireCertificateDNSName: Bool
+        public init(host: String, port: Int, tls: TLSMode, requireCertificateDNSName: Bool = false) {
             self.host = host
             self.port = port
             self.tls = tls
+            self.requireCertificateDNSName = requireCertificateDNSName
         }
     }
 
@@ -239,7 +246,8 @@ public final class SMTPConnectionPool: Sendable {
         self.dialer = { key in
             let asyncChannel = try await SMTPBootstrap.connect(
                 host: key.host, port: key.port, tls: key.tls,
-                connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout, group: capturedGroup
+                connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout,
+                ehloHostname: capturedHostname, group: capturedGroup
             )
             let connection = SMTPConnection(
                 asyncChannel: asyncChannel,

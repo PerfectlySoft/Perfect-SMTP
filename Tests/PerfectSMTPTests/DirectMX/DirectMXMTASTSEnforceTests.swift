@@ -124,12 +124,14 @@ struct DirectMXMTASTSEnforceTests {
         let results = try await transport.send(try envelope(recipients: ["rcpt@nomatch.example"]), message())
 
         #expect(results.count == 1)
-        guard case .permanentlyFailed(let reply) = results[0].outcome else {
-            Issue.record("expected .permanentlyFailed, got \(results[0].outcome)")
+        // Release review: an enforce violation is temporary (RFC 8461 §5:
+        // don't deliver to it now; a later attempt may succeed).
+        guard case .queuedForRetry(_, _, let reply) = results[0].outcome else {
+            Issue.record("expected a temporary failure, got \(results[0].outcome)")
             return
         }
-        #expect(reply.code == 550)
-        #expect(reply.lines.first?.contains("5.7.1") == true)
+        #expect(reply.code == 451)
+        #expect(reply.lines.first?.contains("4.7.5") == true)
     }
 
     // MARK: - `enforce`: a policy-matched host without valid TLS hard-fails, never falls back to plaintext
@@ -157,11 +159,11 @@ struct DirectMXMTASTSEnforceTests {
         let results = try await transport.send(try envelope(recipients: ["rcpt@tlsfail.example"]), message())
 
         #expect(results.count == 1)
-        guard case .permanentlyFailed(let reply) = results[0].outcome else {
-            Issue.record("expected a hard-fail .permanentlyFailed outcome, not a plaintext-fallback delivery, got \(results[0].outcome)")
+        guard case .queuedForRetry(_, _, let reply) = results[0].outcome else {
+            Issue.record("expected a temporary policy failure, not a plaintext-fallback delivery, got \(results[0].outcome)")
             return
         }
-        #expect(reply.lines.first?.contains("5.7.1") == true)
+        #expect(reply.lines.first?.contains("4.7.5") == true)
         #expect(await plaintextWasAttempted.count == 0, "enforce mode must never attempt a plaintext (.none) connection")
     }
 
