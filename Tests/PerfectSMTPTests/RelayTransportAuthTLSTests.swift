@@ -131,15 +131,14 @@ struct WireInjectionTests {
         #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
     }
 
-    /// `SMTPEnvelope.recipients` is mutable after its validating init, so
-    /// the connection re-checks: the reviewer's `NOTIFY=`/`ORCPT=` payload
-    /// must not reach the wire, and nothing (not even MAIL FROM) is sent.
-    @Test func aRecipientMutatedAfterValidationIsRejectedBeforeAnythingIsWritten() async throws {
-        let (connection, channel) = try await ConnectionHarness.make()
-        var envelope = try SMTPEnvelope(mailFrom: .address("from@sender.example"), recipients: ["ok@example.com"])
-        envelope.recipients = ["victim@example.test> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT=rfc822;spoof@evil.test"]
-        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
-        await #expect(throws: (any Error).self) { _ = try await connection.sendMessage(envelope, message) }
-        #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
+    /// `SMTPEnvelope`'s addresses are read-only after its validating init,
+    /// and an invalid reverse path can no longer be wrapped in one: the
+    /// reviewer's `AUTH=<>` payload is refused at construction.
+    @Test func anEnvelopeRefusesAnInvalidReversePath() throws {
+        #expect(throws: (any Error).self) {
+            _ = try SMTPEnvelope(mailFrom: .address("s@example.test> AUTH=<x@y>"), recipients: ["ok@example.com"])
+        }
+        let envelope = try SMTPEnvelope(mailFrom: .address("from@sender.example"), recipients: ["ok@example.com"])
+        #expect(throws: Never.self) { try envelope.validate() }
     }
 }

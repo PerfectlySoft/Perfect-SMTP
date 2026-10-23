@@ -319,6 +319,7 @@ public final class SMTPConnection: @unchecked Sendable {
     /// degrades to lock-step (await each reply before the next write) when
     /// absent — the same command sequence either way.
     public func sendMessage(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        try envelope.validate()
         var mailFromLine = try envelope.mailFrom.mailFromCommand
         if capabilities.sizeAdvertised {
             mailFromLine += " SIZE=\(message.estimatedSize)"
