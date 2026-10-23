@@ -55,7 +55,9 @@ public enum HeaderEncoder {
         // A run without whitespace can't be folded; past 900 octets it
         // would break the 998-octet line limit, so encode it instead
         // (encoded words are folded between words).
-        guard needsEncoding(sanitized) || longestUnbreakableRun(sanitized) > 900 else { return sanitized }
+        // Text containing "=?" is encoded too: a receiver would otherwise
+        // decode a lookalike encoded word in plain text ("=?utf-8?q?x?=").
+        guard needsEncoding(sanitized) || longestUnbreakableRun(sanitized) > 900 || sanitized.contains("=?") else { return sanitized }
         return encodedWords(for: sanitized).joined(separator: "\r\n ")
     }
 
@@ -67,7 +69,7 @@ public enum HeaderEncoder {
     public static func encodePhrase(_ text: String) -> String {
         let sanitized = sanitizeForHeader(text)
         guard !sanitized.isEmpty else { return sanitized }
-        if sanitized.utf8.allSatisfy({ $0 < 0x80 }) {
+        if sanitized.utf8.allSatisfy({ $0 < 0x80 }), !sanitized.contains("=?") {
             return isPlainAtomsPhrase(sanitized) ? sanitized : quotedString(sanitized)
         }
         return encodedWords(for: sanitized).joined(separator: "\r\n ")

@@ -70,3 +70,45 @@ struct HeaderFoldingTests {
         #expect(Self.longestHeaderLine(signed) <= 78)
     }
 }
+
+/// Release review: folding before trailing whitespace made a continuation
+/// line of only whitespace.
+struct HeaderFoldingWhitespaceTests {
+    private static func lines(_ name: String, _ value: String) -> [String] {
+        "\(name): \(HeaderFolding.fold(name: name, value: value))".components(separatedBy: "\r\n")
+    }
+
+    @Test(arguments: [
+        String(repeating: "L", count: 70) + "a(c)end ",
+        String(repeating: "L", count: 70) + "a(c)end    ",
+        String(repeating: "word ", count: 40),
+        String(repeating: "x", count: 77) + " \t ",
+        "a" + String(repeating: " ", count: 120),
+    ])
+    func noContinuationLineIsOnlyWhitespace(value: String) {
+        let folded = Self.lines("Subject", value)
+        #expect(!folded.dropFirst().contains { $0.allSatisfy { $0 == " " || $0 == "\t" } }, "\(folded)")
+        #expect(folded.joined() == "Subject: \(value)")
+    }
+
+    @Test func theReviewersSubjectComposesWithoutAWhitespaceLine() throws {
+        var message = EmailMessage(from: EmailAddress(address: "sender@example.test"))
+        message.to = [EmailAddress(address: "rcpt@example.test")]
+        message.subject = String(repeating: "L", count: 70) + "a(c)end "
+        message.textBody = "hi"
+        let header = String(decoding: try MIMEComposer(message).compose().serialized(), as: UTF8.self).components(separatedBy: "\r\n\r\n")[0]
+        #expect(!header.components(separatedBy: "\r\n").contains { !$0.isEmpty && $0.allSatisfy { $0 == " " || $0 == "\t" } })
+    }
+}
+
+/// Release review nit: ASCII text containing "=?" is encoded, so a
+/// lookalike encoded word isn't decoded by the receiver.
+struct LookalikeEncodedWordTests {
+    @Test func subjectsAndDisplayNamesWithEqualsQuestionAreEncoded() {
+        let subject = HeaderEncoder.encodeUnstructured("price =?utf-8?q?FREE?= today")
+        #expect(subject.hasPrefix("=?utf-8?B?"))
+        let phrase = HeaderEncoder.encodePhrase("=?utf-8?q?Admin?=")
+        #expect(phrase.hasPrefix("=?utf-8?B?"))
+        #expect(HeaderEncoder.encodeUnstructured("plain = and ? apart") == "plain = and ? apart")
+    }
+}

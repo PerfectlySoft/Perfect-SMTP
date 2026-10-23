@@ -33,6 +33,23 @@ public enum HeaderFolding {
         // line, and whether it's a WSP (fold before it) or an insertion
         // point (fold after the character, adding a space).
         var lastBreak: (index: Int, inserting: Bool)?
+        // Whether the current physical line has anything but whitespace
+        // yet (the header name counts). A fold is only made after content,
+        // so the line it ends is never whitespace-only either.
+        var lineHasContent = true
+
+        // Release review: only fold where real content follows on the same
+        // line of the value. Folding before trailing whitespace produced a
+        // continuation line of nothing but whitespace (a Subject of
+        // "L"*70 + "a(c)end "), which RFC 5322 §3.2.2 forbids and some
+        // parsers read as the end of the header block.
+        var contentFollows = [Bool](repeating: false, count: bytes.count + 1)
+        var seen = false
+        for index in stride(from: bytes.count - 1, through: 0, by: -1) {
+            let byte = bytes[index]
+            if byte == cr || byte == lf { seen = false } else if byte != space && byte != tab { seen = true }
+            contentFollows[index] = seen
+        }
 
         var i = 0
         while i < bytes.count {
@@ -43,14 +60,17 @@ public enum HeaderFolding {
                 i += 2
                 lineLength = 0
                 lastBreak = nil
+                lineHasContent = false
                 continue
             }
-            if (byte == space || byte == tab), lineLength > 0 {
+            let isWSP = byte == space || byte == tab
+            if isWSP, lineHasContent, contentFollows[i] {
                 lastBreak = (output.count, false)
             }
             output.append(byte)
             lineLength += 1
-            if insertingBreaksAfter.contains(byte) {
+            if !isWSP { lineHasContent = true }
+            if insertingBreaksAfter.contains(byte), contentFollows[i + 1] {
                 lastBreak = (output.count, true)
             }
             if lineLength > recommendedLineLength, let point = lastBreak, point.index < output.count {
@@ -58,6 +78,7 @@ public enum HeaderFolding {
                 output.insert(contentsOf: fold, at: point.index)
                 lineLength = output.count - point.index - 2
                 lastBreak = nil
+                lineHasContent = output[(point.index + 2)...].contains { $0 != space && $0 != tab }
             }
             i += 1
         }
