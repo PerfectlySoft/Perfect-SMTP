@@ -452,7 +452,7 @@ struct DirectMXRetryQueueTests {
         // processed entries. Counting live loops also catches a superseded
         // loop that was never cancelled at all, which would sleep on
         // entry 1's 30 s target without calling anything.
-        let oneLoopLeft = try? await waitUntil(timeoutSeconds: 2) { await queue.liveLoopCountForTesting == 1 }
+        let oneLoopLeft: Void? = try? await waitUntil(timeoutSeconds: 2) { await queue.liveLoopCountForTesting == 1 }
         let liveLoops = await queue.liveLoopCountForTesting
         #expect(oneLoopLeft != nil, "\(liveLoops) loop tasks still running after the restart")
         #expect(await queue.processDueEntriesFromSupersededLoopCountForTesting == 0)

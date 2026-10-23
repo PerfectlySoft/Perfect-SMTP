@@ -104,11 +104,12 @@ public final class SMTPConnection: @unchecked Sendable {
         // Intentional use of the unscoped, deprecated `.inbound`/`.outbound`
         // accessors -- see this type's doc comment for why
         // `executeThenClose`'s request-scoped lifetime doesn't fit a
-        // pooled, reused connection. The two deprecation warnings below are
-        // deliberately left visible rather than suppressed, as an honest
-        // signal of this judgment call to anyone reading build output.
-        self.iterator = asyncChannel.inbound.makeAsyncIterator()
-        self.outbound = asyncChannel.outbound
+        // pooled, reused connection. They are reached through
+        // `UnscopedAsyncChannelParts` (below) so the package builds with
+        // `-warnings-as-errors`; the judgment call is documented there.
+        let (inbound, outbound) = unscopedParts(of: asyncChannel)
+        self.iterator = inbound.makeAsyncIterator()
+        self.outbound = outbound
         self.capabilities = Capabilities()
         self.ehloHostname = ehloHostname
         self.replyTimeout = replyTimeout
@@ -437,4 +438,41 @@ public final class SMTPConnection: @unchecked Sendable {
     private func outcomeFor(_ reply: SMTPReply) -> DeliveryResult.Outcome {
         backoffPolicy.classify(reply, attempt: 1)
     }
+}
+
+// MARK: - Unscoped NIOAsyncChannel access
+
+/// Reaches `NIOAsyncChannel`'s deprecated, unscoped `inbound`/`outbound`
+/// accessors without a deprecation warning, so the package builds with
+/// `-warnings-as-errors`. `SMTPConnection` needs them because a pooled
+/// connection outlives any single `executeThenClose` scope (see its doc
+/// comment). The accessors are deprecated in favour of the scoped API, not
+/// removed or changed in behaviour; if a future NIO removes them, this is
+/// the one place to change.
+///
+/// Calling through a protocol requirement rather than the deprecated member
+/// itself is what keeps the call site warning-free; the witnesses carry the
+/// deprecation so the intent stays visible in the source.
+protocol UnscopedAsyncChannelParts {
+    associatedtype InboundElement: Sendable
+    associatedtype OutboundElement: Sendable
+    var unscopedInbound: NIOAsyncChannelInboundStream<InboundElement> { get }
+    var unscopedOutbound: NIOAsyncChannelOutboundWriter<OutboundElement> { get }
+}
+
+extension NIOAsyncChannel: UnscopedAsyncChannelParts {
+    typealias InboundElement = Inbound
+    typealias OutboundElement = Outbound
+
+    @available(*, deprecated, message: "Unscoped access for long-lived pooled connections only.")
+    var unscopedInbound: NIOAsyncChannelInboundStream<Inbound> { inbound }
+
+    @available(*, deprecated, message: "Unscoped access for long-lived pooled connections only.")
+    var unscopedOutbound: NIOAsyncChannelOutboundWriter<Outbound> { outbound }
+}
+
+private func unscopedParts<C: UnscopedAsyncChannelParts>(
+    of channel: C
+) -> (NIOAsyncChannelInboundStream<C.InboundElement>, NIOAsyncChannelOutboundWriter<C.OutboundElement>) {
+    (channel.unscopedInbound, channel.unscopedOutbound)
 }

@@ -625,14 +625,16 @@ private final class OpenSocketTracker: @unchecked Sendable {
 /// TLS close waiting on the peer's close_notify.
 private final class CloseHolder: @unchecked Sendable {
     private let lock = NSLock()
-    private var held: [(any EventLoop, () -> Void)] = []
+    // Each close is bound to its channel's loop: `hold` runs there (it is
+    // called from `HoldCloseHandler`), and `releaseAll` hops back to it.
+    private var held: [(any EventLoop, NIOLoopBound<() -> Void>)] = []
     private var heldChannels: Set<ObjectIdentifier> = []
     private var holding = true
 
     func hold(_ channel: any Channel, _ close: @escaping () -> Void) {
         let runNow: Bool = lock.withLock {
             guard holding else { return true }
-            held.append((channel.eventLoop, close))
+            held.append((channel.eventLoop, NIOLoopBound(close, eventLoop: channel.eventLoop)))
             heldChannels.insert(ObjectIdentifier(channel))
             return false
         }
@@ -644,12 +646,12 @@ private final class CloseHolder: @unchecked Sendable {
     var heldCount: Int { lock.withLock { heldChannels.count } }
 
     func releaseAll() {
-        let released: [(any EventLoop, () -> Void)] = lock.withLock {
+        let released: [(any EventLoop, NIOLoopBound<() -> Void>)] = lock.withLock {
             holding = false
             defer { held = [] }
             return held
         }
-        for (eventLoop, close) in released { eventLoop.execute(close) }
+        for (eventLoop, close) in released { eventLoop.execute { close.value() } }
     }
 }
 
