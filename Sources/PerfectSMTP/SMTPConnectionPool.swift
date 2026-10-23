@@ -172,7 +172,7 @@ public final class SMTPConnectionPool: Sendable {
     /// released (see `lockedEffects` and `run`).
     private struct Effects {
         var resumes: [(CheckedContinuation<CheckoutOutcome, any Error>, Result<CheckoutOutcome, any Error>)] = []
-        var closes: [(connection: SMTPConnection, isEviction: Bool)] = []
+        var closes: [(connection: SMTPConnection, isEviction: Bool, polite: Bool)] = []
     }
 
     private struct State {
@@ -195,14 +195,16 @@ public final class SMTPConnectionPool: Sendable {
         var evicting = 0
         /// Closes decided under the current lock acquisition, not yet
         /// issued; `lockedEffects` hands them to `run(_:)`.
-        var queuedCloses: [(connection: SMTPConnection, isEviction: Bool)] = []
+        var queuedCloses: [(connection: SMTPConnection, isEviction: Bool, polite: Bool)] = []
 
         /// The only way the pool closes a connection: it keeps counting
         /// toward `maxTotal` from this moment until `closeFinished()`.
-        mutating func beginClosing(_ connection: SMTPConnection, isEviction: Bool = false) {
+        /// `polite`: the connection is idle and in command mode, so it gets
+        /// a best-effort `QUIT` before the close.
+        mutating func beginClosing(_ connection: SMTPConnection, isEviction: Bool = false, polite: Bool = false) {
             closing += 1
             if isEviction { evicting += 1 }
-            queuedCloses.append((connection, isEviction))
+            queuedCloses.append((connection, isEviction, polite))
         }
         /// Every open connection the pool is responsible for: checked out,
         /// being dialed (a reserved slot), idle, or still closing.
@@ -336,7 +338,7 @@ public final class SMTPConnectionPool: Sendable {
         let effects = lockedEffects { state, effects in
             state.isShutDown = true
             for (_, entries) in state.idle {
-                for entry in entries { state.beginClosing(entry.connection) }
+                for entry in entries { state.beginClosing(entry.connection, polite: true) }
             }
             state.idle.removeAll()
             for (_, list) in state.waiters {
@@ -369,9 +371,13 @@ public final class SMTPConnectionPool: Sendable {
     /// lock. When each close completes, its slot is freed and parked
     /// waiters are admitted.
     private func run(_ effects: Effects) {
-        for (connection, isEviction) in effects.closes {
-            connection.channel.close(promise: nil)
+        for (connection, isEviction, polite) in effects.closes {
             connection.channel.closeFuture.whenComplete { _ in self.closeFinished(wasEviction: isEviction) }
+            if polite {
+                Task { await connection.quitAndClose() }
+            } else {
+                connection.channel.close(promise: nil)
+            }
         }
         for (continuation, result) in effects.resumes { continuation.resume(with: result) }
     }
@@ -507,7 +513,7 @@ public final class SMTPConnectionPool: Sendable {
             }
         }
         guard let key = oldest?.key, var list = state.idle[key] else { return false }
-        state.beginClosing(list.removeFirst().connection, isEviction: true)
+        state.beginClosing(list.removeFirst().connection, isEviction: true, polite: true)
         state.idle[key] = list.isEmpty ? nil : list
         return true
     }
@@ -520,7 +526,7 @@ public final class SMTPConnectionPool: Sendable {
             let ageNanoseconds = DispatchTime.now().uptimeNanoseconds &- entry.returnedAt.uptimeNanoseconds
             let ageSeconds = TimeInterval(ageNanoseconds) / 1_000_000_000
             if ageSeconds > configuration.idleTimeout || !entry.connection.channel.isActive {
-                state.beginClosing(entry.connection)
+                state.beginClosing(entry.connection, polite: entry.connection.channel.isActive)
                 continue
             }
             result = entry.connection
@@ -571,7 +577,7 @@ public final class SMTPConnectionPool: Sendable {
             // socket) for the lifetime of the process. Close it immediately
             // instead.
             guard !state.isShutDown else {
-                state.beginClosing(connection)
+                state.beginClosing(connection, polite: healthy)
                 return
             }
             if healthy, connection.channel.isActive {

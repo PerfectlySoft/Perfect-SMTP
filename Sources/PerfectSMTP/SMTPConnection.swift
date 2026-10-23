@@ -145,6 +145,18 @@ public final class SMTPConnection: @unchecked Sendable {
         }
     }
 
+    /// Best effort: sends `QUIT` (bounded by `timeout`, without waiting for
+    /// the `221`), then closes the channel. Used when the pool retires an
+    /// idle connection, and by `RelayTransport.shutdown()` through it, so
+    /// the server sees an orderly end of session rather than a dropped
+    /// socket (RFC 5321 §4.1.1.10).
+    func quitAndClose(timeout: TimeInterval = 2) async {
+        if channel.isActive {
+            _ = try? await raceAgainstTimeout(timeout) { try await self.outbound.write(.line("QUIT")) }
+        }
+        channel.close(promise: nil)
+    }
+
     /// Closes the channel and waits until it has closed. Used by dialers
     /// that fail after the socket was opened, so the pool only frees the
     /// dial's slot once the socket is really gone.
