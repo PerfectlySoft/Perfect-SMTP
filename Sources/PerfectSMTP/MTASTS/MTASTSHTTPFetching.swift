@@ -74,6 +74,10 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
     /// The whole fetch (connect, TLS, headers and body) did not finish
     /// within the fetcher's `timeout`.
     case timedOut
+    /// The response declared, or delivered, more than the fetcher's
+    /// `maximumBodySize` bytes of body. The fetch stops reading at that
+    /// point instead of buffering the rest.
+    case responseTooLarge(limit: Int)
 }
 
 /// The production `MTASTSHTTPFetching` implementation: a plain `URLSession`
@@ -124,6 +128,7 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
 public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     private let session: URLSession
     private let timeout: TimeInterval
+    private let maximumBodySize: Int
 
     /// - Parameter session: On Darwin, the session every fetch runs on. On
     ///   platforms that use `FoundationNetworking` (Linux), only its
@@ -137,9 +142,20 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     ///   timeout only bounds the gap between bytes, and its resource
     ///   timeout defaults to seven days, so without this a policy host
     ///   trickling bytes could hold up every direct-MX send to its domain.
-    public init(session: URLSession = .shared, timeout: TimeInterval = 60) {
+    /// - Parameter maximumBodySize: The most body bytes read before the
+    ///   fetch is abandoned with `MTASTSHTTPFetchError.responseTooLarge`
+    ///   (default 64 KiB, the same cap `MTASTSPolicyManager` applies). It
+    ///   is enforced while streaming, and a larger `Content-Length` is
+    ///   rejected before any body is read, so an endless body costs at most
+    ///   this much memory.
+    public init(
+        session: URLSession = .shared,
+        timeout: TimeInterval = 60,
+        maximumBodySize: Int = MTASTSPolicyManager.maximumPolicyResponseSizeBytes
+    ) {
         self.session = session
         self.timeout = timeout
+        self.maximumBodySize = max(0, maximumBodySize)
     }
 
     public func fetch(url: URL) async throws -> MTASTSHTTPResponse {
@@ -148,11 +164,12 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = max(0, timeout)
         let session = self.session
+        let limit = maximumBodySize
         let (data, response) = try await Self.withDeadline(timeout) { [request] in
             #if canImport(FoundationNetworking)
-            try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration)
+            try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration, limit: limit)
             #else
-            try await session.data(for: request, delegate: RedirectRefusingTaskDelegate())
+            try await Self.cappedFetch(request, session: session, limit: limit)
             #endif
         }
         guard let http = response as? HTTPURLResponse else {
@@ -164,6 +181,27 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
             body: Array(data)
         )
     }
+
+    #if !canImport(FoundationNetworking)
+    /// Streams the body through `bytes(for:delegate:)`, counting as it
+    /// goes, so at most `limit + 1` bytes are ever held.
+    private static func cappedFetch(_ request: URLRequest, session: URLSession, limit: Int) async throws -> (Data, URLResponse) {
+        let (bytes, response) = try await session.bytes(for: request, delegate: RedirectRefusingTaskDelegate())
+        if response.expectedContentLength > Int64(limit) {
+            bytes.task.cancel()
+            throw MTASTSHTTPFetchError.responseTooLarge(limit: limit)
+        }
+        var body = Data()
+        for try await byte in bytes {
+            guard body.count < limit else {
+                bytes.task.cancel()
+                throw MTASTSHTTPFetchError.responseTooLarge(limit: limit)
+            }
+            body.append(byte)
+        }
+        return (body, response)
+    }
+    #endif
 
     /// Runs `operation`, cancelling it and throwing `.timedOut` if it is
     /// still running after `seconds`.
@@ -214,9 +252,15 @@ private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDeleg
     private var continuation: CheckedContinuation<(Data, URLResponse), any Error>?
     private var task: URLSessionDataTask?
     private var cancelled = false
+    private var tooLarge = false
+    private let limit: Int
 
-    static func fetch(_ request: URLRequest, configuration: URLSessionConfiguration) async throws -> (Data, URLResponse) {
-        let delegate = RedirectRefusingFetchDelegate()
+    private init(limit: Int) {
+        self.limit = limit
+    }
+
+    static func fetch(_ request: URLRequest, configuration: URLSessionConfiguration, limit: Int) async throws -> (Data, URLResponse) {
+        let delegate = RedirectRefusingFetchDelegate(limit: limit)
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         return try await withTaskCancellationHandler {
@@ -268,8 +312,35 @@ private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDeleg
         completionHandler(nil)
     }
 
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        // Reject a declared oversized body before reading any of it.
+        guard response.expectedContentLength <= Int64(limit) else {
+            lock.lock()
+            tooLarge = true
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
+        guard !tooLarge else {
+            lock.unlock()
+            return
+        }
+        if body.count + data.count > limit {
+            // Stop reading: drop what was buffered and cancel the task.
+            tooLarge = true
+            body = Data()
+            lock.unlock()
+            dataTask.cancel()
+            return
+        }
         body.append(data)
         lock.unlock()
     }
@@ -280,9 +351,12 @@ private final class RedirectRefusingFetchDelegate: NSObject, URLSessionDataDeleg
         self.continuation = nil
         self.task = nil
         let data = body
+        let overLimit = tooLarge
         lock.unlock()
         guard let continuation else { return }
-        if let error {
+        if overLimit {
+            continuation.resume(throwing: MTASTSHTTPFetchError.responseTooLarge(limit: limit))
+        } else if let error {
             continuation.resume(throwing: error)
         } else if let response = task.response {
             continuation.resume(returning: (data, response))

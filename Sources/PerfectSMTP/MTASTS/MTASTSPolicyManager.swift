@@ -230,13 +230,11 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// codebase for the same reason: a real MTA-STS policy file (a handful
     /// of `key: value` lines, at most a few dozen `mx:` patterns) is never
     /// remotely close to this size, so the cap is pure DoS hardening with
-    /// no legitimate-policy cost. Enforced post-fetch (see
-    /// `fetchAndParsePolicy(domain:)`) -- `URLSession.data(for:)` gives no
-    /// clean hook to abort mid-stream at a byte cap, so this doesn't stop
-    /// the oversized bytes from being received, but it does guarantee an
-    /// oversized response is never parsed, cached, or acted upon, which is
-    /// the protection that actually matters here.
-    static let maximumPolicyResponseSizeBytes = 64 * 1024
+    /// no legitimate-policy cost. `URLSessionMTASTSFetcher` enforces it
+    /// while streaming (and rejects a larger `Content-Length` up front), so
+    /// an endless body is never buffered; `fetchAndParsePolicy(domain:)`
+    /// checks it again for any other `MTASTSHTTPFetching` implementation.
+    public static let maximumPolicyResponseSizeBytes = 64 * 1024
 
     private var cache: [String: CachedPolicy] = [:]
     private let dnsResolver: any TXTResolving
@@ -543,6 +541,8 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         let response: MTASTSHTTPResponse
         do {
             response = try await httpFetcher.fetch(url: url)
+        } catch MTASTSHTTPFetchError.responseTooLarge {
+            throw MTASTSDiscoveryError.responseTooLarge
         } catch {
             throw MTASTSDiscoveryError.fetchFailed
         }
