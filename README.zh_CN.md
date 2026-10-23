@@ -46,7 +46,7 @@ libcurl 或其他邮件库的封装——它自己实现了 SMTP 线路协议，
 - **SASL 认证**——`PLAIN`、`LOGIN`、`XOAUTH2`（Gmail/Workspace 必需，
   Microsoft 365 也在逐步要求使用）。
 - **送达率相关头字段**——`List-Unsubscribe`/`List-Unsubscribe-Post`
-  （RFC 8058）、`Precedence`、`Auto-Submitted`——自 2025 年 11 月起
+  （RFC 8058）、`Precedence`、`Auto-Submitted`——自 2024 年 2 月起
   Gmail 和 Yahoo 已对批量发件人强制要求这些头字段。
 - **面向批量/列表服务器场景**——有并发上限的批量 `send`，以及基于
   `AsyncSequence` 的流式 `send`，可以在不将全部收件人一次性载入内存的情况下

@@ -51,7 +51,7 @@ which uses it to implement its `email_send` tag.
   Gmail/Workspace, increasingly required by Microsoft 365).
 - **Deliverability headers** — `List-Unsubscribe`/`List-Unsubscribe-Post`
   (RFC 8058), `Precedence`, `Auto-Submitted` — the headers Gmail and Yahoo
-  have required for bulk senders since November 2025.
+  have required for bulk senders since February 2024.
 - **Bulk/list-server ready** — a bounded-concurrency batch `send` and an
   `AsyncSequence`-based streaming `send` for sending to millions of
   recipients without materializing them all in memory.
