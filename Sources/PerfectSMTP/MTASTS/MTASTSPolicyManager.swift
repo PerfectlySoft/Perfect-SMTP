@@ -230,8 +230,8 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// codebase for the same reason: a real MTA-STS policy file (a handful
     /// of `key: value` lines, at most a few dozen `mx:` patterns) is never
     /// remotely close to this size, so the cap is pure DoS hardening with
-    /// no legitimate-policy cost. `URLSessionMTASTSFetcher` enforces it
-    /// while streaming (and rejects a larger `Content-Length` up front), so
+    /// no legitimate-policy cost. The default `NIOMTASTSHTTPFetcher`
+    /// enforces it while streaming (and rejects a larger `Content-Length` up front), so
     /// an endless body is never buffered; `fetchAndParsePolicy(domain:)`
     /// checks it again for any other `MTASTSHTTPFetching` implementation.
     public static let maximumPolicyResponseSizeBytes = 64 * 1024
@@ -271,7 +271,7 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     ///   SSRF-class filtering of the MTA-STS HTTPS fetch target.
     public init(
         dnsResolver: any TXTResolving,
-        httpFetcher: any MTASTSHTTPFetching = URLSessionMTASTSFetcher(),
+        httpFetcher: any MTASTSHTTPFetching = NIOMTASTSHTTPFetcher(),
         addressResolver: (any MTASTSAddressResolving)? = nil,
         configuration: Configuration = .init()
     ) {

@@ -125,6 +125,13 @@ public enum MTASTSHTTPFetchError: Error, Sendable, Equatable {
 /// `RedirectRefusingFetchDelegate` as the *session* delegate driving a
 /// delegate-based data task; only the injected session's configuration is
 /// used there, not the session itself.
+///
+/// **Not the default.** `MTASTSPolicyManager` uses `NIOMTASTSHTTPFetcher`.
+/// This fetcher is kept for callers who want `URLSession`'s configuration
+/// (proxies, for example). Its size cap holds on Darwin, but on Linux
+/// corelibs Foundation keeps reading and queueing data after the task is
+/// cancelled, so an endless body can still exhaust memory there (5.9 GB
+/// RSS in the release review's linux/amd64 test).
 public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
     private let session: URLSession
     private let timeout: TimeInterval

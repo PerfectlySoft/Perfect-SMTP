@@ -372,11 +372,16 @@ restarts), and `DirectMXTransport` applies it automatically:
   configured a provider at all: plain opportunistic delivery per
   `tlsPolicy`.
 
-The policy fetch is bounded as a whole: `URLSessionMTASTSFetcher` (the
-default `httpFetcher`) gives up after `timeout` seconds (default 60) from
-connect to the last body byte and throws `MTASTSHTTPFetchError.timedOut`,
-so a slow policy host can't hold up delivery to its domain indefinitely.
-Redirects are never followed (RFC 8461 §3.3).
+The policy fetch is bounded as a whole. `NIOMTASTSHTTPFetcher` (the
+default `httpFetcher`, a small HTTP/1.1 client on SwiftNIO with full
+certificate verification) gives up after `timeout` seconds (default 60)
+from connect to the last body byte (`MTASTSHTTPFetchError.timedOut`), and
+stops reading past 64 KiB of body (`.responseTooLarge`). A slow or endless
+policy host therefore can't hold up delivery to its domain or exhaust
+memory. Redirects are never followed (RFC 8461 §3.3).
+`URLSessionMTASTSFetcher` is the alternative if you need `URLSession`'s
+configuration (proxies, for example), but on Linux its size cap can't stop
+corelibs Foundation from buffering an endless body.
 
 MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above: the
 HTTPS policy-file fetch target is address-checked the same way when you

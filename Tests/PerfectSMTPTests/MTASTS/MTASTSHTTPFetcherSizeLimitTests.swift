@@ -14,12 +14,36 @@ import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
+import NIOSSL
 import Testing
 @testable import PerfectSMTP
 
+/// The fetchers under test. On Linux, `URLSessionMTASTSFetcher` can't stop
+/// corelibs Foundation from reading and queueing an endless body after
+/// cancelling (5.9 GB RSS and an OOM kill on linux/amd64), so there only
+/// the NIO fetcher, the default, is held to the cap.
+enum FetcherKind: String, CaseIterable, Sendable {
+    case nio, urlSession
+
+    static var cappedOnThisPlatform: [FetcherKind] {
+        #if canImport(FoundationNetworking)
+        [.nio]
+        #else
+        allCases
+        #endif
+    }
+
+    func make(timeout: TimeInterval = 30) -> any MTASTSHTTPFetching {
+        switch self {
+        case .nio: NIOMTASTSHTTPFetcher(timeout: timeout)
+        case .urlSession: URLSessionMTASTSFetcher(timeout: timeout)
+        }
+    }
+}
+
 struct MTASTSHTTPFetcherSizeLimitTests {
-    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
-    func anEndlessBodyIsCutOffAtTheCapWithoutBufferingIt(declareHugeLength: Bool) async throws {
+    @Test(.timeLimit(.minutes(1)), arguments: FetcherKind.cappedOnThisPlatform, [false, true])
+    func anEndlessBodyIsCutOffAtTheCapWithoutBufferingIt(kind: FetcherKind, declareHugeLength: Bool) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let sent = NIOLockedValueBox(0)
         let closed = NIOLockedValueBox(false)
@@ -34,7 +58,7 @@ struct MTASTSHTTPFetcherSizeLimitTests {
             .bind(host: "127.0.0.1", port: 0).get()
         let port = try #require(channel.localAddress?.port)
 
-        let fetcher = URLSessionMTASTSFetcher(timeout: 30)
+        let fetcher = kind.make()
         let url = try #require(URL(string: "http://127.0.0.1:\(port)/.well-known/mta-sts.txt"))
         let started = Date()
         await #expect(throws: MTASTSHTTPFetchError.responseTooLarge(limit: MTASTSPolicyManager.maximumPolicyResponseSizeBytes)) {
@@ -53,14 +77,7 @@ struct MTASTSHTTPFetcherSizeLimitTests {
         try await channel.close()
         try await group.shutdownGracefully()
         #expect(closed.withLockedValue { $0 }, "the client never closed the connection; the server streamed \(total) bytes")
-        #if !canImport(FoundationNetworking)
         #expect(total < 256 * 1024 * 1024, "the server streamed \(total) bytes before the client stopped reading")
-        #endif
-        // On Linux, corelibs Foundation can keep draining the socket for a
-        // moment after the task is cancelled (once 2.4 GB over loopback in
-        // a loaded full-suite run). The bytes are dropped, not buffered: a
-        // standalone probe under CPU load kept max RSS at about 60 MB over
-        // ten endless-body fetches. So only the hang-up is asserted there.
     }
 
     @Test func aPolicyManagerTreatsAnOversizedFetchAsNoPolicy() async throws {
@@ -124,4 +141,83 @@ private final class EndlessBodyHTTPHandler: ChannelInboundHandler, @unchecked Se
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
         context.close(promise: nil)
     }
+}
+
+/// The NIO fetcher end to end: a real policy over HTTPS (local test CA),
+/// a chunked body, and an untrusted certificate.
+struct NIOMTASTSHTTPFetcherTests {
+    private static let policy = "version: STSv1\r\nmode: enforce\r\nmx: mx.victim.test\r\nmax_age: 86400\r\n"
+
+    private func serve(tls: Bool, chunked: Bool, group: any EventLoopGroup) async throws -> (Channel, Int) {
+        let context: NIOSSLContext? = tls ? try NIOSSLContext(configuration: .makeServerConfiguration(
+            certificateChain: [.certificate(try NIOSSLCertificate(bytes: Array(TestCertificates.namedCertificatePEM.utf8), format: .pem))],
+            privateKey: .privateKey(try NIOSSLPrivateKey(bytes: Array(TestCertificates.namedKeyPEM.utf8), format: .pem))
+        )) : nil
+        let body = Self.policy
+        let bytes = Array(body.utf8)
+        let first = String(decoding: bytes[..<(bytes.count / 2)], as: UTF8.self)
+        let second = String(decoding: bytes[(bytes.count / 2)...], as: UTF8.self)
+        let response = chunked
+            ? "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + "\(String(first.utf8.count, radix: 16))\r\n\(first)\r\n"
+                + "\(String(second.utf8.count, radix: 16))\r\n\(second)\r\n0\r\n\r\n"
+            : "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        let channel = try await ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    if let context { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: context)) }
+                    try channel.pipeline.syncOperations.addHandler(FixedHTTPResponder(response: response))
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        return (channel, try #require(channel.localAddress?.port))
+    }
+
+    private func trustingTestCA() throws -> TLSConfiguration {
+        var configuration = TLSConfiguration.makeClientConfiguration()
+        configuration.trustRoots = .certificates([try NIOSSLCertificate(bytes: Array(TestCertificates.caPEM.utf8), format: .pem)])
+        return configuration
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: [(false, false), (false, true), (true, false), (true, true)])
+    func aPolicyIsFetched(tls: Bool, chunked: Bool) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let (channel, port) = try await serve(tls: tls, chunked: chunked, group: group)
+        let fetcher = NIOMTASTSHTTPFetcher(group: group, timeout: 10, tlsConfiguration: try trustingTestCA())
+        let url = try #require(URL(string: "\(tls ? "https" : "http")://127.0.0.1:\(port)/.well-known/mta-sts.txt"))
+        let response = try await fetcher.fetch(url: url)
+        try await channel.close()
+        try await group.shutdownGracefully()
+        #expect(response.statusCode == 200)
+        #expect(response.contentType?.hasPrefix("text/plain") == true)
+        #expect(String(decoding: response.body, as: UTF8.self) == Self.policy)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func anUntrustedCertificateFailsTheFetch() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let (channel, port) = try await serve(tls: true, chunked: false, group: group)
+        let fetcher = NIOMTASTSHTTPFetcher(group: group, timeout: 10) // system trust store
+        let url = try #require(URL(string: "https://127.0.0.1:\(port)/.well-known/mta-sts.txt"))
+        await #expect(throws: (any Error).self) { _ = try await fetcher.fetch(url: url) }
+        try await channel.close()
+        try await group.shutdownGracefully()
+    }
+}
+
+private final class FixedHTTPResponder: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+    private let response: String
+    private var answered = false
+    init(response: String) { self.response = response }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !answered else { return }
+        answered = true
+        let channel = context.channel
+        context.writeAndFlush(Self.wrapOutboundOut(ByteBuffer(string: response))).whenComplete { _ in channel.close(promise: nil) }
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: any Error) { context.close(promise: nil) }
 }

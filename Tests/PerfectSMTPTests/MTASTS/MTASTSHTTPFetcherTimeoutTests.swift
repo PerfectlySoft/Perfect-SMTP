@@ -16,8 +16,8 @@ import Testing
 @testable import PerfectSMTP
 
 struct MTASTSHTTPFetcherTimeoutTests {
-    @Test(.timeLimit(.minutes(1)))
-    func aTricklingPolicyHostIsCutOffAtTheFetchersDeadline() async throws {
+    @Test(.timeLimit(.minutes(1)), arguments: FetcherKind.allCases)
+    func aTricklingPolicyHostIsCutOffAtTheFetchersDeadline(kind: FetcherKind) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let channel = try await ServerBootstrap(group: group)
             .childChannelInitializer { channel in
@@ -28,7 +28,7 @@ struct MTASTSHTTPFetcherTimeoutTests {
             .bind(host: "127.0.0.1", port: 0).get()
         let port = try #require(channel.localAddress?.port)
 
-        let fetcher = URLSessionMTASTSFetcher(timeout: 1)
+        let fetcher = kind.make(timeout: 1)
         let url = try #require(URL(string: "http://127.0.0.1:\(port)/.well-known/mta-sts.txt"))
         let started = Date()
         await #expect(throws: MTASTSHTTPFetchError.timedOut) {

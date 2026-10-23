@@ -25,12 +25,13 @@ import Testing
 @testable import PerfectSMTP
 
 struct MTASTSHTTPFetcherRedirectTests {
-    @Test func aRedirectResponseIsTreatedAsAFetchFailureNotSilentlyFollowed() async throws {
+    @Test(arguments: FetcherKind.allCases)
+    func aRedirectResponseIsTreatedAsAFetchFailureNotSilentlyFollowed(kind: FetcherKind) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let requestCount = RequestCounter()
         let server = try await RedirectingFakeHTTPServer.start(group: group, onRequest: { await requestCount.increment() })
 
-        let fetcher = URLSessionMTASTSFetcher()
+        let fetcher = kind.make()
         let url = URL(string: "http://127.0.0.1:\(server.port)/.well-known/mta-sts.txt")!
 
         let response = try await fetcher.fetch(url: url)
