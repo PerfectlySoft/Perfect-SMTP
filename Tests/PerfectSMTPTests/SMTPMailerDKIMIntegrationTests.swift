@@ -119,9 +119,11 @@ struct SMTPMailerDKIMIntegrationTests {
         // ...and the DKIM-Signature's own `h=` tag must list its name,
         // proving it's actually covered by the signature, not just
         // present alongside it.
-        let dkimLine = try #require(headerBlock.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
-        let hTag = try #require(dkimLine.components(separatedBy: "; ").first { $0.hasPrefix("h=") })
-        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.lowercased() }
+        // Unfold first: the DKIM-Signature header is folded.
+        let unfolded = headerBlock.replacingOccurrences(of: "\r\n ", with: " ").replacingOccurrences(of: "\r\n\t", with: " ")
+        let dkimLine = try #require(unfolded.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
+        let hTag = try #require(dkimLine.components(separatedBy: ";").map { $0.trimmingCharacters(in: .whitespaces) }.first { $0.hasPrefix("h=") })
+        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
         #expect(signedNames.contains("x-campaign-id"))
     }
 

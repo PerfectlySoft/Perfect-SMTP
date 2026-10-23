@@ -41,7 +41,7 @@ public enum HeaderEncoder {
     /// characters. Payload capped at 45 bytes so the base64 expansion
     /// (ceil(45/3)*4 = 60 chars) plus overhead stays comfortably at or
     /// under `maxEncodedWordLength`.
-    private static let maxPayloadBytesPerWord = 45
+    private static let maxPayloadBytesPerWord = 39 // 52 base64 chars + 12 = 64, so "Subject: " plus a word stays under 78
 
     private static let atextChars: Set<Character> = Set(
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-/=?^_`{|}~"
@@ -52,7 +52,10 @@ public enum HeaderEncoder {
     /// anything else is emitted as one or more folded encoded-words.
     public static func encodeUnstructured(_ text: String) -> String {
         let sanitized = sanitizeForHeader(text)
-        guard needsEncoding(sanitized) else { return sanitized }
+        // A run without whitespace can't be folded; past 900 octets it
+        // would break the 998-octet line limit, so encode it instead
+        // (encoded words are folded between words).
+        guard needsEncoding(sanitized) || longestUnbreakableRun(sanitized) > 900 else { return sanitized }
         return encodedWords(for: sanitized).joined(separator: "\r\n ")
     }
 
@@ -169,6 +172,14 @@ public enum HeaderEncoder {
     private static func sanitizeForHeader(_ text: String) -> String {
         guard text.unicodeScalars.contains(where: isForbiddenControlScalar) else { return text }
         return String(String.UnicodeScalarView(text.unicodeScalars.filter { !isForbiddenControlScalar($0) }))
+    }
+
+    private static func longestUnbreakableRun(_ text: String) -> Int {
+        var longest = 0, current = 0
+        for byte in text.utf8 {
+            if byte == UInt8(ascii: " ") || byte == UInt8(ascii: "\t") { current = 0 } else { current += 1; longest = max(longest, current) }
+        }
+        return longest
     }
 
     private static func needsEncoding(_ text: String) -> Bool {

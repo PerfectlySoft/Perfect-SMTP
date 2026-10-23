@@ -23,7 +23,8 @@ struct DeliverabilityHeadersTests {
 
         let composed = try MIMEComposer(message).compose()
         let header = try #require(composed.headers.first { $0.name == "List-Unsubscribe" }?.value)
-        #expect(header == "<mailto:unsub@example.com>, <https://example.com/unsub?id=123>")
+        // Folded to stay under 78 octets; compare the unfolded value.
+        #expect(header.replacingOccurrences(of: "\r\n", with: "") == "<mailto:unsub@example.com>, <https://example.com/unsub?id=123>")
     }
 
     @Test func onlyMailtoPresentEmitsJustTheMailtoEntry() throws {

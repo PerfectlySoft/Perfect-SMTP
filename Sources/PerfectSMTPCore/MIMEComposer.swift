@@ -47,6 +47,10 @@ public struct MIMEComposer: Sendable {
         /// The boundary generator returned something that isn't an RFC 2046
         /// boundary: 1–70 `bchars`, not ending in a space.
         case invalidBoundary(String)
+        /// A header value has a run without whitespace long enough that the
+        /// header can't be folded under RFC 5322's 998-octet line limit
+        /// (a caller-supplied Message-ID, reference or extra-header value).
+        case headerLineTooLong(String)
         /// `EmailMessage.listUnsubscribe.postOneClick` was `true` but `url`
         /// was `nil` — RFC 8058 §2's one-click mechanism is specifically
         /// for the HTTPS POST target, so there is no URL for
@@ -311,7 +315,14 @@ public struct MIMEComposer: Sendable {
             body = Self.serializeMultipart(boundary: boundary, parts: parts)
         }
 
-        return RFC5322Message(headers: headers, body: body)
+        // Release review: fold every header to the RFC 5322 §2.1.1 limits
+        // before anything (DKIM included) sees it, and refuse one that
+        // can't be brought under 998 octets per line.
+        let folded = headers.map { (name: $0.name, value: HeaderFolding.fold(name: $0.name, value: $0.value)) }
+        for header in folded where HeaderFolding.longestLine(name: header.name, value: header.value) > HeaderFolding.maximumLineLength {
+            throw ComposerError.headerLineTooLong(header.name)
+        }
+        return RFC5322Message(headers: folded, body: body)
     }
 
     /// Builds `List-Unsubscribe`/`List-Unsubscribe-Post` (RFC 8058, building
@@ -700,7 +711,7 @@ public struct MIMEComposer: Sendable {
         for part in parts {
             out.append(contentsOf: Array("--\(boundary)\r\n".utf8))
             for (name, value) in part.headers {
-                out.append(contentsOf: Array("\(name): \(value)\r\n".utf8))
+                out.append(contentsOf: Array("\(name): \(HeaderFolding.fold(name: name, value: value))\r\n".utf8))
             }
             out.append(contentsOf: Array("\r\n".utf8))
             switch part.body {
