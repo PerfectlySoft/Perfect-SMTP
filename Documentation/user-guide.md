@@ -92,6 +92,12 @@ A few things worth calling out:
   (`jane@dest.com`), stored separately so the header encoder can apply RFC
   2047 encoding to the display name without ever touching the address
   itself.
+  The address has to be a plain mailbox (`local@domain`: a dot-atom local
+  part, and an LDH domain or an `[address literal]`), checked by
+  `AddressSyntax`. Quoted local parts, `<`, `>`, whitespace and control
+  characters are refused, and so are non-ASCII addresses: SMTPUTF8 isn't
+  implemented yet, so convert an internationalized domain to its A-label
+  (`xn--...`) form first.
 - **`bcc:` is a parameter of `send`, not a field on `EmailMessage`.** This
   is a deliberate structural fix (see
   [Migrating](#migrating-from-the-old-perfect-smtp)): Bcc addresses become
@@ -312,20 +318,20 @@ doesn't apply to them.
 **`DirectMXTLSPolicy`** controls what TLS `DirectMXTransport` attempts
 against each resolved host:
 
-- **`.opportunistic`** (the default): try `.startTLS` first — a real,
-  mandatory-verified handshake, same as `.startTLS` always is in this
-  library. If the server's EHLO simply doesn't advertise STARTTLS at all,
-  retry the *same host* in plaintext rather than treating it as
-  unreachable. Important nuance: a **genuine certificate/handshake
-  failure does not fall back to plaintext** — this library's STARTTLS
-  buffer-discipline fencing (the defense against the CVE-2026-41319-class
-  injection attack) deliberately can't distinguish "an attacker injected
-  bytes during the upgrade" from "the certificate is merely
-  misconfigured," so both are treated as the more dangerous case and the
-  connection to that host fails outright. The plaintext fallback only
-  ever fires when the peer doesn't offer STARTTLS at all.
+- **`.opportunistic`** (the default): try `.startTLS` first, with full
+  certificate verification. If that fails, retry the *same host* in
+  plaintext: when the server doesn't advertise STARTTLS, answers it with
+  an error such as `454`, the handshake fails, or the certificate doesn't
+  verify (`SMTPError.tlsCertificateInvalid`). Someone able to break TLS on
+  the path could force plaintext anyway by stripping STARTTLS, so this
+  costs nothing and keeps mail flowing to the many MX hosts with
+  self-signed certificates. There is **no** plaintext retry after detected
+  STARTTLS injection (`.starttlsInjection`) or with the host's circuit
+  breaker open (it might have opened because of injections); delivery
+  moves on to the next MX host instead.
 - **`.fixed(TLSMode)`**: every host gets exactly the `TLSMode` you specify,
-  uniformly, with no opportunistic fallback and (crucially) **no MTA-STS
+  uniformly, with no opportunistic fallback (`.fixed(.startTLS)` is how to
+  require TLS for every host) and (crucially) **no MTA-STS
   involvement at all**, even for a domain that publishes an `enforce`
   policy. This is the explicit escape hatch for full manual control.
 
@@ -352,12 +358,14 @@ policy per domain (in-memory only — nothing here persists across process
 restarts), and `DirectMXTransport` applies it automatically:
 
 - **`mode: enforce`** — only MX hosts matching the policy's `mx:` patterns
-  are ever dialed, mandatory STARTTLS only. If none match, or every
-  matching host fails, the whole domain hard-fails immediately (a
-  `550 5.7.1` permanent failure) — it never silently falls back to a
-  non-matching host or to plaintext.
-- **`mode: testing`** — the same policy-matched, mandatory-TLS attempt runs
-  first, but a failure never blocks delivery: it falls through to the
+  are ever dialed, mandatory STARTTLS only, and the certificate must carry
+  a DNS subjectAltName for the MX host (an IP-address SAN alone isn't
+  accepted). If none match, or every matching host fails, nothing is
+  delivered now: the recipients get a temporary `451 4.7.5` and are queued
+  for retry (RFC 8461 §5), never a fallback to a non-matching host or to
+  plaintext.
+- **`mode: testing`** — the same policy-matched, mandatory-TLS,
+  DNS-name-checked attempt runs first, but a failure never blocks delivery: it falls through to the
   ordinary opportunistic path across all resolved hosts (RFC 8461 §5 —
   testing mode must never block delivery).
 - **No policy for the domain, or `mode: none`** — identical to not having
@@ -496,12 +504,14 @@ Every `DeliveryResult.Outcome` case, in plain language:
   never auto-retried (retrying here risks double delivery); surfaced so
   you can decide what's appropriate for your application (log it,
   alert on it, leave it for manual review).
-- **`.failed(any Error & Sendable)`** — a transport-level or pre-flight
-  failure with no `SMTPReply` at all: a connection/timeout error, a
-  DKIM/compose failure, a circuit-breaker rejection, or (for the batch
-  `send` overloads specifically) one message's own thrown failure, mapped
-  to this case per its would-be recipients so it doesn't take down the
-  rest of the batch.
+- **`.failed(any Error & Sendable)`** — a failure with no `SMTPReply` that
+  retrying won't fix: a DKIM/compose failure, an invalid address, a host
+  name that doesn't exist, addresses filtered as private, or (for the
+  batch `send` overloads specifically) one message's own thrown failure,
+  mapped to this case per its would-be recipients so it doesn't take down
+  the rest of the batch. `RelayTransport` and `LocalMTATransport` also
+  report connection errors this way; `DirectMXTransport` classifies those
+  as temporary (below).
 
 **Automatic retry is a `DirectMXTransport`-only feature.** Every transport
 classifies replies into these outcomes the same way (via the shared
@@ -516,7 +526,19 @@ yourself (re-call `mailer.send` for the `.queuedForRetry` recipients after
 `.queuedForRetry` result from a `send` call is automatically enqueued and
 redelivered in the background on the classified backoff schedule, up to
 that queue's configured expiry/attempt ceiling (at which point the
-recipient's final outcome becomes `.expired`, not silently dropped). If you
+recipient's final outcome becomes `.expired`, not silently dropped).
+
+Following RFC 5321 §4.5.4.1, `DirectMXTransport` treats failing to reach a
+domain as temporary: refused or reset connections, connect and reply
+timeouts, a peer hanging up, an open circuit breaker, TLS failures,
+DNS timeouts or SERVFAIL, and MTA-STS `enforce` violations all become
+`.queuedForRetry` (a synthesized `451 4.4.1` or `451 4.7.5` reply carries
+the cause). A host name that doesn't exist (NXDOMAIN), a null MX, and 5yz
+replies are final.
+
+**The retry queue lives in memory only.** Pending retries are lost when the
+process exits; if you need durability, record `.queuedForRetry` results
+yourself (or deliver through a local MTA with its own spool). If you
 want visibility into a background retry's eventual outcome, pass
 `onTerminalRetryOutcome` to `DirectMXTransport`'s initializer; you can also
 inspect what's still pending via `pendingRetryEntries()`.
@@ -528,7 +550,8 @@ dependencies and zero environment variables — including tests that
 exercise a real STARTTLS handshake, a full `DirectMXTransport` delivery,
 the DNS resolver and the MTA-STS fetcher against in-process fake servers
 bound to `127.0.0.1`. None of it needs the internet or DNS: the 6.0.0
-release checks ran it in Linux containers with no network beyond loopback.
+release checks ran it in Linux containers with no network beyond loopback,
+and CI's `linux-offline` job does the same on every push.
 
 **There is no built-in live-integration test tier against a real SMTP
 server**, despite one being described in the original rewrite plan

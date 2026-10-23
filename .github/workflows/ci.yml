@@ -37,9 +37,27 @@ jobs:
           swift build --build-tests $flags
 
       # Hermetic: every test runs against in-process fakes on 127.0.0.1, with no DNS,
-      # internet or external SMTP server.
+      # internet or external SMTP server (linux-offline below enforces it).
       - name: Test
         run: swift test $FLAGS
+
+  # The suite must not need the network. A job container can't drop its
+  # network, so this runs docker directly: resolve with the network, then
+  # build and test in a container that has none.
+  linux-offline:
+    name: Linux (Swift 6.4, no network)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve dependencies (networked)
+        run: docker run --rm -v "$PWD:/src" -w /src swift:6.4-noble swift package resolve
+
+      - name: Build and test with --network none
+        run: |
+          docker run --rm --network none -e SWIFT_BACKTRACE=enable=no -v "$PWD:/src" -w /src swift:6.4-noble \
+            bash -c "swift build --build-tests -Xswiftc -warnings-as-errors && swift test --skip-build"
 
   macos:
     name: macOS (Xcode ${{ matrix.xcode }}, ${{ matrix.configuration }})

@@ -150,35 +150,69 @@ You get these without configuring anything:
 
 - **TLS certificates are verified.** Every TLS connection (`.startTLS`,
   `.implicit`, and `DirectMXTransport`'s STARTTLS attempts) uses
-  `TLSConfiguration.makeClientConfiguration()`: full chain and hostname
-  verification.
+  `TLSConfiguration.makeClientConfiguration()`: full chain verification
+  plus a name check. The name check follows NIOSSL: the certificate must
+  name the host, or carry an IP-address SAN equal to the address
+  dialed. Only a real IP-literal host is dialed without SNI; any other
+  name that isn't a valid host name fails before connecting. A failed
+  certificate is reported as `SMTPError.tlsCertificateInvalid`.
 - **`.startTLS` never downgrades.** If the server doesn't advertise
-  `STARTTLS`, the connection fails with `SMTPError.starttlsRequired`
-  instead of continuing in plaintext. Bytes injected around the upgrade
-  (the CVE-2026-41319 class) fail the connection with
-  `.starttlsInjection`.
+  `STARTTLS`, or answers it with an error such as `454`, the connection
+  fails instead of continuing in plaintext. Bytes injected around the
+  upgrade (the CVE-2026-41319 class) fail it with `.starttlsInjection`.
 - **No AUTH in cleartext.** A `RelayConfig` with credentials and
   `tls: .none` throws `RelayTransportError.authenticationRequiresTLS`
   before dialing. Set `allowsAuthenticationWithoutTLS: true` only for a
   relay you trust, such as a loopback MTA or a test server.
-- **No header or command injection.** Addresses, the EHLO hostname, extra
-  headers, message IDs, content types and content IDs are rejected if they
-  contain CR, LF or other control characters; subjects and display names
-  have them stripped and are RFC 2047-encoded. The DATA payload is
-  dot-stuffed. Bcc addresses only ever go into `RCPT TO`, never a header.
+- **Strict syntax wherever text reaches the wire.**
+  - Addresses (MAIL FROM, RCPT TO, From/To/Cc/Reply-To/Sender) must be
+    plain `local@domain` mailboxes: a dot-atom local part, and an LDH
+    domain or an `[address literal]`. No quoted local parts, `<`, `>`,
+    whitespace or control characters, so nothing can smuggle an ESMTP
+    parameter or a second mailbox. Non-ASCII addresses are rejected
+    (SMTPUTF8 isn't implemented); pass IDN domains in A-label form.
+  - The EHLO name, TLS server name, DKIM `d=`/`s=` and `messageIDDomain`
+    must be LDH host names.
+  - Extra-header names must be RFC 5322 field names, and the
+    routing-critical names (`Bcc`, `To`, `From`...) are refused.
+  - Header values, message IDs, content types and content IDs are
+    refused if they contain CR, LF, other C0 or C1 controls, or
+    U+2028/U+2029. Subjects and display names have those stripped and
+    are RFC 2047-encoded.
+  - Headers are folded to 78 octets (refused if they can't be kept under
+    998). The DATA payload has its line endings normalized to CRLF and
+    is dot-stuffed. Bcc addresses only ever go into `RCPT TO`.
 - **Every network step has a timeout:** TCP connect (30 s), each SMTP reply
   including the greeting, EHLO, STARTTLS and the TLS handshake (300 s), the
-  final reply after DATA (600 s), each DNS query (5 s), the MTA-STS policy
-  fetch (60 s), and the `sendmail` process (60 s). All are configurable.
+  final reply after DATA (600 s), each DNS query (5 s), the whole MTA-STS
+  policy fetch (60 s, and at most 64 KiB of body, enforced while reading),
+  and the `sendmail` process (60 s). All are configurable.
 - **No secrets in logs.** The library logs only the DKIM alignment warning
   and MTA-STS decisions (domains, hosts, errors), never message bodies or
-  credentials. `RelayConfig.Auth`, `SASLPlain`, `SASLLogin` and
-  `SigningKey` print redacted descriptions.
-- **Direct MX delivery** refuses private, loopback and link-local
-  addresses unless `allowPrivateAddresses` is set, uses opportunistic
-  STARTTLS that falls back to plaintext only when a server doesn't offer
-  STARTTLS (never after a failed handshake), and honors MTA-STS `enforce`
-  policies when you configure a policy provider.
+  credentials. `RelayConfig.Auth`, `SASLPlain`, `SASLLogin`, `XOAuth2` and
+  `SigningKey` print redacted descriptions, and their mirrors (`dump`, the
+  debugger) hide the secret too.
+- **Direct MX delivery:**
+  - It only dials globally reachable unicast addresses. Every IANA
+    special-purpose IPv4 and IPv6 range is refused (loopback, private,
+    `0.0.0.0/8`, link-local, CGNAT, documentation, benchmarking,
+    multicast, reserved), including IPv4 addresses embedded in mapped,
+    NAT64 and 6to4 IPv6 addresses, unless `allowPrivateAddresses` is set.
+  - DNS answers must match the question, and only records for the asked
+    name count. MX exchanges must be LDH host names, and a null MX
+    anywhere in the set means "no mail".
+  - STARTTLS is opportunistic with no MTA-STS policy: a host that doesn't
+    offer it, answers `454`, or fails the handshake or certificate is
+    retried in plaintext. It is never retried in plaintext after detected
+    injection or with its circuit breaker open, nor under
+    `.fixed(.startTLS)` or an MTA-STS `enforce` policy.
+  - Under an MTA-STS policy (`testing` or `enforce`), the certificate must
+    also carry a DNS subjectAltName for the MX host.
+  - Unreachable hosts, timeouts, TLS failures and DNS timeouts or SERVFAIL
+    are temporary and queued for retry (RFC 5321 §4.5.4.1), as is an
+    MTA-STS `enforce` violation. NXDOMAIN, null MX and 5yz replies are
+    final. The retry queue is in memory only: pending retries are lost if
+    the process exits.
 
 ## Migrating from 5.x
 
@@ -219,7 +253,8 @@ The whole suite is hermetic: no environment variables, no internet, no DNS
 and no external mail server. Tests that need sockets (a real STARTTLS
 handshake, a full DirectMX delivery, the DNS resolver, the MTA-STS
 fetcher) run against in-process fake servers on `127.0.0.1`. CI runs it on
-Linux and macOS in debug and release with `-warnings-as-errors`.
+Linux and macOS in debug and release with `-warnings-as-errors`, plus a
+Linux job in a container started with `--network none`.
 
 There is no live-integration tier. To check your own setup against a real
 SMTP server, point a `RelayTransport` at a local

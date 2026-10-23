@@ -1,27 +1,6 @@
 # Perfect - SMTP 简单邮件协议 [English](README.md)
 
 <p align="center">
-    <a href="http://perfect.org/get-involved.html" target="_blank">
-        <img src="http://perfect.org/assets/github/perfect_github_2_0_0.jpg" alt="Get Involed with Perfect!" width="854" />
-    </a>
-</p>
-
-<p align="center">
-    <a href="https://github.com/PerfectlySoft/Perfect" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_1_Star.jpg" alt="Star Perfect On Github" />
-    </a>
-    <a href="https://gitter.im/PerfectlySoft/Perfect" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_2_Git.jpg" alt="Chat on Gitter" />
-    </a>
-    <a href="https://twitter.com/perfectlysoft" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_3_twit.jpg" alt="Follow Perfect on Twitter" />
-    </a>
-    <a href="http://perfect.ly" target="_blank">
-        <img src="http://www.perfect.org/github/Perfect_GH_button_4_slack.jpg" alt="Join the Perfect Slack" />
-    </a>
-</p>
-
-<p align="center">
     <a href="https://www.swift.org/" target="_blank">
         <img src="https://img.shields.io/badge/Swift-6.2%2B-orange.svg?style=flat" alt="Swift 6.2+">
     </a>
@@ -30,9 +9,6 @@
     </a>
     <a href="LICENSE" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
-    </a>
-    <a href="http://twitter.com/PerfectlySoft" target="_blank">
-        <img src="https://img.shields.io/badge/Twitter-@PerfectlySoft-blue.svg?style=flat" alt="PerfectlySoft Twitter">
     </a>
 </p>
 
@@ -144,11 +120,22 @@ await transport.shutdown()
 try await group.shutdownGracefully()
 ```
 
-**安全默认值：** 所有 TLS 连接都会完整校验证书；`.startTLS` 在服务器未提供
-STARTTLS 时直接失败，绝不降级为明文；当 `tls: .none` 且配置了认证信息时，
-`send` 会抛出 `RelayTransportError.authenticationRequiresTLS`，除非显式设置
-`allowsAuthenticationWithoutTLS: true`。详见英文 README 的
-[Security defaults](README.md#security-defaults) 一节。
+`MultiThreadedEventLoopGroup` 来自 SwiftNIO 的 `NIOPosix`，PerfectSMTP 已经依赖
+它；如果你的构建要求每个导入的模块都是显式声明的依赖，请添加
+`.package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0")` 和
+`.product(name: "NIOPosix", package: "swift-nio")`。
+
+**安全默认值：** 所有 TLS 连接都会完整校验证书（失败时报告
+`SMTPError.tlsCertificateInvalid`）；`.startTLS` 在服务器未提供 STARTTLS
+或返回 `454` 等错误时直接失败，绝不降级为明文；当 `tls: .none` 且配置了认证
+信息时，`send` 会抛出 `RelayTransportError.authenticationRequiresTLS`，除非
+显式设置 `allowsAuthenticationWithoutTLS: true`。地址必须是普通的
+`local@domain` 邮箱（不支持带引号的本地部分和非 ASCII 地址，国际化域名请先转换为
+`xn--` 形式），头字段名、值、EHLO 主机名等都会做严格校验，头字段按 78 字节折行。
+直连 MX 投递只连接全局单播地址；无 MTA-STS 策略时 STARTTLS 为机会性的，但在检测到
+注入、断路器打开、`.fixed(.startTLS)` 或 MTA-STS `enforce` 下绝不回退到明文；
+连接失败、超时、TLS 失败和 DNS 超时会进入（仅保存在内存中的）重试队列。详见英文
+README 的 [Security defaults](README.md#security-defaults) 一节。
 
 基础用法就是这些。关于 DKIM 签名、直连 MX 投递、认证方式、批量发送以及
 送达率相关头字段，请参阅**[用户指南](Documentation/user-guide.md)**。
