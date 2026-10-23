@@ -171,7 +171,7 @@ public struct DNSResolver: Sendable {
     ///   sketch line that named a real design choice to make.
     public func resolveMX(domain: String) async throws -> [MXRecord] {
         let message = try await query(name: domain, type: .mx)
-        return try Self.processMXAnswers(message.answers)
+        return try Self.processMXAnswers(Self.answers(in: message, for: domain))
     }
 
     /// Resolves both A and AAAA records for `hostname`, following CNAME
@@ -195,27 +195,35 @@ public struct DNSResolver: Sendable {
     ///   family's failure is silently dropped (documented simplification --
     ///   see `resolveAddresses`'s implementation comment for the trade-off).
     public func resolveAddresses(hostname: String) async throws -> [DNSAddress] {
-        async let aAddresses = try? resolveAddressesOfType(.a, name: hostname)
-        async let aaaaAddresses = try? resolveAddressesOfType(.aaaa, name: hostname)
-        // `try?` here means a hard failure in one family (timeout,
-        // malformed response, a genuine CNAME loop) is indistinguishable
-        // from that family simply having no records -- both collapse to
-        // "contributed nothing" once combined below. This is a deliberate
-        // simplification: distinguishing them cleanly would need a
-        // Sendable error-carrying result type threaded through `async let`
-        // (non-trivial since `any Error` isn't itself `Sendable`), for a
-        // benefit that's marginal here -- the two families are queried
-        // independently and a real, permanent problem with one nameserver
-        // will affect both anyway. The one real cost: if *both* families
-        // fail for the same underlying reason (e.g. the nameserver is
-        // unreachable), the caller sees `.noRecordsFound` rather than
-        // `.timeout`/`.malformedResponse`, which is less precise than it
-        // could be. Flagged in the Phase 3 report as a judgment call worth
-        // revisiting if `DirectMXTransport` needs to distinguish those
-        // cases (e.g. to decide whether to retry at all).
-        let combined = (await aAddresses ?? []) + (await aaaaAddresses ?? [])
-        guard !combined.isEmpty else { throw ResolveError.noRecordsFound }
-        return combined
+        async let aResult = Self.capture { try await self.resolveAddressesOfType(.a, name: hostname) }
+        async let aaaaResult = Self.capture { try await self.resolveAddressesOfType(.aaaa, name: hostname) }
+        let results = [await aResult, await aaaaResult]
+        let combined = results.flatMap { (try? $0.get()) ?? [] }
+        if !combined.isEmpty { return combined }
+        // Release review: neither family produced an address. Report why,
+        // rather than collapsing every failure into `.noRecordsFound`: a
+        // timeout or SERVFAIL is temporary (the caller should retry), while
+        // NODATA/NXDOMAIN in both families is a real "no such host".
+        let failures: [ResolveError] = results.compactMap {
+            if case .failure(let error) = $0 { return error }
+            return nil
+        }
+        if let transient = failures.first(where: \.isTransient) { throw transient }
+        if let other = failures.first(where: { $0 != .noRecordsFound }) { throw other }
+        throw ResolveError.noRecordsFound
+    }
+
+    /// Runs `operation`, mapping any non-`ResolveError` failure (a socket
+    /// error, say) to `.timeout`: from the caller's side both mean the
+    /// nameservers couldn't be reached.
+    private static func capture(_ operation: @Sendable () async throws -> [DNSAddress]) async -> Result<[DNSAddress], ResolveError> {
+        do {
+            return .success(try await operation())
+        } catch let error as ResolveError {
+            return .failure(error)
+        } catch {
+            return .failure(.timeout)
+        }
     }
 
     /// Resolves TXT records for `name`, returning one `String` per resource
@@ -240,7 +248,7 @@ public struct DNSResolver: Sendable {
     public func resolveTXT(name: String) async throws -> [String] {
         let message = try await query(name: name, type: .txt)
         try Self.validateResponseCode(message)
-        let strings: [String] = message.answers.compactMap { record in
+        let strings: [String] = Self.answers(in: message, for: name).compactMap { record in
             guard case .txt(let parts) = record.rdata else { return nil }
             return parts.joined()
         }
@@ -257,15 +265,27 @@ public struct DNSResolver: Sendable {
     /// unit-tested against hand-built `DNSResourceRecord` values without a
     /// live resolver or wire bytes at all.
     static func processMXAnswers(_ answers: [DNSResourceRecord]) throws -> [MXRecord] {
-        let entries: [(preference: UInt16, exchange: String)] = answers.compactMap {
+        var entries: [(preference: UInt16, exchange: String)] = answers.compactMap {
             guard case .mx(let preference, let exchange) = $0.rdata else { return nil }
             return (preference, exchange)
         }
         guard !entries.isEmpty else { throw ResolveError.noRecordsFound }
 
-        if entries.count == 1, entries[0].preference == 0, isRootDomain(entries[0].exchange) {
+        // RFC 7505 §3: a domain that publishes a null MX "MUST NOT
+        // advertise any other MX RR", and §4 has senders treat it as "this
+        // domain accepts no mail". The RFC doesn't spell out a mixed RRset,
+        // so any null MX in the set wins: falling through to the other
+        // records would deliver mail the domain owner said to refuse.
+        if entries.contains(where: { $0.preference == 0 && isRootDomain($0.exchange) }) {
             throw ResolveError.nullMX
         }
+        // Release review: only LDH host names are usable exchanges. A
+        // root exchange at another preference, or a name with a byte that
+        // made it through DNS decoding but isn't a host name, is dropped;
+        // if nothing usable is left the response is malformed rather than
+        // "no MX" (which would trigger the implicit-MX fallback).
+        entries.removeAll { !AddressSyntax.isHostname($0.exchange) }
+        guard !entries.isEmpty else { throw ResolveError.malformedResponse }
 
         let grouped = Dictionary(grouping: entries, by: { $0.preference })
         return grouped.keys.sorted().flatMap { preference in
@@ -308,9 +328,10 @@ public struct DNSResolver: Sendable {
             let message = try await query(name: currentName, type: type)
             try Self.validateResponseCode(message)
 
-            let (addresses, cnameTarget) = Self.extractAddresses(from: message, type: type)
+            let (addresses, cnameTarget) = Self.extractAddresses(from: message, type: type, name: currentName)
             if !addresses.isEmpty { return addresses }
             guard let cnameTarget else { return [] } // NODATA: name exists, no record of this type, no CNAME either
+            guard AddressSyntax.isHostname(cnameTarget) else { throw ResolveError.malformedResponse }
             currentName = cnameTarget
         }
         throw ResolveError.cnameLoop
@@ -321,21 +342,57 @@ public struct DNSResolver: Sendable {
     /// hop) if no terminal address record for `type` was present. Pure --
     /// unit-tested directly against hand-built `DNSMessage` values.
     static func extractAddresses(from message: DNSMessage, type: DNSRecordType) -> (addresses: [DNSAddress], cnameTarget: String?) {
+        extractAddresses(from: message, type: type, name: message.questions.first?.name ?? "")
+    }
+
+    /// Release review: only records owned by `name`, or by the end of a
+    /// CNAME chain starting at `name` within this same answer section, are
+    /// used. A response that also carries `127.0.0.1` for some other owner
+    /// name no longer contributes it.
+    static func extractAddresses(from message: DNSMessage, type: DNSRecordType, name: String) -> (addresses: [DNSAddress], cnameTarget: String?) {
+        let owner = chainEnd(in: message.answers, from: name)
         var addresses: [DNSAddress] = []
-        var cnameTarget: String?
-        for record in message.answers {
+        for record in message.answers where sameName(record.name, owner) {
             switch record.rdata {
-            case .a(let address):
-                if type == .a { addresses.append(address) }
-            case .aaaa(let address):
-                if type == .aaaa { addresses.append(address) }
-            case .cname(let target):
-                cnameTarget = target
-            case .mx, .txt, .other:
-                break
+            case .a(let address) where type == .a: addresses.append(address)
+            case .aaaa(let address) where type == .aaaa: addresses.append(address)
+            default: break
             }
         }
-        return (addresses, addresses.isEmpty ? cnameTarget : nil)
+        if !addresses.isEmpty { return (addresses, nil) }
+        return ([], sameName(owner, name) ? nil : owner)
+    }
+
+    /// The answer records that belong to `name`: owned by it, or by the end
+    /// of the CNAME chain that starts at it.
+    static func answers(in message: DNSMessage, for name: String) -> [DNSResourceRecord] {
+        let owner = chainEnd(in: message.answers, from: name)
+        return message.answers.filter { sameName($0.name, owner) }
+    }
+
+    /// Follows CNAME records in `answers` from `name`, at most
+    /// `maximumCNAMEHops` times, and returns where the chain ends.
+    private static func chainEnd(in answers: [DNSResourceRecord], from name: String) -> String {
+        var current = name
+        var visited: Set<String> = [canonical(name)]
+        for _ in 0..<maximumCNAMEHops {
+            guard let next = answers.lazy.compactMap({ record -> String? in
+                guard sameName(record.name, current), case .cname(let target) = record.rdata else { return nil }
+                return target
+            }).first, visited.insert(canonical(next)).inserted else { break }
+            current = next
+        }
+        return current
+    }
+
+    /// DNS names compare case-insensitively (ASCII only) and ignore a
+    /// trailing root dot.
+    static func sameName(_ a: String, _ b: String) -> Bool {
+        canonical(a) == canonical(b)
+    }
+
+    private static func canonical(_ name: String) -> String {
+        (name.hasSuffix(".") ? String(name.dropLast()) : name).lowercased()
     }
 
     // MARK: - Response-code classification
@@ -430,6 +487,19 @@ public struct DNSResolver: Sendable {
     func query(name: String, type: DNSRecordType) async throws -> DNSMessage {
         guard !nameservers.isEmpty else { throw ResolveError.noNameserversConfigured }
         return try await DNSTransport.query(name: name, type: type, resolver: self)
+    }
+}
+
+extension DNSResolver.ResolveError {
+    /// Whether retrying later could succeed: no answer in time, a SERVFAIL
+    /// or other failure RCODE, an unparseable reply, or no nameserver.
+    /// NODATA/NXDOMAIN, null MX and CNAME loops are answers, not failures
+    /// to get one.
+    public var isTransient: Bool {
+        switch self {
+        case .timeout, .serverFailure, .malformedResponse, .noNameserversConfigured: return true
+        case .nullMX, .noRecordsFound, .cnameLoop: return false
+        }
     }
 }
 

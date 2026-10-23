@@ -126,10 +126,15 @@ final class FakeDNSUDPHandler: ChannelInboundHandler, @unchecked Sendable {
         /// `DNSTransportTests` uses this to confirm the resolver doesn't
         /// accept a stray/mismatched reply as answering the pending query.
         var precededByWrongID = false
+        /// Datagrams sent (with the real query's ID patched in) before the
+        /// real response: malformed or mismatched packets the resolver
+        /// must ignore.
+        var decoys: [[UInt8]] = []
 
-        init(_ bytes: [UInt8], precededByWrongID: Bool = false) {
+        init(_ bytes: [UInt8], precededByWrongID: Bool = false, decoys: [[UInt8]] = []) {
             self.bytes = bytes
             self.precededByWrongID = precededByWrongID
+            self.decoys = decoys
         }
     }
 
@@ -156,6 +161,14 @@ final class FakeDNSUDPHandler: ChannelInboundHandler, @unchecked Sendable {
             // rather than a coin-flip chance of accidentally matching.
             decoy[0] = queryBytes[0] &+ 1
             decoy[1] = queryBytes[1]
+            send(decoy, to: envelope.remoteAddress, context: context)
+        }
+
+        for var decoy in scripted.decoys {
+            if decoy.count >= 2 {
+                decoy[0] = queryBytes[0]
+                decoy[1] = queryBytes[1]
+            }
             send(decoy, to: envelope.remoteAddress, context: context)
         }
 

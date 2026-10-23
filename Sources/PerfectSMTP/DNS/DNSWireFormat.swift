@@ -55,7 +55,11 @@ public enum DNSWireError: Error, Sendable, Equatable {
     /// An MX record's RDATA was too short to contain even a preference
     /// field and a (possibly root) exchange name.
     case invalidMXRecordData
-    /// A query name label was empty or exceeded 63 bytes (RFC 1035 §2.3.4).
+    /// A query name label was empty or exceeded 63 bytes (RFC 1035 §2.3.4),
+    /// or (release review) a decoded label contained a byte that can't be
+    /// part of a host or service name: NUL and other controls, space, `.`,
+    /// DEL or non-ASCII. `mx\0.victim.test` used to decode to a name that
+    /// matched `*.victim.test` but reached TLS and logs with a NUL in it.
     case invalidLabel
     /// FIX #4 (plan §9 Phase 3 milestone security review, decompression
     /// amplification): the total number of compression-pointer jumps
@@ -234,6 +238,8 @@ public struct DNSMessage: Sendable, Equatable {
             bytes.append(0)
             return
         }
+        // RFC 1035 §2.3.4: at most 255 octets on the wire.
+        guard trimmed.utf8.count + 2 <= 255 else { throw DNSWireError.nameTooLong }
         for label in trimmed.split(separator: ".", omittingEmptySubsequences: false) {
             let labelBytes = Array(label.utf8)
             guard (1...63).contains(labelBytes.count) else { throw DNSWireError.invalidLabel }
@@ -425,6 +431,7 @@ public struct DNSMessage: Sendable, Equatable {
     ) throws -> (name: String, nextOffset: Int) {
         var offset = startOffset
         var labels: [String] = []
+        var wireLength = 1 // the terminating root label
         var visitedPointers = Set<Int>()
         var jumps = 0
         var firstJumpNextOffset: Int?
@@ -455,9 +462,16 @@ public struct DNSMessage: Sendable, Equatable {
                 let labelLength = Int(lengthByte)
                 offset += 1
                 guard offset + labelLength <= bytes.count else { throw DNSWireError.truncated }
-                labels.append(String(decoding: bytes[offset..<offset + labelLength], as: UTF8.self))
+                let label = bytes[offset..<offset + labelLength]
+                // Printable ASCII other than space and `.`: covers LDH host
+                // names, `_service` labels and the rest of real-world use.
+                guard label.allSatisfy({ (0x21...0x7E).contains($0) && $0 != 0x2E }) else {
+                    throw DNSWireError.invalidLabel
+                }
+                labels.append(String(decoding: label, as: UTF8.self))
                 offset += labelLength
-                guard labels.count <= maximumLabelsPerName else { throw DNSWireError.nameTooLong }
+                wireLength += 1 + labelLength
+                guard labels.count <= maximumLabelsPerName, wireLength <= 255 else { throw DNSWireError.nameTooLong }
             default: // 0x40 / 0x80 -- reserved/EDNS0 extended label forms, unsupported
                 throw DNSWireError.unsupportedLabelForm
             }
