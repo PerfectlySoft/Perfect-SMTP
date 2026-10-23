@@ -244,6 +244,23 @@ struct BugRegressionTests {
         }
     }
 
+    // `InlineResource.contentID` is embedded raw into the inline part's
+    // `Content-ID` header, the same shape as `inlineResource.contentType`
+    // above. Every CR/LF form must be rejected, with or without a filename.
+    @Test(arguments: ["img1\r\nX-Injected-CID: yes", "img1\nX-Injected-CID: yes", "img1\rX-Injected-CID: yes", "img1\r\n\r\nbody"])
+    func inlineResourceContentIDCRLFInjectionAttemptIsRejected(contentID: String) {
+        for filename in [nil, "logo.png"] {
+            var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+            message.htmlBody = "<p><img src=\"cid:img1\"></p>"
+            message.inlineImages = [
+                InlineResource(contentID: contentID, filename: filename, contentType: "image/png", data: Data([0, 1, 2])),
+            ]
+            #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("inlineResource.contentID")) {
+                _ = try MIMEComposer(message).compose()
+            }
+        }
+    }
+
     // MARK: - Bug #1 class, new vector: bodyContentTypeOverride CRLF injection
     //
     // `bodyContentTypeOverride` (added for the LassoPerfectSMTP

@@ -650,6 +650,10 @@ public struct MIMEComposer: Sendable {
 
     private func inlineLeaf(_ resource: InlineResource) throws -> MIMEPart {
         try Self.requireNoInjection(resource.contentType, field: "inlineResource.contentType")
+        // `contentID` goes into the part's `Content-ID` header verbatim, so
+        // a CR/LF in it would inject headers (or, with a blank line, body
+        // content) into the inline part.
+        try Self.requireNoInjection(resource.contentID, field: "inlineResource.contentID")
         var headers: [(name: String, value: String)] = []
         if let filename = resource.filename {
             let name = sanitizedFilename(filename)
