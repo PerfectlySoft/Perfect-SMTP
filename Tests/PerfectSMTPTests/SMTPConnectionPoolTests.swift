@@ -555,7 +555,11 @@ struct SMTPConnectionPoolTests {
         try await waitForPool(pool) { $0.active == 1 }
         let checkouts = (0..<3).map { _ in Task { try await pool.withConnection(to: key) { _ in () } } }
         try await waitForPool(pool) { $0.waiters == 3 }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        // An evicted idle connection gets a best-effort QUIT before its
+        // close, so the close arrives a moment later: wait for the first
+        // one, then give any (wrong) extra evictions the same time.
+        try await waitUntilHeld(holder, count: 1)
+        try await Task.sleep(nanoseconds: 50_000_000)
 
         #expect(holder.heldCount == 1, "\(holder.heldCount) idle connections evicted; only 1 checkout for host A can be admitted")
         #expect(pool.snapshotForTesting().idle == 2)
