@@ -146,3 +146,31 @@ public struct XOAuth2: SASLMechanism {
 
     public var isComplete: Bool { sentInitial }
 }
+
+// Redacted descriptions, so interpolating a mechanism or a relay
+// configuration into a log line or error message (`"\(config)"`) never
+// prints a password. Without these, Swift's default reflection-based
+// description prints every stored property, password included. Same
+// discipline as `SigningKey`'s redacted description.
+extension SASLPlain: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String { "SASLPlain(username: \(username), password: <redacted>)" }
+    public var debugDescription: String { description }
+}
+
+extension SASLLogin: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String { "SASLLogin(username: \(username), password: <redacted>)" }
+    public var debugDescription: String { description }
+}
+
+extension RelayConfig.Auth: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String {
+        switch self {
+        case .none: return "none"
+        case .plain(let username, _): return "plain(username: \(username), password: <redacted>)"
+        case .login(let username, _): return "login(username: \(username), password: <redacted>)"
+        case .xoauth2(let username, _): return "xoauth2(username: \(username), tokenProvider: <redacted>)"
+        }
+    }
+
+    public var debugDescription: String { description }
+}

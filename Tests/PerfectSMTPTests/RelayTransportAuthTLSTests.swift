@@ -86,3 +86,20 @@ struct RelayTransportAuthTLSTests {
         #expect(try await channel.readOutbound(as: ByteBuffer.self) == nil)
     }
 }
+
+struct CredentialRedactionTests {
+    @Test func relayConfigAndSASLDescriptionsNeverContainThePassword() {
+        let secret = "hunter2-SECRET"
+        let config = RelayConfig(host: "relay.example", port: 587, tls: .startTLS, auth: .plain(username: "u", password: secret))
+        let login = RelayConfig(host: "relay.example", port: 587, tls: .startTLS, auth: .login(username: "u", password: secret))
+        let rendered = [
+            "\(config)", String(reflecting: config), "\(login)", String(reflecting: login),
+            "\(config.auth)", "\(SASLPlain(username: "u", password: secret))",
+            String(reflecting: SASLLogin(username: "u", password: secret)),
+        ]
+        for text in rendered {
+            #expect(!text.contains(secret), "\(text)")
+        }
+        #expect("\(config.auth)".contains("<redacted>"))
+    }
+}
