@@ -176,11 +176,18 @@ public struct URLSessionMTASTSFetcher: MTASTSHTTPFetching {
         let session = self.session
         let limit = maximumBodySize
         let (data, response) = try await Self.withDeadline(timeout) { [request] in
-            #if canImport(FoundationNetworking)
-            try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration, limit: limit)
-            #else
-            try await Self.cappedFetch(request, session: session, limit: limit)
-            #endif
+            do {
+                #if canImport(FoundationNetworking)
+                return try await RedirectRefusingFetchDelegate.fetch(request, configuration: session.configuration, limit: limit)
+                #else
+                return try await Self.cappedFetch(request, session: session, limit: limit)
+                #endif
+            } catch let error as URLError where error.code == .timedOut {
+                // The request's idle timeout is the same `timeout`, and on a
+                // loaded host it can fire just before the deadline; either
+                // way the fetcher's timeout elapsed, so report it as one.
+                throw MTASTSHTTPFetchError.timedOut
+            }
         }
         guard let http = response as? HTTPURLResponse else {
             throw MTASTSHTTPFetchError.notAnHTTPResponse

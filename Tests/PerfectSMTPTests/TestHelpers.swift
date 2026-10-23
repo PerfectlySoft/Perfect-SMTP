@@ -107,10 +107,14 @@ enum ConnectionHarness {
     static func make(
         replyTimeout: TimeInterval = 300,
         dataTerminationTimeout: TimeInterval = 600,
-        ehloHostname: String = "client.example.com"
+        ehloHostname: String = "client.example.com",
+        answersQUIT: Bool = false
     ) async throws -> (SMTPConnection, NIOAsyncTestingChannel) {
         let testingChannel = NIOAsyncTestingChannel()
         try await testingChannel.testingEventLoop.executeInContext {
+            if answersQUIT {
+                try testingChannel.pipeline.syncOperations.addHandler(QUITResponder(), position: .first)
+            }
             try testingChannel.pipeline.syncOperations.addHandler(ByteToMessageHandler(SMTPResponseDecoder()))
             try testingChannel.pipeline.syncOperations.addHandler(SMTPCommandEncoder())
         }
@@ -165,4 +169,22 @@ func trimCRLF(_ s: String) -> String {
         scalars.removeLast()
     }
     return String(scalars)
+}
+
+/// Answers a `QUIT` written by the client with `221`, like a real server,
+/// so pool tests don't sit out the QUIT reply timeout. Sits first in the
+/// pipeline: it sees the encoded bytes on the way out and feeds the reply
+/// back up through the decoder. Event-loop confined.
+final class QUITResponder: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let buffer = Self.unwrapOutboundIn(data)
+        let isQUIT = buffer.getString(at: buffer.readerIndex, length: buffer.readableBytes) == "QUIT\r\n"
+        context.write(data, promise: promise)
+        if isQUIT {
+            context.fireChannelRead(NIOAny(ByteBuffer(string: "221 2.0.0 Bye\r\n")))
+        }
+    }
 }

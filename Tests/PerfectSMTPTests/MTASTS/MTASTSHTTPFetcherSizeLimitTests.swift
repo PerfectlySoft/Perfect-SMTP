@@ -238,6 +238,42 @@ struct NIOMTASTSHTTPFetcherTests {
         }
     }
 
+    /// Re-review: the GET used to be written into NIOSSL before the
+    /// handshake finished, so a server whose certificate the DNS-name check
+    /// then refused still received the request. It must see nothing.
+    @Test(.timeLimit(.minutes(1)), arguments: [TLSVersion.tlsv12, .tlsv13])
+    func aServerWhoseCertificateIsRefusedNeverReceivesTheRequest(version: TLSVersion) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let received = NIOLockedValueBox(0)
+        var serverConfiguration = TLSConfiguration.makeServerConfiguration(
+            certificateChain: [.certificate(try NIOSSLCertificate(bytes: Array(TestCertificates.ipOnlyCertificatePEM.utf8), format: .pem))],
+            privateKey: .privateKey(try NIOSSLPrivateKey(bytes: Array(TestCertificates.ipOnlyKeyPEM.utf8), format: .pem))
+        )
+        serverConfiguration.minimumTLSVersion = version
+        serverConfiguration.maximumTLSVersion = version
+        let context = try NIOSSLContext(configuration: serverConfiguration)
+        let server = try await ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: context))
+                    try channel.pipeline.syncOperations.addHandler(RequestRecorder(received: received))
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let port = try #require(server.localAddress?.port)
+        let fetcher = NIOMTASTSHTTPFetcher(
+            group: group, timeout: 10, tlsConfiguration: try trustingTestCA(),
+            addressResolver: FixedResolver(addresses: [.v4([127, 0, 0, 1])]), allowPrivateAddresses: true
+        )
+        await #expect(throws: CertificateNameError.noDNSName(host: "mta-sts.victim.test")) {
+            _ = try await fetcher.fetch(url: try #require(URL(string: "https://mta-sts.victim.test:\(port)/.well-known/mta-sts.txt")))
+        }
+        try await Task.sleep(nanoseconds: 200_000_000) // let anything in flight arrive
+        try await server.close()
+        #expect(received.withLockedValue { $0 } == 0, "the server received \(received.withLockedValue { $0 }) request bytes")
+    }
+
     /// Release review (SSRF): the host is resolved once and only globally
     /// routable addresses are dialed, by default.
     @Test(.timeLimit(.minutes(1)))
@@ -292,5 +328,17 @@ private final class FixedHTTPResponder: ChannelInboundHandler, @unchecked Sendab
         context.writeAndFlush(Self.wrapOutboundOut(ByteBuffer(string: response))).whenComplete { _ in channel.close(promise: nil) }
     }
 
+    func errorCaught(context: ChannelHandlerContext, error: any Error) { context.close(promise: nil) }
+}
+
+/// Counts decrypted application bytes the client sends. Event-loop confined.
+private final class RequestRecorder: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    private let received: NIOLockedValueBox<Int>
+    init(received: NIOLockedValueBox<Int>) { self.received = received }
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let bytes = Self.unwrapInboundIn(data).readableBytes
+        received.withLockedValue { $0 += bytes }
+    }
     func errorCaught(context: ChannelHandlerContext, error: any Error) { context.close(promise: nil) }
 }

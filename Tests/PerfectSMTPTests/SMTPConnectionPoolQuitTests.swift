@@ -55,3 +55,30 @@ struct QuitWaitsFor221Tests {
         try await channel.closeFuture.get()
     }
 }
+
+/// Re-review: an eviction used to wait up to 0.5 s for the 221 before the
+/// close freed the slot, delaying the checkout waiting for it.
+struct EvictionDoesNotWaitForTheQUITReplyTests {
+    @Test(.timeLimit(.minutes(1)))
+    func aCheckoutWaitingOnAnEvictionIsNotHeldUpByASilentServer() async throws {
+        // The server never answers QUIT (answersQUIT: false), and the QUIT
+        // reply timeout is 30 s: had the eviction waited for a 221, the
+        // checkout would take 30 s. Robust on slow machines, unlike a tight
+        // bound against the 0.5 s default.
+        let pool = SMTPConnectionPool(
+            configuration: .init(maxPerHost: 1, maxTotal: 1, quitReplyTimeout: 30), group: NIOAsyncTestingEventLoop()
+        ) { _ in
+            let (connection, channel) = try await ConnectionHarness.make()
+            try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
+            return connection
+        }
+        let hostA = SMTPConnectionPool.Key(host: "a.example.com", port: 25, tls: .none)
+        let hostB = SMTPConnectionPool.Key(host: "b.example.com", port: 25, tls: .none)
+        try await pool.withConnection(to: hostA) { _ in () } // A is now idle and holds the only slot
+        let started = DispatchTime.now()
+        try await pool.withConnection(to: hostB) { _ in () } // evicts A
+        let seconds = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
+        await pool.shutdown()
+        #expect(seconds < 10, "the checkout waited \(seconds) s for the evicted connection's QUIT reply")
+    }
+}

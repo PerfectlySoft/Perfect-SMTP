@@ -108,34 +108,58 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
                 promise.fail(MTASTSHTTPFetchError.noPermittedAddress(host: host))
                 throw MTASTSHTTPFetchError.noPermittedAddress(host: host)
             }
-            let bootstrap = ClientBootstrap(group: group)
-                .connectTimeout(connectTimeout)
-                .channelInitializer { channel in
-                    channel.eventLoop.makeCompletedFuture {
-                        if let sslContext {
-                            let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
-                            try channel.pipeline.syncOperations.addHandler(tls)
-                            if literal == nil {
-                                try channel.pipeline.syncOperations.addHandler(PeerDNSNameCheck(host: host))
+            // One event loop for every attempt, so each attempt's readiness
+            // promise is created up front and held here rather than looked up
+            // in a pipeline that may already have been torn down.
+            let loop = group.next()
+            func bootstrap(ready: EventLoopPromise<Void>) -> ClientBootstrap {
+                ClientBootstrap(group: loop)
+                    .connectTimeout(connectTimeout)
+                    .channelInitializer { channel in
+                        channel.eventLoop.makeCompletedFuture {
+                            if let sslContext {
+                                let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
+                                try channel.pipeline.syncOperations.addHandler(tls)
+                                try channel.pipeline.syncOperations.addHandler(
+                                    TLSReadyGate(host: literal == nil ? host : nil, ready: ready)
+                                )
                             }
+                            try channel.pipeline.syncOperations.addHTTPClientHandlers()
+                            try channel.pipeline.syncOperations.addHandler(CappedResponseCollector(limit: limit, promise: promise))
                         }
-                        try channel.pipeline.syncOperations.addHTTPClientHandlers()
-                        try channel.pipeline.syncOperations.addHandler(CappedResponseCollector(limit: limit, promise: promise))
                     }
-                }
-            var channel: (any Channel)?
+            }
+            var connected: (channel: any Channel, ready: EventLoopPromise<Void>)?
             var lastError: any Error = MTASTSHTTPFetchError.noPermittedAddress(host: host)
             for address in permitted {
+                let ready = loop.makePromise(of: Void.self)
                 do {
-                    channel = try await bootstrap.connect(to: SocketAddress(ipAddress: address.description, port: port)).get()
+                    let channel = try await bootstrap(ready: ready)
+                        .connect(to: SocketAddress(ipAddress: address.description, port: port)).get()
+                    connected = (channel, ready)
                     break
                 } catch {
+                    ready.fail(error)  // no-op if the gate already failed it
                     lastError = error
                 }
             }
-            guard let channel else {
+            guard let (channel, ready) = connected else {
                 promise.fail(lastError)
                 throw lastError
+            }
+            // Re-review: nothing is written until the handshake has
+            // completed and the certificate's DNS name has been checked, so
+            // a refused server never sees the request.
+            if useTLS {
+                do {
+                    try await ready.futureResult.get()
+                } catch {
+                    channel.close(promise: nil)
+                    promise.fail(error)
+                    throw error
+                }
+            } else {
+                ready.succeed(())
             }
             var headers = HTTPHeaders()
             headers.add(name: "Host", value: hostField)
@@ -190,25 +214,47 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
     }
 }
 
-/// After the handshake, requires a DNS subjectAltName for `host` on the
-/// verified certificate; on failure the error reaches the collector, which
-/// fails the fetch and closes. Event-loop confined.
-private final class PeerDNSNameCheck: ChannelInboundHandler, @unchecked Sendable {
+/// Completes `ready` once the TLS handshake is done and, for a host name,
+/// the verified certificate carries a matching DNS subjectAltName; fails
+/// it (and closes) otherwise. The request is written only after `ready`
+/// succeeds. Event-loop confined.
+private final class TLSReadyGate: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = NIOAny
-    private let host: String
-    init(host: String) { self.host = host }
+    private let host: String?
+    let ready: EventLoopPromise<Void>
+
+    init(host: String?, ready: EventLoopPromise<Void>) {
+        self.host = host
+        self.ready = ready
+    }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
             do {
-                try CertificateDNSNames.requireMatch(in: context.pipeline.syncOperations, host: host)
+                if let host { try CertificateDNSNames.requireMatch(in: context.pipeline.syncOperations, host: host) }
+                ready.succeed(())
             } catch {
+                ready.fail(error)
                 context.fireErrorCaught(error)
                 context.close(promise: nil)
                 return
             }
         }
         context.fireUserInboundEventTriggered(event)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: any Error) {
+        ready.fail(error)
+        context.fireErrorCaught(error)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        ready.fail(NIOMTASTSHTTPFetcher.FetchError.incompleteResponse)
+        context.fireChannelInactive()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        ready.fail(NIOMTASTSHTTPFetcher.FetchError.incompleteResponse)
     }
 }
 

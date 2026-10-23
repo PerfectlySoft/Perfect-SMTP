@@ -32,7 +32,7 @@ struct SMTPConnectionPoolTests {
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
                 await onDial()
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -124,7 +124,7 @@ struct SMTPConnectionPoolTests {
                     await firstDialGate.wait()
                     throw SimulatedDialFailure()
                 }
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -152,7 +152,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 4, maxTotal: 1),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -267,7 +267,7 @@ struct SMTPConnectionPoolTests {
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
                 await Task.yield()
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -322,7 +322,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 4, maxTotal: 1),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -352,7 +352,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 2, maxTotal: 2),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -391,7 +391,7 @@ struct SMTPConnectionPoolTests {
         slowKeys: Set<SMTPConnectionPool.Key>? = nil
     ) -> SMTPConnectionPool {
         SMTPConnectionPool(configuration: configuration, group: NIOAsyncTestingEventLoop(), dialer: { key in
-            let (connection, channel) = try await ConnectionHarness.make()
+            let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
             if slowKeys?.contains(key) ?? true {
                 try await channel.testingEventLoop.executeInContext {
                     try channel.pipeline.syncOperations.addHandler(HoldCloseHandler(holder), position: .first)

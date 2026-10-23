@@ -112,6 +112,10 @@ public final class SMTPConnectionPool: Sendable {
         /// terminator, where the server may legitimately be doing real
         /// work (spooling/scanning a large message).
         public var dataTerminationTimeout: TimeInterval
+        /// How long `shutdown()` waits for each idle connection's `221`
+        /// reply to `QUIT` before closing it (default 0.5 s). Evictions and
+        /// idle-timeout closes never wait: they send `QUIT` and close.
+        public var quitReplyTimeout: TimeInterval
 
         public init(
             maxPerHost: Int = 4,
@@ -121,7 +125,8 @@ public final class SMTPConnectionPool: Sendable {
             circuitBreakerThreshold: Int = 5,
             circuitBreakerResetTimeout: TimeInterval = 30,
             replyTimeout: TimeInterval = 300,
-            dataTerminationTimeout: TimeInterval = 600
+            dataTerminationTimeout: TimeInterval = 600,
+            quitReplyTimeout: TimeInterval = 0.5
         ) {
             self.maxPerHost = maxPerHost
             self.maxTotal = maxTotal
@@ -131,6 +136,7 @@ public final class SMTPConnectionPool: Sendable {
             self.circuitBreakerResetTimeout = circuitBreakerResetTimeout
             self.replyTimeout = replyTimeout
             self.dataTerminationTimeout = dataTerminationTimeout
+            self.quitReplyTimeout = quitReplyTimeout
         }
     }
 
@@ -386,10 +392,15 @@ public final class SMTPConnectionPool: Sendable {
     /// lock. When each close completes, its slot is freed and parked
     /// waiters are admitted.
     private func run(_ effects: Effects) {
+        // Only a shutdown waits for the 221: an eviction or idle-timeout
+        // close holds a maxTotal slot until it completes, and a checkout may
+        // be parked waiting for that slot.
+        let shuttingDown = effects.closes.contains(where: \.polite) && state.withLockedValue { $0.isShutDown }
         for (connection, isEviction, polite) in effects.closes {
             connection.channel.closeFuture.whenComplete { _ in self.closeFinished(wasEviction: isEviction) }
             if polite {
-                Task { await connection.quitAndClose() }
+                let timeout = configuration.quitReplyTimeout
+                Task { await connection.quitAndClose(waitForReply: shuttingDown, timeout: timeout) }
             } else {
                 connection.channel.close(promise: nil)
             }
