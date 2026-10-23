@@ -26,6 +26,12 @@ public struct RelayConfig: Sendable {
     public var auth: Auth
     public var ehloHostname: String
     public var pool: SMTPConnectionPool.Configuration
+    /// Whether `auth` may be sent over a connection with `tls: .none`.
+    /// `false` (the default) makes `RelayTransport.send` throw
+    /// `RelayTransportError.authenticationRequiresTLS` instead of sending
+    /// credentials or tokens in cleartext. Set it only for a relay on a
+    /// network you trust (a loopback MTA, a test server).
+    public var allowsAuthenticationWithoutTLS: Bool
 
     public init(
         host: String,
@@ -33,7 +39,8 @@ public struct RelayConfig: Sendable {
         tls: TLSMode,
         auth: Auth = .none,
         ehloHostname: String = "localhost",
-        pool: SMTPConnectionPool.Configuration = .init()
+        pool: SMTPConnectionPool.Configuration = .init(),
+        allowsAuthenticationWithoutTLS: Bool = false
     ) {
         self.host = host
         self.port = port
@@ -41,6 +48,7 @@ public struct RelayConfig: Sendable {
         self.auth = auth
         self.ehloHostname = ehloHostname
         self.pool = pool
+        self.allowsAuthenticationWithoutTLS = allowsAuthenticationWithoutTLS
     }
 
     var mechanism: (any SASLMechanism)? {
@@ -51,6 +59,15 @@ public struct RelayConfig: Sendable {
         case .xoauth2(let username, let tokenProvider): return XOAuth2(username: username, tokenProvider: tokenProvider)
         }
     }
+}
+
+/// Configuration errors `RelayTransport.send(_:_:)` throws before opening
+/// any connection.
+public enum RelayTransportError: Error, Sendable, Equatable {
+    /// `RelayConfig.auth` is set but `tls` is `.none`, and
+    /// `allowsAuthenticationWithoutTLS` is `false`: authenticating would
+    /// send the credentials in cleartext.
+    case authenticationRequiresTLS
 }
 
 /// A `SMTPTransport` that submits to one configured SMTP host via a pooled,
@@ -99,6 +116,9 @@ public final class RelayTransport: SMTPTransport, Sendable {
     /// `Documentation/user-guide.md`'s "Handling delivery results and
     /// retries" section for what that means for callers.
     public func send(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        if config.tls == .none, config.mechanism != nil, !config.allowsAuthenticationWithoutTLS {
+            throw RelayTransportError.authenticationRequiresTLS
+        }
         // FIX (milestone architecture + SMTP-protocol reviews, originally
         // flagged against `DirectMXTransport.attemptOnHost` but confirmed
         // to apply equally here): `SMTPConnection.sendMessage` returns
@@ -114,7 +134,7 @@ public final class RelayTransport: SMTPTransport, Sendable {
         // `RelayTransport` has no host-fallback to break, but it still
         // owns a pool and a circuit breaker whose bookkeeping deserves to
         // be correct.
-        try await pool.withConnection(to: key, isHealthy: SMTPConnectionPool.deliveryResultsIndicateHealthyConnection) { connection in
+        return try await pool.withConnection(to: key, isHealthy: SMTPConnectionPool.deliveryResultsIndicateHealthyConnection) { connection in
             // A pooled connection is reused across many checkouts; only
             // authenticate once per connection (most servers reject a
             // second AUTH on an already-authenticated session).

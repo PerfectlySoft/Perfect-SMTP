@@ -106,7 +106,8 @@ enum ConnectionHarness {
     /// clock, so no `advanceTime` dance is needed to observe it fire).
     static func make(
         replyTimeout: TimeInterval = 300,
-        dataTerminationTimeout: TimeInterval = 600
+        dataTerminationTimeout: TimeInterval = 600,
+        ehloHostname: String = "client.example.com"
     ) async throws -> (SMTPConnection, NIOAsyncTestingChannel) {
         let testingChannel = NIOAsyncTestingChannel()
         try await testingChannel.testingEventLoop.executeInContext {
@@ -118,7 +119,7 @@ enum ConnectionHarness {
         }
         let connection = SMTPConnection(
             asyncChannel: asyncChannel,
-            ehloHostname: "client.example.com",
+            ehloHostname: ehloHostname,
             replyTimeout: replyTimeout,
             dataTerminationTimeout: dataTerminationTimeout
         )

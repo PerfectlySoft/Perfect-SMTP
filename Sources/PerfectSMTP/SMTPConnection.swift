@@ -206,6 +206,9 @@ public final class SMTPConnection: @unchecked Sendable {
     /// fallback when the server doesn't understand EHLO at all.
     @discardableResult
     public func negotiateCapabilities() async throws -> Capabilities {
+        // The hostname comes from configuration, but it is written into a
+        // command line verbatim: a CR/LF in it would inject commands.
+        _ = try HeaderEncoder.rejectHeaderInjection(ehloHostname, field: "EHLO hostname")
         try await writeLine("EHLO \(ehloHostname)")
         let reply = try await nextReply()
         if reply.replyClass == .permanentNegative {
