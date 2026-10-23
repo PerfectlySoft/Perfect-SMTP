@@ -148,7 +148,10 @@ freshly-dialed connection once and reusing it across sends. `tls` is a
 requested: if the server doesn't advertise STARTTLS, the connection fails
 rather than silently continuing in plaintext), or `.implicit` (TLS from the
 first byte, typically port 465). Both TLS modes verify the server's
-certificate chain and hostname.
+certificate chain, and for a relay reached by name the certificate must
+carry a DNS subjectAltName for it (an IP-address SAN for the dialed
+address is not enough), so someone who can redirect the relay's DNS
+can't collect credentials with an IP certificate.
 
 `tls: .none` together with `auth` is refused: `send` throws
 `RelayTransportError.authenticationRequiresTLS` before opening a
@@ -383,12 +386,14 @@ memory. Redirects are never followed (RFC 8461 §3.3).
 configuration (proxies, for example), but on Linux its size cap can't stop
 corelibs Foundation from buffering an endless body.
 
-MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above: the
-HTTPS policy-file fetch target is address-checked the same way when you
-pass `addressResolver` to `MTASTSPolicyManager.init` (as in the example
-above), since the fetch hostname (`mta-sts.<domain>`) is just as
-attacker-influenceable as an MX record when the recipient domain isn't
-fully trusted.
+MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above, and is
+on by default: `NIOMTASTSHTTPFetcher` resolves `mta-sts.<domain>` once,
+refuses non-routable addresses, and connects to a vetted address (with
+the name in SNI and `Host`), since the fetch hostname is just as
+attacker-influenceable as an MX record. The policy host's certificate
+must carry a DNS subjectAltName for it. Passing `addressResolver` to
+`MTASTSPolicyManager.init` (as in the example above) adds the same check
+for a custom fetcher.
 
 DANE/TLSA is explicitly out of scope for this rewrite (deferred per the
 plan) — MTA-STS is the only policy mechanism implemented.

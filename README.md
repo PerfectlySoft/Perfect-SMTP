@@ -151,11 +151,15 @@ You get these without configuring anything:
 - **TLS certificates are verified.** Every TLS connection (`.startTLS`,
   `.implicit`, and `DirectMXTransport`'s STARTTLS attempts) uses
   `TLSConfiguration.makeClientConfiguration()`: full chain verification
-  plus a name check. The name check follows NIOSSL: the certificate must
-  name the host, or carry an IP-address SAN equal to the address
-  dialed. Only a real IP-literal host is dialed without SNI; any other
-  name that isn't a valid host name fails before connecting. A failed
-  certificate is reported as `SMTPError.tlsCertificateInvalid`.
+  plus a name check. A relay reached by name, a direct-MX host under an
+  MTA-STS policy, and the MTA-STS policy host must present a DNS
+  subjectAltName for that name: an IP-address SAN alone, which NIOSSL
+  would accept for the dialed address, isn't enough. An IP-literal host is
+  checked against its IP SAN, and opportunistic direct MX without a policy
+  uses NIOSSL's check as is. Only a real IP literal is dialed without
+  SNI; any other name that isn't a valid host name fails before
+  connecting. A failed certificate is reported as
+  `SMTPError.tlsCertificateInvalid`.
 - **`.startTLS` never downgrades.** If the server doesn't advertise
   `STARTTLS`, or answers it with an error such as `454`, the connection
   fails instead of continuing in plaintext. Bytes injected around the
