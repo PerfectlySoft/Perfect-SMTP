@@ -16,16 +16,18 @@ let package = Package(
         // release whose `EmbeddedChannel` accepts the `autoRead` option.
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
+        // 1.5.4: 1.5.0-1.5.3 don't compile on Linux with Swift 6.2+
+        // (`localtime` returns an optional there).
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.4"),
         // A range, not an exact pin: an exact pin in a library makes
         // resolution fail for any app that also needs a different
         // swift-crypto. `_CryptoExtras` is underscore-prefixed, but the only
         // part used here (`_RSA.Signing` PEM/DER init, `keySizeInBits`,
-        // PKCS#1 v1.5 sign/verify) is unchanged from 3.4.0 (the first
-        // release with `Sendable` RSA keys and the `unsafe*Representation`
-        // initializers the tests use) through 4.5.2; both ends of the range
-        // are built and tested. Matches Perfect-NIO's own 3.x..<5 range.
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.4.0"..<"5.0.0"),
+        // PKCS#1 v1.5 sign/verify) is unchanged across 4.x; 4.0.0 and 4.5.2
+        // are built and tested on macOS and Linux. 3.x is excluded: on
+        // Linux its `Curve25519.Signing.PrivateKey` isn't `Sendable`, so
+        // `SigningKey` doesn't compile (3.4.0+ does build on macOS).
+        .package(url: "https://github.com/apple/swift-crypto.git", "4.0.0"..<"5.0.0"),
     ],
     targets: [
         // Foundation + Crypto/_CryptoExtras only. No NIO import — value

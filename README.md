@@ -71,9 +71,8 @@ iOS, tvOS and watchOS are not supported: this is a server-side package
 (SwiftNIO sockets, and `LocalMTATransport` launches a local `sendmail`).
 
 Dependencies are all Apple/SSWG packages: `swift-nio`, `swift-nio-ssl`,
-`swift-log` and `swift-crypto` (the last for DKIM; its version range is
-`3.4.0..<5.0.0`, so it resolves alongside packages on either swift-crypto
-major).
+`swift-log` and `swift-crypto` (the last for DKIM; any 4.x release, so it
+resolves alongside other packages using swift-crypto 4).
 
 ## Installation
 
