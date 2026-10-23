@@ -147,6 +147,7 @@ private final class EndlessBodyHTTPHandler: ChannelInboundHandler, @unchecked Se
 
 /// The NIO fetcher end to end: a real policy over HTTPS (local test CA),
 /// a chunked body, and an untrusted certificate.
+@Suite(.serialized)
 struct NIOMTASTSHTTPFetcherTests {
     private static let policy = "version: STSv1\r\nmode: enforce\r\nmx: mx.victim.test\r\nmax_age: 86400\r\n"
 

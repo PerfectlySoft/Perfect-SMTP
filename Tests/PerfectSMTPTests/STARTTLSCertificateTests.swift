@@ -23,6 +23,10 @@ import NIOSSL
 import Testing
 @testable import PerfectSMTP
 
+// Serialized: every case is a TLS handshake (and some load the system
+// trust store). Run all at once on a slow machine (emulated amd64 debug)
+// they starve the timing-sensitive tests running alongside.
+@Suite(.serialized)
 struct STARTTLSCertificateTests {
     enum Leaf { case ipOnly, named, dnsOnly }
 
@@ -221,6 +225,7 @@ private final class TLSFakeSMTPHandler: ChannelInboundHandler, @unchecked Sendab
 /// Release review: every relay TLS connection to a host name needs a DNS
 /// subjectAltName, so a DNS attacker holding an IP certificate for the
 /// address they redirect to can't collect AUTH credentials.
+@Suite(.serialized)
 struct RelayCertificateNameTests {
     @Test func theDefaultDialerRequiresADNSNameForTLSToAHostName() {
         typealias Key = SMTPConnectionPool.Key

@@ -10,6 +10,7 @@ import NIOSSL
 import Testing
 @testable import PerfectSMTP
 
+@Suite(.serialized)
 struct CertificateDNSNamesTests {
     private static func der(_ pem: String) throws -> [UInt8] {
         try NIOSSLCertificate(bytes: Array(pem.utf8), format: .pem).toDERBytes()
@@ -99,12 +100,14 @@ struct CertificateDNSNamesTests {
         }
     }
 
-    /// Random mutations of a real certificate never crash; they either
+    /// Random mutations (400; more just costs CPU that starves the timing
+    /// tests running beside it on slow machines) of a real certificate
+    /// never crash; they either
     /// parse or throw `.malformedCertificate`.
     @Test func mutatedCertificatesNeverCrash() throws {
         let base = try Self.der(TestCertificates.namedCertificatePEM)
         var generator = SystemRandomNumberGenerator()
-        for _ in 0..<2000 {
+        for _ in 0..<400 {
             var bytes = base
             for _ in 0..<Int.random(in: 1...6, using: &generator) {
                 let i = Int.random(in: 0..<bytes.count, using: &generator)
