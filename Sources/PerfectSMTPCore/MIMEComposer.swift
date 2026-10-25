@@ -37,6 +37,20 @@ public struct MIMEComposer: Sendable {
         /// upstream, but composition fails loudly rather than silently
         /// emitting a malformed header.
         case invalidHeaderValue(String)
+        /// An `extraHeaders` name isn't an RFC 5322 §3.6.8 field name: one
+        /// or more printable ASCII characters (33–126) other than `:`. A
+        /// name like `"Bcc:x@y"` or `"To "` would otherwise slip past
+        /// `forbiddenExtraHeaderNames` and still be read as `Bcc`/`To`.
+        case invalidHeaderName(String)
+        /// `messageIDDomain` isn't an LDH hostname.
+        case invalidMessageIDDomain(String)
+        /// The boundary generator returned something that isn't an RFC 2046
+        /// boundary: 1–70 `bchars`, not ending in a space.
+        case invalidBoundary(String)
+        /// A header value has a run without whitespace long enough that the
+        /// header can't be folded under RFC 5322's 998-octet line limit
+        /// (a caller-supplied Message-ID, reference or extra-header value).
+        case headerLineTooLong(String)
         /// `EmailMessage.listUnsubscribe.postOneClick` was `true` but `url`
         /// was `nil` — RFC 8058 §2's one-click mechanism is specifically
         /// for the HTTPS POST target, so there is no URL for
@@ -183,6 +197,21 @@ public struct MIMEComposer: Sendable {
         "perfect-smtp-\(UUID().uuidString)"
     }
 
+    /// A single RFC 5322 §3.6.4 `msg-id`: `<`, one or more characters
+    /// other than whitespace and angle brackets, `>`. "<a@b> <c@d>" (two
+    /// IDs in one field) is refused.
+    private static func requireMessageID(_ value: String, field: String) throws {
+        guard value.count > 2, value.first == "<", value.last == ">",
+              !value.dropFirst().dropLast().contains(where: { $0 == "<" || $0 == ">" || $0.isWhitespace })
+        else { throw ComposerError.invalidHeaderValue(field) }
+    }
+
+    /// RFC 5322 §3.6.8 `field-name = 1*ftext`, `ftext` = printable ASCII
+    /// 33–126 except `:`.
+    static func isValidFieldName(_ name: String) -> Bool {
+        !name.isEmpty && name.utf8.allSatisfy { (33...126).contains($0) && $0 != UInt8(ascii: ":") }
+    }
+
     /// Routes a caller-controlled string through `HeaderEncoder`'s shared
     /// `rejectHeaderInjection`, re-surfacing any control-character rejection
     /// as this composer's own `ComposerError.invalidHeaderValue` — the
@@ -209,6 +238,9 @@ public struct MIMEComposer: Sendable {
             // first, before the denylist lookup, so a mangled name is
             // caught regardless of what it lowercases to.
             try Self.requireNoInjection(name, field: name)
+            guard Self.isValidFieldName(name) else {
+                throw ComposerError.invalidHeaderName(name)
+            }
             if Self.forbiddenExtraHeaderNames.contains(name.lowercased()) {
                 throw ComposerError.forbiddenHeader(name)
             }
@@ -216,6 +248,9 @@ public struct MIMEComposer: Sendable {
         }
         guard message.textBody != nil || message.htmlBody != nil else {
             throw ComposerError.missingBody
+        }
+        if let messageIDDomain, !AddressSyntax.isHostnameOrAddressLiteral(messageIDDomain) {
+            throw ComposerError.invalidMessageIDDomain(messageIDDomain)
         }
 
         let top = try buildTopLevelPart()
@@ -242,6 +277,7 @@ public struct MIMEComposer: Sendable {
             // validated above via the "From" header's `encodeAddress`
             // call, so it can't carry an injection payload.
             try Self.requireNoInjection(messageID, field: "messageID")
+            try Self.requireMessageID(messageID, field: "messageID")
             headers.append(("Message-ID", messageID))
         } else {
             headers.append(("Message-ID", synthesizeMessageID()))
@@ -249,11 +285,13 @@ public struct MIMEComposer: Sendable {
 
         if let inReplyTo = message.inReplyTo {
             try Self.requireNoInjection(inReplyTo, field: "inReplyTo")
+            try Self.requireMessageID(inReplyTo, field: "inReplyTo")
             headers.append(("In-Reply-To", inReplyTo))
         }
         if !message.references.isEmpty {
             for reference in message.references {
                 try Self.requireNoInjection(reference, field: "references")
+                try Self.requireMessageID(reference, field: "references")
             }
             headers.append(("References", message.references.joined(separator: " ")))
         }
@@ -289,7 +327,14 @@ public struct MIMEComposer: Sendable {
             body = Self.serializeMultipart(boundary: boundary, parts: parts)
         }
 
-        return RFC5322Message(headers: headers, body: body)
+        // Release review: fold every header to the RFC 5322 §2.1.1 limits
+        // before anything (DKIM included) sees it, and refuse one that
+        // can't be brought under 998 octets per line.
+        let folded = headers.map { (name: $0.name, value: HeaderFolding.fold(name: $0.name, value: $0.value)) }
+        for header in folded where HeaderFolding.longestLine(name: header.name, value: header.value) > HeaderFolding.maximumLineLength {
+            throw ComposerError.headerLineTooLong(header.name)
+        }
+        return RFC5322Message(headers: folded, body: body)
     }
 
     /// Builds `List-Unsubscribe`/`List-Unsubscribe-Post` (RFC 8058, building
@@ -430,7 +475,7 @@ public struct MIMEComposer: Sendable {
 
         let alternativeOrSingle: MIMEPart
         if bodyParts.count > 1 {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             alternativeOrSingle = MIMEPart(
                 headers: [("Content-Type", "multipart/alternative; boundary=\"\(boundary)\"")],
                 body: .multipart(boundary: boundary, parts: bodyParts)
@@ -441,7 +486,7 @@ public struct MIMEComposer: Sendable {
 
         let relatedOrSingle: MIMEPart
         if !message.inlineImages.isEmpty {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             var parts = [alternativeOrSingle]
             parts.append(contentsOf: try message.inlineImages.map(inlineLeaf))
             relatedOrSingle = MIMEPart(
@@ -453,7 +498,7 @@ public struct MIMEComposer: Sendable {
         }
 
         if !message.attachments.isEmpty {
-            let boundary = boundaryGenerator()
+            let boundary = try makeBoundary()
             var parts = [relatedOrSingle]
             parts.append(contentsOf: try message.attachments.map(attachmentLeaf))
             return MIMEPart(
@@ -650,6 +695,14 @@ public struct MIMEComposer: Sendable {
 
     private func inlineLeaf(_ resource: InlineResource) throws -> MIMEPart {
         try Self.requireNoInjection(resource.contentType, field: "inlineResource.contentType")
+        // `contentID` goes into the part's `Content-ID` header verbatim, so
+        // a CR/LF in it would inject headers (or, with a blank line, body
+        // content) into the inline part.
+        try Self.requireNoInjection(resource.contentID, field: "inlineResource.contentID")
+        // It's wrapped in <...> below: no brackets or whitespace inside.
+        guard !resource.contentID.isEmpty, !resource.contentID.contains(where: { $0 == "<" || $0 == ">" || $0.isWhitespace }) else {
+            throw ComposerError.invalidHeaderValue("inlineResource.contentID")
+        }
         var headers: [(name: String, value: String)] = []
         if let filename = resource.filename {
             let name = sanitizedFilename(filename)
@@ -674,7 +727,7 @@ public struct MIMEComposer: Sendable {
         for part in parts {
             out.append(contentsOf: Array("--\(boundary)\r\n".utf8))
             for (name, value) in part.headers {
-                out.append(contentsOf: Array("\(name): \(value)\r\n".utf8))
+                out.append(contentsOf: Array("\(name): \(HeaderFolding.fold(name: name, value: value))\r\n".utf8))
             }
             out.append(contentsOf: Array("\r\n".utf8))
             switch part.body {
@@ -803,6 +856,18 @@ public struct MIMEComposer: Sendable {
 
     private static func isPrintableASCII(_ value: String) -> Bool {
         value.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value < 0x7F }
+    }
+
+    /// Calls `boundaryGenerator` and checks the result against RFC 2046
+    /// §5.1.1: 1–70 characters from `bchars`, not ending in a space.
+    private func makeBoundary() throws -> String {
+        let boundary = boundaryGenerator()
+        let bchars = Set("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'()+_,-./:=? ".utf8)
+        guard (1...70).contains(boundary.utf8.count),
+              boundary.utf8.allSatisfy(bchars.contains),
+              boundary.utf8.last != UInt8(ascii: " ")
+        else { throw ComposerError.invalidBoundary(boundary) }
+        return boundary
     }
 
     private func synthesizeMessageID() -> String {

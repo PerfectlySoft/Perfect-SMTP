@@ -217,14 +217,12 @@ struct DirectMXTransportTests {
         }
 
         #expect(lastResults.count == 1)
-        guard case .failed(let error) = lastResults[0].outcome else {
-            Issue.record("expected .failed once the sole host's breaker is open, got \(lastResults[0].outcome)")
+        // Release review: an open breaker is temporary -- queued for retry.
+        guard case .queuedForRetry(_, _, let last) = lastResults[0].outcome, last.code == 451 else {
+            Issue.record("expected a temporary failure once the sole host's breaker is open, got \(lastResults[0].outcome)")
             return
         }
-        guard let smtpError = error as? SMTPError, case .circuitOpen = smtpError else {
-            Issue.record("expected the .failed outcome to wrap SMTPError.circuitOpen, got \(error)")
-            return
-        }
+        #expect(last.lines.joined().contains("circuitOpen"), "expected the failure to name SMTPError.circuitOpen, got \(last.lines)")
     }
 
     // MARK: - `.ambiguous` is never queued for retry
@@ -340,7 +338,7 @@ struct DirectMXTransportTests {
         // open -- proving the ambiguous outcome fed `recordFailure`
         // (not `recordSuccess`) during `release`.
         let r2 = try await transport.send(try envelope(recipients: ["b@goesambiguous.example"]), message())
-        guard case .failed(let error) = r2[0].outcome, let smtpError = error as? SMTPError, case .circuitOpen = smtpError else {
+        guard case .queuedForRetry(_, _, let last) = r2[0].outcome, last.lines.joined().contains("circuitOpen") else {
             Issue.record("expected the second attempt to fail with SMTPError.circuitOpen (proving the ambiguous outcome fed the breaker), got \(r2[0].outcome)")
             return
         }
@@ -422,7 +420,7 @@ struct DirectMXTransportTests {
         // hang writing a second MAIL FROM against a scripted server task
         // that already exited after replying once.
         let r2 = try await transport.send(try envelope(recipients: ["b@goes421.example"]), message())
-        guard case .failed(let error) = r2[0].outcome, let smtpError = error as? SMTPError, case .circuitOpen = smtpError else {
+        guard case .queuedForRetry(_, _, let last) = r2[0].outcome, last.lines.joined().contains("circuitOpen") else {
             Issue.record("expected the second attempt to fail with SMTPError.circuitOpen, got \(r2[0].outcome)")
             return
         }

@@ -43,6 +43,12 @@ public enum SMTPError: Error, Sendable {
     /// `.connectionFailed`'s existing precedent for carrying an opaque
     /// underlying error in a `Sendable` enum.
     case starttlsInjection(underlying: (any Error & Sendable)?)
+    /// The server's TLS certificate didn't verify: an untrusted or expired
+    /// chain, a name that doesn't match the host, or (for MTA-STS) no DNS
+    /// subjectAltName for the MX host. Reported separately from
+    /// `.starttlsInjection`, which now only means bytes were injected
+    /// around the upgrade.
+    case tlsCertificateInvalid(underlying: (any Error & Sendable)?)
     /// MTA-STS / DANE policy violation (Phase 4).
     case tlsPolicyViolation(String)
     case circuitOpen

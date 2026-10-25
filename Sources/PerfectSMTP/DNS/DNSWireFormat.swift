@@ -56,6 +56,8 @@ public enum DNSWireError: Error, Sendable, Equatable {
     /// field and a (possibly root) exchange name.
     case invalidMXRecordData
     /// A query name label was empty or exceeded 63 bytes (RFC 1035 §2.3.4).
+    /// (Decoded labels with unusual bytes are escaped instead; see
+    /// `DNSMessage.presentationForm`.)
     case invalidLabel
     /// FIX #4 (plan §9 Phase 3 milestone security review, decompression
     /// amplification): the total number of compression-pointer jumps
@@ -234,6 +236,8 @@ public struct DNSMessage: Sendable, Equatable {
             bytes.append(0)
             return
         }
+        // RFC 1035 §2.3.4: at most 255 octets on the wire.
+        guard trimmed.utf8.count + 2 <= 255 else { throw DNSWireError.nameTooLong }
         for label in trimmed.split(separator: ".", omittingEmptySubsequences: false) {
             let labelBytes = Array(label.utf8)
             guard (1...63).contains(labelBytes.count) else { throw DNSWireError.invalidLabel }
@@ -425,6 +429,7 @@ public struct DNSMessage: Sendable, Equatable {
     ) throws -> (name: String, nextOffset: Int) {
         var offset = startOffset
         var labels: [String] = []
+        var wireLength = 1 // the terminating root label
         var visitedPointers = Set<Int>()
         var jumps = 0
         var firstJumpNextOffset: Int?
@@ -455,9 +460,11 @@ public struct DNSMessage: Sendable, Equatable {
                 let labelLength = Int(lengthByte)
                 offset += 1
                 guard offset + labelLength <= bytes.count else { throw DNSWireError.truncated }
-                labels.append(String(decoding: bytes[offset..<offset + labelLength], as: UTF8.self))
+                let label = bytes[offset..<offset + labelLength]
+                labels.append(Self.presentationForm(label))
                 offset += labelLength
-                guard labels.count <= maximumLabelsPerName else { throw DNSWireError.nameTooLong }
+                wireLength += 1 + labelLength
+                guard labels.count <= maximumLabelsPerName, wireLength <= 255 else { throw DNSWireError.nameTooLong }
             default: // 0x40 / 0x80 -- reserved/EDNS0 extended label forms, unsupported
                 throw DNSWireError.unsupportedLabelForm
             }
@@ -465,6 +472,30 @@ public struct DNSMessage: Sendable, Equatable {
 
         let name = labels.joined(separator: ".")
         return (name, firstJumpNextOffset ?? offset)
+    }
+
+    /// A label in zone-file presentation form (RFC 1035 §5.1): printable
+    /// ASCII as is, and every other byte, `.` and `\` as `\DDD`.
+    /// Release review: `mx\0.victim.test` used to decode to a string with a
+    /// NUL that matched `*.victim.test`; a label containing `.` could pass
+    /// for two labels. Escaped, such names can't equal a real host name, so
+    /// `AddressSyntax.isHostname` and the owner-name matching reject them
+    /// record by record, and an odd name elsewhere in a response no
+    /// longer fails the whole message.
+    static func presentationForm(_ label: ArraySlice<UInt8>) -> String {
+        guard !label.allSatisfy({ (0x21...0x7E).contains($0) && $0 != 0x2E && $0 != 0x5C }) else {
+            return String(decoding: label, as: UTF8.self)
+        }
+        var text = ""
+        for byte in label {
+            if (0x21...0x7E).contains(byte), byte != 0x2E, byte != 0x5C {
+                text.unicodeScalars.append(Unicode.Scalar(byte))
+            } else {
+                let digits = String(byte)
+                text += "\\" + String(repeating: "0", count: 3 - digits.count) + digits
+            }
+        }
+        return text
     }
 
     private static func readUInt16(_ bytes: [UInt8], at offset: Int) -> UInt16 {

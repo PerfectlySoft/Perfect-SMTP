@@ -88,6 +88,9 @@ public actor LocalMTATransport: SMTPTransport {
     }
 
     private func runProcess(envelope: SMTPEnvelope, message: SignedMessage) async throws {
+        // Release review: the addresses go straight into the `sendmail`
+        // argv, so check them here as the SMTP path does before RCPT TO.
+        try envelope.validate()
         var arguments = config.extraArguments
         switch envelope.mailFrom {
         case .address(let address):

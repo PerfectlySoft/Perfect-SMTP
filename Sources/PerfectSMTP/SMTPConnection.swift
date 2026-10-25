@@ -37,6 +37,9 @@ public enum SMTPConnectionError: Error, Sendable, Equatable {
     /// existing catch path exactly like any other thrown error, marking the
     /// connection unhealthy (closed, not returned to idle) via `release`.
     case replyTimedOut
+    /// The server kept answering an AUTH exchange with `334` continuations
+    /// past `SMTPConnection.maximumSASLChallenges`.
+    case tooManySASLChallenges
 }
 
 /// The live, TLS-ready connection's async conversation surface.
@@ -104,11 +107,12 @@ public final class SMTPConnection: @unchecked Sendable {
         // Intentional use of the unscoped, deprecated `.inbound`/`.outbound`
         // accessors -- see this type's doc comment for why
         // `executeThenClose`'s request-scoped lifetime doesn't fit a
-        // pooled, reused connection. The two deprecation warnings below are
-        // deliberately left visible rather than suppressed, as an honest
-        // signal of this judgment call to anyone reading build output.
-        self.iterator = asyncChannel.inbound.makeAsyncIterator()
-        self.outbound = asyncChannel.outbound
+        // pooled, reused connection. They are reached through
+        // `UnscopedAsyncChannelParts` (below) so the package builds with
+        // `-warnings-as-errors`; the judgment call is documented there.
+        let (inbound, outbound) = unscopedParts(of: asyncChannel)
+        self.iterator = inbound.makeAsyncIterator()
+        self.outbound = outbound
         self.capabilities = Capabilities()
         self.ehloHostname = ehloHostname
         self.replyTimeout = replyTimeout
@@ -139,6 +143,30 @@ public final class SMTPConnection: @unchecked Sendable {
         if channel.isActive {
             channel.close(promise: nil)
         }
+    }
+
+    /// Best effort: sends `QUIT` (RFC 5321 §4.1.1.10), then closes the
+    /// channel, so the server sees an orderly end of session rather than a
+    /// dropped socket. With `waitForReply` it first waits up to `timeout`
+    /// for the `221`; the pool asks for that only on shutdown. An eviction
+    /// or idle-timeout close doesn't wait, because the pool frees the slot
+    /// when the close completes and a checkout may be waiting for it.
+    func quitAndClose(waitForReply: Bool = true, timeout: TimeInterval = 0.5) async {
+        if channel.isActive {
+            // Closing the channel is what ends a pending read, so the
+            // deadline closes it rather than relying on task cancellation
+            // to interrupt `rawNextReply()`.
+            let channel = self.channel
+            let deadline = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                channel.close(promise: nil)
+            }
+            if (try? await raceAgainstTimeout(timeout) { try await self.outbound.write(.line("QUIT")) }) != nil, waitForReply {
+                _ = try? await rawNextReply()
+            }
+            deadline.cancel()
+        }
+        channel.close(promise: nil)
     }
 
     /// Closes the channel and waits until it has closed. Used by dialers
@@ -205,6 +233,12 @@ public final class SMTPConnection: @unchecked Sendable {
     /// fallback when the server doesn't understand EHLO at all.
     @discardableResult
     public func negotiateCapabilities() async throws -> Capabilities {
+        // The hostname comes from configuration, but it is written into a
+        // command line verbatim: a CR/LF in it would inject commands.
+        _ = try HeaderEncoder.rejectHeaderInjection(ehloHostname, field: "EHLO hostname")
+        guard AddressSyntax.isHostnameOrAddressLiteral(ehloHostname) else {
+            throw AddressSyntax.Error.invalidHostname(field: "EHLO hostname")
+        }
         try await writeLine("EHLO \(ehloHostname)")
         let reply = try await nextReply()
         if reply.replyClass == .permanentNegative {
@@ -256,6 +290,10 @@ public final class SMTPConnection: @unchecked Sendable {
         isAuthenticated = true
     }
 
+    /// No supported mechanism needs more than two continuations (LOGIN's
+    /// username and password, or XOAUTH2's error detail); 10 is headroom.
+    static let maximumSASLChallenges = 10
+
     private func performSASLExchange(_ mechanism: inout any SASLMechanism) async throws {
         let initial = try await mechanism.initialResponse()
         var line = "AUTH \(mechanism.name)"
@@ -264,7 +302,14 @@ public final class SMTPConnection: @unchecked Sendable {
         }
         try await writeLine(line)
         var reply = try await nextReply()
+        var challenges = 0
         while reply.code == 334 {
+            // Bounded: a hostile or broken server could otherwise keep the
+            // exchange going forever, one reply timeout at a time.
+            challenges += 1
+            guard challenges <= Self.maximumSASLChallenges else {
+                throw SMTPConnectionError.tooManySASLChallenges
+            }
             guard let challengeText = reply.lines.first,
                   let challengeData = Data(base64Encoded: challengeText)
             else {
@@ -286,12 +331,16 @@ public final class SMTPConnection: @unchecked Sendable {
     /// degrades to lock-step (await each reply before the next write) when
     /// absent — the same command sequence either way.
     public func sendMessage(_ envelope: SMTPEnvelope, _ message: SignedMessage) async throws -> [DeliveryResult] {
+        try envelope.validate()
         var mailFromLine = try envelope.mailFrom.mailFromCommand
         if capabilities.sizeAdvertised {
             mailFromLine += " SIZE=\(message.estimatedSize)"
         }
         let recipientLines = try envelope.recipients.map { recipient -> String in
+            // Re-checked here: `SMTPEnvelope.recipients` is mutable after
+            // its validating init.
             let validated = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
+            try AddressSyntax.validateMailbox(validated, field: "RCPT TO address")
             return "RCPT TO:<\(validated)>"
         }
 
@@ -371,6 +420,21 @@ public final class SMTPConnection: @unchecked Sendable {
         }
 
         let dataReply = try await nextReply()
+        // Release review: a server may still answer the pipelined DATA with
+        // 354 after rejecting every RCPT. It is then in DATA mode, and
+        // returning the connection to the pool as is would feed the next
+        // transaction's MAIL FROM into a message body. RFC 2920 §3.1: send
+        // the terminating dot without a body and read its reply. If that
+        // fails, close the channel so the pool drops the connection.
+        if !anyAccepted, dataReply.code == 354 {
+            do {
+                try await write(.line("."))
+                _ = try await nextReply()
+            } catch {
+                channel.close(promise: nil)
+            }
+            return results
+        }
         // DATA proceeds only if at least one RCPT was accepted -- otherwise
         // the pipelined DATA command itself draws a rejection and the body
         // must never be sent (plan §4.3's corrected PIPELINING semantics).
@@ -437,4 +501,41 @@ public final class SMTPConnection: @unchecked Sendable {
     private func outcomeFor(_ reply: SMTPReply) -> DeliveryResult.Outcome {
         backoffPolicy.classify(reply, attempt: 1)
     }
+}
+
+// MARK: - Unscoped NIOAsyncChannel access
+
+/// Reaches `NIOAsyncChannel`'s deprecated, unscoped `inbound`/`outbound`
+/// accessors without a deprecation warning, so the package builds with
+/// `-warnings-as-errors`. `SMTPConnection` needs them because a pooled
+/// connection outlives any single `executeThenClose` scope (see its doc
+/// comment). The accessors are deprecated in favour of the scoped API, not
+/// removed or changed in behaviour; if a future NIO removes them, this is
+/// the one place to change.
+///
+/// Calling through a protocol requirement rather than the deprecated member
+/// itself is what keeps the call site warning-free; the witnesses carry the
+/// deprecation so the intent stays visible in the source.
+protocol UnscopedAsyncChannelParts {
+    associatedtype InboundElement: Sendable
+    associatedtype OutboundElement: Sendable
+    var unscopedInbound: NIOAsyncChannelInboundStream<InboundElement> { get }
+    var unscopedOutbound: NIOAsyncChannelOutboundWriter<OutboundElement> { get }
+}
+
+extension NIOAsyncChannel: UnscopedAsyncChannelParts {
+    typealias InboundElement = Inbound
+    typealias OutboundElement = Outbound
+
+    @available(*, deprecated, message: "Unscoped access for long-lived pooled connections only.")
+    var unscopedInbound: NIOAsyncChannelInboundStream<Inbound> { inbound }
+
+    @available(*, deprecated, message: "Unscoped access for long-lived pooled connections only.")
+    var unscopedOutbound: NIOAsyncChannelOutboundWriter<Outbound> { outbound }
+}
+
+private func unscopedParts<C: UnscopedAsyncChannelParts>(
+    of channel: C
+) -> (NIOAsyncChannelInboundStream<C.InboundElement>, NIOAsyncChannelOutboundWriter<C.OutboundElement>) {
+    (channel.unscopedInbound, channel.unscopedOutbound)
 }

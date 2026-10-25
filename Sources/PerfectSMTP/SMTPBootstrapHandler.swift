@@ -74,12 +74,15 @@ public enum SMTPBootstrap {
         connectTimeout: TimeAmount = .seconds(30),
         replyTimeout: TimeInterval = 300,
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
+        ehloHostname: String = "localhost",
+        requireCertificateDNSName: Bool = false,
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         try await connect(
             target: .hostPort(host: host, port: port), sniHostname: host, tls: tls,
             connectTimeout: connectTimeout, replyTimeout: replyTimeout,
-            tlsConfiguration: tlsConfiguration, group: group
+            tlsConfiguration: tlsConfiguration, ehloHostname: ehloHostname,
+            requireCertificateDNSName: requireCertificateDNSName, group: group
         )
     }
 
@@ -97,6 +100,12 @@ public enum SMTPBootstrap {
     /// TLS SNI and certificate-hostname verification are about the name a
     /// certificate is expected to match, independent of which specific
     /// address that name happened to resolve to.
+    ///
+    /// `requireCertificateDNSName`: when `true` (DirectMX delivery under an
+    /// MTA-STS policy), the server certificate must also carry a DNS
+    /// subjectAltName matching `sniHostname` (RFC 8461 §4.2); one that
+    /// only verifies through an IP-address SAN for the dialed address is
+    /// refused with `SMTPError.tlsCertificateInvalid`.
     public static func connect(
         to socketAddress: SocketAddress,
         sniHostname: String,
@@ -104,12 +113,15 @@ public enum SMTPBootstrap {
         connectTimeout: TimeAmount = .seconds(30),
         replyTimeout: TimeInterval = 300,
         tlsConfiguration: TLSConfiguration = .makeClientConfiguration(),
+        ehloHostname: String = "localhost",
+        requireCertificateDNSName: Bool = false,
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
         try await connect(
             target: .socketAddress(socketAddress), sniHostname: sniHostname, tls: tls,
             connectTimeout: connectTimeout, replyTimeout: replyTimeout,
-            tlsConfiguration: tlsConfiguration, group: group
+            tlsConfiguration: tlsConfiguration, ehloHostname: ehloHostname,
+            requireCertificateDNSName: requireCertificateDNSName, group: group
         )
     }
 
@@ -129,8 +141,19 @@ public enum SMTPBootstrap {
         connectTimeout: TimeAmount,
         replyTimeout: TimeInterval,
         tlsConfiguration: TLSConfiguration,
+        ehloHostname: String,
+        requireCertificateDNSName: Bool,
         group: any EventLoopGroup
     ) async throws -> NIOAsyncChannel<SMTPReply, SMTPCommand> {
+        // The EHLO argument and the TLS name both reach the wire; refuse
+        // anything that isn't a host name (or, for EHLO, an address
+        // literal) before connecting.
+        guard AddressSyntax.isHostnameOrAddressLiteral(ehloHostname) else {
+            throw AddressSyntax.Error.invalidHostname(field: "EHLO hostname")
+        }
+        if tls != .none, !isIPAddressLiteral(sniHostname), !AddressSyntax.isHostname(sniHostname) {
+            throw AddressSyntax.Error.invalidHostname(field: "TLS server name")
+        }
         let stepTimeout = Self.timeAmount(seconds: replyTimeout)
         let promise = group.next().makePromise(of: NIOAsyncChannel<SMTPReply, SMTPCommand>.self)
 
@@ -152,13 +175,17 @@ public enum SMTPBootstrap {
                     )
                     try channel.pipeline.syncOperations.addHandler(SMTPCommandEncoder(), name: Names.encoder)
                     if tls == .implicit {
-                        let sslHandler = try Self.makeSSLHandler(host: sniHostname, configuration: tlsConfiguration)
+                        let sslHandler = try Self.makeSSLHandler(
+                            host: sniHostname, configuration: tlsConfiguration, requireDNSName: requireCertificateDNSName
+                        )
                         try channel.pipeline.syncOperations.addHandler(sslHandler, position: .first)
                     }
                     let handler = SMTPBootstrapHandler(
                         tls: tls,
                         host: sniHostname,
                         tlsConfiguration: tlsConfiguration,
+                        requireCertificateDNSName: requireCertificateDNSName,
+                        ehloHostname: ehloHostname,
                         stepTimeout: stepTimeout,
                         readyPromise: promise,
                         initialDecoder: decoder
@@ -218,27 +245,49 @@ public enum SMTPBootstrap {
     /// any real multiline EHLO/reply while being well short of unbounded.
     static let maximumReplyBufferSize = 64 * 1024
 
-    static func makeSSLHandler(host: String, configuration: TLSConfiguration) throws -> NIOSSLClientHandler {
+    static func isIPAddressLiteral(_ host: String) -> Bool {
+        (try? SocketAddress(ipAddress: host, port: 0)) != nil
+    }
+
+    /// Builds the client TLS handler for `host`.
+    ///
+    /// A host name is sent as SNI and the certificate must match it. Only a
+    /// genuine IP-address literal is dialed without SNI (RFC 6066 §3 forbids
+    /// IP addresses there); NIOSSL then checks the certificate against the
+    /// peer's address (an iPAddress subjectAltName). Release review: this
+    /// used to fall back to no SNI for *any* name NIOSSL's SNI check
+    /// rejected, so a name like `mx\0.victim.test` was verified against
+    /// the dialed IP instead, and a certificate whose only SAN was that IP
+    /// passed. Any other name NIOSSL refuses now fails the connection.
+    ///
+    /// With `requireDNSName`, the certificate must additionally have a DNS
+    /// subjectAltName matching `host`; that is checked once the handshake
+    /// completes (`CertificateDNSNames`), since NIOSSL's own check also
+    /// accepts an IP SAN equal to the dialed address. An IP literal can't
+    /// satisfy it at all.
+    static func makeSSLHandler(host: String, configuration: TLSConfiguration, requireDNSName: Bool = false) throws -> NIOSSLClientHandler {
         let context = try NIOSSLContext(configuration: configuration)
-        do {
-            return try NIOSSLClientHandler(context: context, serverHostname: host)
-        } catch {
-            // `host` failed SNI hostname validation (e.g. it's a bare IP
-            // address, which NIOSSL's SNI validator rejects outright per
-            // RFC 6066 §3) -- fall back to no SNI. This is NOT a
-            // verification bypass: `serverHostname: nil` only disables the
-            // SNI *extension* sent during the handshake (a hint some
-            // servers use for virtual hosting); it does not disable
-            // certificate verification. NIOSSL still performs full
-            // certificate-chain validation and still checks the peer's
-            // certificate against the real connection address -- for an
-            // IP-literal host specifically, that means verifying an
-            // iPAddress `subjectAltName` entry (RFC 6125 §6.4.2/RFC 5280)
-            // against the actual peer IP, exactly the check that would
-            // otherwise catch a MITM presenting the wrong certificate.
-            // Confirmed safe by the security review.
+        if isIPAddressLiteral(host) {
+            guard !requireDNSName else { throw SMTPError.tlsCertificateInvalid(underlying: CertificateNameError.noDNSName(host: host)) }
             return try NIOSSLClientHandler(context: context, serverHostname: nil)
         }
+        return try NIOSSLClientHandler(context: context, serverHostname: host)
+    }
+
+    /// Whether `error`, seen while TLS is being set up, means the peer's
+    /// certificate failed verification (as opposed to a malformed TLS
+    /// stream, which during STARTTLS is how injected plaintext shows up).
+    /// Name failures are matched by type. A chain that doesn't verify only
+    /// shows up as `NIOSSLError.handshakeFailed` wrapping BoringSSL's
+    /// queue, whose error codes NIOSSL keeps private, so that one case is
+    /// recognized by BoringSSL's `CERTIFICATE_VERIFY_FAILED` reason text.
+    static func isCertificateFailure(_ error: any Error) -> Bool {
+        if error is CertificateNameError { return true }
+        if let extra = error as? NIOSSLExtraError, extra == .failedToValidateHostname { return true }
+        if case NIOSSLError.handshakeFailed(let underlying) = error {
+            return "\(underlying)".contains("CERTIFICATE_VERIFY_FAILED")
+        }
+        return false
     }
 }
 
@@ -269,6 +318,9 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
     private let tls: TLSMode
     private let host: String
     private let tlsConfiguration: TLSConfiguration
+    private let requireCertificateDNSName: Bool
+    /// The configured EHLO name, used for the pre-STARTTLS capability probe.
+    private let ehloHostname: String
     /// How long each bootstrap step (greeting, pre-TLS EHLO reply,
     /// STARTTLS reply, STARTTLS handshake) may take; see `SMTPBootstrap`.
     private let stepTimeout: TimeAmount
@@ -286,6 +338,8 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         tls: TLSMode,
         host: String,
         tlsConfiguration: TLSConfiguration,
+        requireCertificateDNSName: Bool = false,
+        ehloHostname: String = "localhost",
         stepTimeout: TimeAmount = .seconds(300),
         readyPromise: EventLoopPromise<NIOAsyncChannel<SMTPReply, SMTPCommand>>,
         initialDecoder: SMTPResponseDecoder
@@ -293,6 +347,8 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         self.tls = tls
         self.host = host
         self.tlsConfiguration = tlsConfiguration
+        self.requireCertificateDNSName = requireCertificateDNSName
+        self.ehloHostname = ehloHostname
         self.stepTimeout = stepTimeout
         self.readyPromise = readyPromise
         self.initialDecoder = initialDecoder
@@ -362,6 +418,16 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let tlsEvent = event as? TLSUserEvent, case .handshakeCompleted = tlsEvent {
+            // The certificate has verified as a chain; where a DNS name is
+            // required, check it before any SMTP reply is processed.
+            if requireCertificateDNSName, state == .upgrading || tls == .implicit {
+                do {
+                    try CertificateDNSNames.requireMatch(in: context.pipeline.syncOperations, host: host)
+                } catch {
+                    fail(context: context, .tlsCertificateInvalid(underlying: error))
+                    return
+                }
+            }
             guard state == .upgrading else {
                 // A handshake-completed event outside the upgrade window
                 // (e.g. implicit TLS, where we never entered `.upgrading`
@@ -380,6 +446,13 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        // A certificate that fails verification is its own outcome, in the
+        // upgrade window (STARTTLS) or before the greeting (implicit TLS):
+        // not an injection, and not a generic connection failure.
+        if SMTPBootstrap.isCertificateFailure(error) {
+            fail(context: context, .tlsCertificateInvalid(underlying: error))
+            return
+        }
         guard state == .upgrading else {
             fail(context: context, .connectionFailed(error))
             return
@@ -420,7 +493,7 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         case .startTLS:
             state = .awaitingPreTLSEHLOReply
             armStepTimer(context: context)
-            writeLine(context: context, "EHLO \(Self.probeHostname)")
+            writeLine(context: context, "EHLO \(ehloHostname)")
         }
     }
 
@@ -523,7 +596,9 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         guard state == .upgrading else { return }
         do {
             // Step 5: NIOSSLClientHandler at `.first`.
-            let sslHandler = try SMTPBootstrap.makeSSLHandler(host: host, configuration: tlsConfiguration)
+            let sslHandler = try SMTPBootstrap.makeSSLHandler(
+                host: host, configuration: tlsConfiguration, requireDNSName: requireCertificateDNSName
+            )
             try context.pipeline.syncOperations.addHandler(sslHandler, position: .first)
             // Step 6: a fresh decoder above it.
             try context.pipeline.syncOperations.addHandler(
@@ -567,6 +642,8 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
             context.channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { [weak self] error in
                 self?.fail(context: boundContext.value, .connectionFailed(error))
             }
+        } catch let error as SMTPError {
+            fail(context: context, error)
         } catch {
             fail(context: context, .connectionFailed(error))
         }
@@ -627,12 +704,4 @@ final class SMTPBootstrapHandler: ChannelDuplexHandler, RemovableChannelHandler,
         context.writeAndFlush(Self.wrapOutboundOut(.line(line)), promise: nil)
     }
 
-    /// The EHLO identity used for the narrow pre-STARTTLS capability probe
-    /// only. Phase B's real EHLO (issued post-bootstrap) uses the caller's
-    /// actual configured EHLO hostname (plan §7's "no configurable
-    /// EHLO/HELO hostname" gap) -- this probe's own identity doesn't matter
-    /// since its only purpose is discovering whether STARTTLS is
-    /// advertised, and its capabilities are discarded, never reused past
-    /// the upgrade.
-    private static let probeHostname = "localhost"
 }

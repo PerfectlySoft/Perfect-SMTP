@@ -322,6 +322,10 @@ public struct SMTPMailer: Sendable {
                         sourceExhausted = true
                         return false
                     }
+                    // Cancellation can land while `iterator.next()` is
+                    // suspended; don't start a send for a message pulled
+                    // after the consumer went away.
+                    guard !Task.isCancelled else { return false }
                     group.addTask {
                         do {
                             let sent = try await mailer.send(message, envelopeFrom: envelopeFrom)

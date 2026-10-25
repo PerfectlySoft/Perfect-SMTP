@@ -85,9 +85,12 @@ public actor DirectMXRetryQueue {
         /// `DirectMXTransport.send` itself before anything is ever
         /// enqueued here, counts as attempt 1) before a still-transiently-
         /// failing entry becomes `.expired` instead of being rescheduled
-        /// again. Default 10 -- generous headroom given `maxAge` below is
-        /// the primary ceiling in practice (a 15-minute 421 backoff alone
-        /// would only reach ~2.5 hours after 10 attempts).
+        /// again. Default 50. Release review: the old default of 10, with a
+        /// flat 5-minute greylist-class delay, gave up after about 50
+        /// minutes. With the exponential schedule (`RetryBackoffPolicy
+        /// .delay(for:attempt:)`, capped at 4 hours) about 35 attempts span
+        /// `maxAge`'s 5 days (about 39 with every delay at jitter's low end), so 50
+        /// leaves `maxAge` as the real cutoff.
         public var maxAttempts: Int
         /// Maximum wall-clock age (measured from the *first* time a given
         /// recipient's delivery was queued for retry, not from the most
@@ -119,7 +122,7 @@ public actor DirectMXRetryQueue {
 
         public init(
             backoff: RetryBackoffPolicy = .init(),
-            maxAttempts: Int = 10,
+            maxAttempts: Int = 50,
             maxAge: TimeInterval = 5 * 24 * 3600,
             maxTotalEntries: Int = 10_000
         ) {
@@ -548,12 +551,19 @@ public actor DirectMXRetryQueue {
                 } else if configuration.isPastCeiling(attempt: nextAttemptNumber, firstQueuedAt: entry.firstQueuedAt) {
                     await reportTerminal(DeliveryResult(recipient: result.recipient, outcome: .expired(attempts: nextAttemptNumber, last: last)))
                 } else {
+                    // The redelivery's own classification doesn't know the
+                    // entry's history (it always says attempt 1), so the
+                    // schedule is applied here, from the real attempt
+                    // number.
+                    _ = nextAttempt
+                    let delay = configuration.backoff.delay(for: last, attempt: nextAttemptNumber)
+                    let scheduled = Date().addingTimeInterval(delay)
                     let rescheduled = Entry(
                         id: UUID(), recipients: [result.recipient], mailFrom: entry.mailFrom, message: entry.message,
-                        nextAttempt: nextAttempt, attempt: nextAttemptNumber, last: last, firstQueuedAt: entry.firstQueuedAt
+                        nextAttempt: scheduled, attempt: nextAttemptNumber, last: last, firstQueuedAt: entry.firstQueuedAt
                     )
                     entries[rescheduled.id] = rescheduled
-                    nudgeLoop(forCandidate: nextAttempt)
+                    nudgeLoop(forCandidate: scheduled)
                 }
             }
         }

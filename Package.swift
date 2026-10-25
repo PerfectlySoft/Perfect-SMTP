@@ -11,14 +11,28 @@ let package = Package(
         .library(name: "PerfectSMTP", targets: ["PerfectSMTP"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
-        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
-        // Pinned to an exact version, not `from:` — `_CryptoExtras` (needed
-        // for RSA-SHA256 DKIM signing) is an underscore-prefixed, semi-
-        // stable SPI module per plan §4.6, so an unpinned range risks a
-        // silent behavior/API change under this SPI on a routine update.
-        .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.1"),
+        // 2.86.0: the library itself needs 2.75.0 (`syncOperations
+        // .removeHandler(context:)`); the tests need 2.86.0, the first
+        // release whose `EmbeddedChannel` accepts the `autoRead` option.
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0"),
+        // 2.31.0: the first release with the public `peerCertificate`,
+        // which the DNS-subjectAltName check reads after the handshake.
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.31.0"),
+        // Already in the graph through swift-crypto 4 (which requires
+        // 1.2.0); declared for the subjectAltName parser.
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.2.0"),
+        // 1.5.4: 1.5.0-1.5.3 don't compile on Linux with Swift 6.2+
+        // (`localtime` returns an optional there).
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.4"),
+        // A range, not an exact pin: an exact pin in a library makes
+        // resolution fail for any app that also needs a different
+        // swift-crypto. `_CryptoExtras` is underscore-prefixed, but the only
+        // part used here (`_RSA.Signing` PEM/DER init, `keySizeInBits`,
+        // PKCS#1 v1.5 sign/verify) is unchanged across 4.x; 4.0.0 and 4.5.2
+        // are built and tested on macOS and Linux. 3.x is excluded: on
+        // Linux its `Curve25519.Signing.PrivateKey` isn't `Sendable`, so
+        // `SigningKey` doesn't compile (3.4.0+ does build on macOS).
+        .package(url: "https://github.com/apple/swift-crypto.git", "4.0.0"..<"5.0.0"),
     ],
     targets: [
         // Foundation + Crypto/_CryptoExtras only. No NIO import — value
@@ -55,8 +69,10 @@ let package = Package(
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
                 .product(name: "NIOTLS", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
             ],

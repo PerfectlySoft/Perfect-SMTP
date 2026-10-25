@@ -65,6 +65,10 @@ public struct DKIMSigner: Sendable, MessageSigner {
         /// directly from a key parsed some other way, bypassing that
         /// convenience initializer entirely.
         case rsaKeyTooSmall(bits: Int)
+        /// `domain` (the `d=` tag) isn't an LDH hostname.
+        case invalidDomain(String)
+        /// `selector` (the `s=` tag) isn't one or more LDH labels.
+        case invalidSelector(String)
     }
 
     let domain: String
@@ -175,6 +179,10 @@ public struct DKIMSigner: Sendable, MessageSigner {
         // construction time rather than at the point of use.
         self.domain = try HeaderEncoder.rejectHeaderInjection(domain, field: "domain")
         self.selector = try HeaderEncoder.rejectHeaderInjection(selector, field: "selector")
+        // RFC 6376 §3.5: `d=` is a domain name and `s=` a sequence of
+        // sub-domains; both end up in a DNS query (`s._domainkey.d`).
+        guard AddressSyntax.isHostname(domain) else { throw ConfigurationError.invalidDomain(domain) }
+        guard AddressSyntax.isHostname(selector) else { throw ConfigurationError.invalidSelector(selector) }
         self.signedHeaders = signedHeaders
         self.canon = canon
         self.keys = keys
@@ -262,8 +270,17 @@ public struct DKIMSigner: Sendable, MessageSigner {
             // explicit tag would be redundant. `i=` (the Agent or User
             // Identifier) is essentially unused outside third-party-signer
             // / ADSP-era configurations this signer doesn't target.
-            let tagPrefix = "v=1; a=\(key.algorithm.tagValue); c=\(canon.header.rawValue)/\(canon.body.rawValue); " +
-                "d=\(domain); s=\(selector); t=\(timestamp); h=\(hTagValue); bh=\(bh); b="
+            // Folded (release review: h= and b= made the header several
+            // hundred octets long). FWS is allowed after every ';' and ':'
+            // in the tag list (RFC 6376 §3.2, §3.5 h=), and the folded form
+            // is what gets hashed, so simple and relaxed canonicalization
+            // both see exactly what is sent.
+            let tagPrefix = HeaderFolding.fold(
+                name: "DKIM-Signature",
+                value: "v=1; a=\(key.algorithm.tagValue); c=\(canon.header.rawValue)/\(canon.body.rawValue); " +
+                    "d=\(domain); s=\(selector); t=\(timestamp); h=\(hTagValue); bh=\(bh); b=",
+                insertingBreaksAfter: [UInt8(ascii: ":")]
+            )
             let hashInput = DKIMSigningInput.headerHashInput(
                 actualHeaders: message.headers,
                 hNames: hNames,
@@ -271,10 +288,29 @@ public struct DKIMSigner: Sendable, MessageSigner {
                 dkimSignatureHeaderValue: tagPrefix
             )
             let signatureBase64 = try key.sign(hashInput)
-            dkimHeaders.append(("DKIM-Signature", tagPrefix + signatureBase64))
+            // b= is removed whole (with its whitespace) before verifying
+            // (RFC 6376 §3.7), so it can be folded freely after signing.
+            dkimHeaders.append(("DKIM-Signature", Self.appendFolded(signatureBase64, to: tagPrefix)))
         }
 
         return RFC5322Message(headers: dkimHeaders + message.headers, body: message.body)
+    }
+
+    /// Appends `base64` to `prefix` (which ends in `b=`), breaking it with
+    /// folding whitespace so no line passes 78 octets.
+    static func appendFolded(_ base64: String, to prefix: String) -> String {
+        let lastLine = prefix.utf8.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false).last.map(\.count) ?? 0
+        var result = prefix
+        var remaining = Substring(base64)
+        var room = max(1, HeaderFolding.recommendedLineLength - lastLine - (prefix.contains("\r\n") ? 0 : "DKIM-Signature: ".count))
+        while !remaining.isEmpty {
+            let chunk = remaining.prefix(room)
+            result += chunk
+            remaining = remaining.dropFirst(chunk.count)
+            if !remaining.isEmpty { result += "\r\n " }
+            room = HeaderFolding.recommendedLineLength - 1
+        }
+        return result
     }
 
     /// DMARC-alignment lint (plan §4.6): exposed as a pure data check, no

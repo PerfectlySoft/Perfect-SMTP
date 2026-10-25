@@ -244,6 +244,23 @@ struct BugRegressionTests {
         }
     }
 
+    // `InlineResource.contentID` is embedded raw into the inline part's
+    // `Content-ID` header, the same shape as `inlineResource.contentType`
+    // above. Every CR/LF form must be rejected, with or without a filename.
+    @Test(arguments: ["img1\r\nX-Injected-CID: yes", "img1\nX-Injected-CID: yes", "img1\rX-Injected-CID: yes", "img1\r\n\r\nbody"])
+    func inlineResourceContentIDCRLFInjectionAttemptIsRejected(contentID: String) {
+        for filename in [nil, "logo.png"] {
+            var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+            message.htmlBody = "<p><img src=\"cid:img1\"></p>"
+            message.inlineImages = [
+                InlineResource(contentID: contentID, filename: filename, contentType: "image/png", data: Data([0, 1, 2])),
+            ]
+            #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("inlineResource.contentID")) {
+                _ = try MIMEComposer(message).compose()
+            }
+        }
+    }
+
     // MARK: - Bug #1 class, new vector: bodyContentTypeOverride CRLF injection
     //
     // `bodyContentTypeOverride` (added for the LassoPerfectSMTP
@@ -295,5 +312,43 @@ struct BugRegressionTests {
         // As with finding #5: there is no serialized message to inspect --
         // composition throwing before producing one is itself the
         // assertion that no live extra header was ever embedded.
+    }
+}
+
+/// Release review: extra-header names that aren't RFC 5322 field names
+/// used to get past `forbiddenExtraHeaderNames` -- `"Bcc:secret@victim"`
+/// was emitted as a `Bcc:` header and `"To "` as a second `To:`.
+struct ExtraHeaderNameTests {
+    private func message(extraName: String, value: String = "x") -> EmailMessage {
+        var message = EmailMessage(from: EmailAddress(address: "ops@example.com"))
+        message.to = [EmailAddress(address: "user@example.com")]
+        message.textBody = "hi"
+        message.extraHeaders = [(extraName, value)]
+        return message
+    }
+
+    @Test(arguments: ["Bcc:secret@victim.test", "To ", " To", "From:attacker@evil.test", "Content-Type:text/html", "X-Ünicode", "", "X A", "X\tA"])
+    func aNameThatIsNotAFieldNameIsRejected(name: String) {
+        #expect(throws: (any Error).self) { _ = try MIMEComposer(message(extraName: name)).compose() }
+        do {
+            _ = try MIMEComposer(message(extraName: name)).compose()
+        } catch let error as MIMEComposer.ComposerError {
+            #expect(error == .invalidHeaderName(name) || error == .invalidHeaderValue(name))
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+    }
+
+    @Test(arguments: ["X-Mailer", "List-Id", "X-Custom.Header_1", "X-~!#$%&'*+"])
+    func aValidFieldNameIsAccepted(name: String) throws {
+        let composed = try MIMEComposer(message(extraName: name, value: "v")).compose()
+        #expect(composed.headers.contains { $0.name == name && $0.value == "v" })
+    }
+
+    @Test(arguments: ["v\u{2028}Bcc: x", "v\u{2029}x", "v\u{85}Bcc: x", "v\u{9B}x"])
+    func aValueWithAUnicodeLineBreakOrC1ControlIsRejected(value: String) {
+        #expect(throws: MIMEComposer.ComposerError.invalidHeaderValue("X-A")) {
+            _ = try MIMEComposer(message(extraName: "X-A", value: value)).compose()
+        }
     }
 }

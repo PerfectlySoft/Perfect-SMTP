@@ -232,10 +232,11 @@ struct DKIMSignerTests {
     /// instead do a proper tag-list parse; this shortcut is sufficient for
     /// a same-process round-trip test.
     private static func splitOffSignature(_ headerValue: String) throws -> (tagPrefix: String, signatureBase64: String) {
-        let marker = "; b="
-        let range = try #require(headerValue.range(of: marker))
+        // The header is folded; the signature is everything after the last
+        // "b=", with its folding whitespace removed.
+        let range = try #require(headerValue.range(of: "b=", options: .backwards))
         let tagPrefix = String(headerValue[..<range.upperBound])
-        let signatureBase64 = String(headerValue[range.upperBound...])
+        let signatureBase64 = String(headerValue[range.upperBound...]).filter { !$0.isWhitespace }
         return (tagPrefix, signatureBase64)
     }
 

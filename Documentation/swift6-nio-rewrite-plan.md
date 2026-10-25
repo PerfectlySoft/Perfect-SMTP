@@ -1,7 +1,7 @@
 # Perfect-SMTP Swift 6.2 / SwiftNIO Rewrite — Plan
 
 Date: 2026-07-18
-Status: **Planned, reviewed, not yet implemented.** This document is the actionable output of a design → architecture → parallel expert review cycle (application architect, Swift-concurrency expert, SMTP-protocol/adversarial reviewer). No code has been written yet. All work described here happens on feature branches, never directly on `master`.
+Status: **Implemented; shipped in 6.0.0. Kept as design history.** Source comments cite this plan's sections ("plan §4.3") for the reasoning behind a choice, so it stays here unedited. Several review passes changed the final API after it was written: for how the shipped code actually behaves, read [the user guide](user-guide.md) and the README, not this plan. Original status, as written: *Planned, reviewed, not yet implemented.* This document is the actionable output of a design → architecture → parallel expert review cycle (application architect, Swift-concurrency expert, SMTP-protocol/adversarial reviewer). No code has been written yet. All work described here happens on feature branches, never directly on `master`.
 
 ## 1. Why this library needs a full rewrite, not a modernization pass
 

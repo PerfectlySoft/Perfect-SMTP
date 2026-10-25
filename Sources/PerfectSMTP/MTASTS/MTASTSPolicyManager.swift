@@ -200,8 +200,9 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         /// `id` hasn't changed before continuing to trust the cached
         /// policy body.
         public var idRecheckInterval: TimeInterval
-        /// FIX D (protocol review, option (a)): mirrors `DirectMXConfig
-        /// .allowPrivateAddresses` for the MTA-STS HTTPS fetch target --
+        /// Governs the optional `addressResolver` pre-check only; the
+        /// default `NIOMTASTSHTTPFetcher` has its own flag. Mirrors
+        /// `DirectMXConfig.allowPrivateAddresses` for the MTA-STS fetch --
         /// `false` (filtering on) by default, since the same "attacker
         /// controls the recipient domain" threat model
         /// `DirectMXConfig`'s own doc comment describes applies equally to
@@ -230,13 +231,11 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// codebase for the same reason: a real MTA-STS policy file (a handful
     /// of `key: value` lines, at most a few dozen `mx:` patterns) is never
     /// remotely close to this size, so the cap is pure DoS hardening with
-    /// no legitimate-policy cost. Enforced post-fetch (see
-    /// `fetchAndParsePolicy(domain:)`) -- `URLSession.data(for:)` gives no
-    /// clean hook to abort mid-stream at a byte cap, so this doesn't stop
-    /// the oversized bytes from being received, but it does guarantee an
-    /// oversized response is never parsed, cached, or acted upon, which is
-    /// the protection that actually matters here.
-    static let maximumPolicyResponseSizeBytes = 64 * 1024
+    /// no legitimate-policy cost. The default `NIOMTASTSHTTPFetcher`
+    /// enforces it while streaming (and rejects a larger `Content-Length` up front), so
+    /// an endless body is never buffered; `fetchAndParsePolicy(domain:)`
+    /// checks it again for any other `MTASTSHTTPFetching` implementation.
+    public static let maximumPolicyResponseSizeBytes = 64 * 1024
 
     private var cache: [String: CachedPolicy] = [:]
     private let dnsResolver: any TXTResolving
@@ -265,15 +264,18 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
     /// always uses `Date.init` (the real wall clock).
     private let now: @Sendable () -> Date
 
-    /// - Parameter addressResolver: FIX D (protocol review, option (a)) --
-    ///   see the stored property's own doc comment. `nil` by default
-    ///   (purely additive opt-in, matching `DirectMXTransport
-    ///   .mtaSTSPolicyProvider`'s identical shape) -- pass a `DNSResolver`
-    ///   (or any other `MTASTSAddressResolving` conformance) to enable
-    ///   SSRF-class filtering of the MTA-STS HTTPS fetch target.
+    /// - Parameter httpFetcher: Defaults to `NIOMTASTSHTTPFetcher()`, which
+    ///   resolves the policy host itself, refuses non-routable addresses,
+    ///   dials only a vetted address and caps the body. To allow private
+    ///   addresses with it, pass `NIOMTASTSHTTPFetcher(allowPrivateAddresses:
+    ///   true)`; `Configuration.allowPrivateAddresses` only governs the
+    ///   pre-check below.
+    /// - Parameter addressResolver: An extra pre-check for custom fetchers
+    ///   that can't vet addresses themselves (see the stored property's doc
+    ///   comment). `nil` by default; the default fetcher doesn't need it.
     public init(
         dnsResolver: any TXTResolving,
-        httpFetcher: any MTASTSHTTPFetching = URLSessionMTASTSFetcher(),
+        httpFetcher: any MTASTSHTTPFetching = NIOMTASTSHTTPFetcher(),
         addressResolver: (any MTASTSAddressResolving)? = nil,
         configuration: Configuration = .init()
     ) {
@@ -514,20 +516,14 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
             throw MTASTSDiscoveryError.fetchFailed
         }
 
-        // FIX D (protocol review, option (a)): pre-check the fetch target's
-        // resolved addresses against `DNSAddress.isRoutable` before ever
-        // attempting the HTTPS fetch -- mirrors `DirectMXTransport
-        // .makeDialer`'s identical treatment of the direct-MX dial path.
-        // A no-op (as before this fix) when `addressResolver` is `nil` --
-        // see that stored property's doc comment for why this is an
-        // opt-in dependency rather than a forced one. This is a refusal-
-        // to-attempt gate, not a pinned-address dial: it doesn't force
-        // `URLSession` to connect to a specific pre-resolved address (not
-        // practical to do cleanly with `URLSession`'s own connection
-        // establishment) -- it just declines to even try the fetch when
-        // every address this hostname resolves to is private/reserved,
-        // which closes most of the practical SSRF risk without fighting
-        // `URLSession` internals.
+        // Address vetting. The default `NIOMTASTSHTTPFetcher` resolves the
+        // policy host once, filters the addresses with
+        // `DNSAddress.isRoutable` and dials a vetted one itself, so the
+        // address checked is the address used. This optional pre-check is
+        // for a custom `httpFetcher` that can't do that: with an
+        // `addressResolver`, the fetch is refused when every address the
+        // host resolves to is private or reserved (it can't stop that
+        // fetcher from resolving differently afterwards).
         if let addressResolver, !configuration.allowPrivateAddresses {
             let resolvedAddresses: [DNSAddress]
             do {
@@ -543,6 +539,10 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         let response: MTASTSHTTPResponse
         do {
             response = try await httpFetcher.fetch(url: url)
+        } catch MTASTSHTTPFetchError.responseTooLarge {
+            throw MTASTSDiscoveryError.responseTooLarge
+        } catch MTASTSHTTPFetchError.noPermittedAddress {
+            throw MTASTSDiscoveryError.addressFilteredAsPrivate
         } catch {
             throw MTASTSDiscoveryError.fetchFailed
         }
@@ -550,13 +550,9 @@ public actor MTASTSPolicyManager: MTASTSPolicyProviding {
         guard let contentType = response.contentType,
               contentType.lowercased().hasPrefix("text/plain")
         else { throw MTASTSDiscoveryError.invalidContentType }
-        // FIX C (protocol review): RFC 8461 §3.3 SHOULD, 64KB -- see
-        // `maximumPolicyResponseSizeBytes`'s doc comment. Checked after the
-        // full body is already buffered by `httpFetcher.fetch(url:)` (see
-        // that property's doc comment for why this codebase doesn't try to
-        // abort `URLSession` mid-stream), but before the body is ever
-        // decoded/parsed/cached/acted upon, which is the protection that
-        // actually matters.
+        // RFC 8461 §3.3 SHOULD, 64 KiB (see `maximumPolicyResponseSizeBytes`).
+        // The default fetcher stops reading at the cap; this re-check covers
+        // custom fetchers before anything is parsed or cached.
         guard response.body.count <= Self.maximumPolicyResponseSizeBytes else {
             throw MTASTSDiscoveryError.responseTooLarge
         }

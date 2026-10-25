@@ -119,9 +119,11 @@ struct SMTPMailerDKIMIntegrationTests {
         // ...and the DKIM-Signature's own `h=` tag must list its name,
         // proving it's actually covered by the signature, not just
         // present alongside it.
-        let dkimLine = try #require(headerBlock.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
-        let hTag = try #require(dkimLine.components(separatedBy: "; ").first { $0.hasPrefix("h=") })
-        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.lowercased() }
+        // Unfold first: the DKIM-Signature header is folded.
+        let unfolded = headerBlock.replacingOccurrences(of: "\r\n ", with: " ").replacingOccurrences(of: "\r\n\t", with: " ")
+        let dkimLine = try #require(unfolded.components(separatedBy: "\r\n").first { $0.hasPrefix("DKIM-Signature:") })
+        let hTag = try #require(dkimLine.components(separatedBy: ";").map { $0.trimmingCharacters(in: .whitespaces) }.first { $0.hasPrefix("h=") })
+        let signedNames = hTag.dropFirst("h=".count).split(separator: ":").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
         #expect(signedNames.contains("x-campaign-id"))
     }
 
@@ -141,8 +143,8 @@ struct SMTPMailerDKIMIntegrationTests {
 
     @Test func misalignedDKIMDomainLogsAWarningButStillSendsSuccessfully() async throws {
         let capture = CapturingTransport()
-        let logHandler = CapturingLogHandler()
-        var logger = Logger(label: "test.dkim.alignment") { _ in logHandler }
+        let (logHandler, logHandlerFactory) = makeCapturingLogHandler(CapturingLogHandlerMaker.self)
+        var logger = Logger(label: "test.dkim.alignment", factory: logHandlerFactory)
         logger.logLevel = .trace
         let signer = try DKIMSigner(
             domain: "third-party-esp.example",
@@ -203,6 +205,15 @@ private final class CapturingLogHandlerStorage: @unchecked Sendable {
     }
 }
 
+///
+/// swift-log 1.11 added `LogHandler.log(event:)` and deprecated the flat
+/// `log(level:message:...)` requirement this handler implements, but the
+/// package supports swift-log back to 1.5.0, which has no `LogEvent` type.
+/// To build warning-free against both, the handler is marked deprecated
+/// (which silences the "deprecated default implementation" diagnostic on
+/// its conformance) and is only ever constructed through a protocol
+/// requirement, so no call site names the deprecated type directly.
+@available(*, deprecated, message: "Test-only; see the comment above.")
 private struct CapturingLogHandler: LogHandler {
     let storage = CapturingLogHandlerStorage()
     var metadata: Logger.Metadata = [:]
@@ -222,4 +233,22 @@ private struct CapturingLogHandler: LogHandler {
         guard level == .warning else { return }
         storage.record(message.description)
     }
+}
+
+private protocol CapturingLogHandlerMaking {
+    static func make() -> (storage: CapturingLogHandlerStorage, factory: @Sendable (String) -> any LogHandler)
+}
+
+private enum CapturingLogHandlerMaker: CapturingLogHandlerMaking {
+    @available(*, deprecated, message: "Test-only; see CapturingLogHandler.")
+    static func make() -> (storage: CapturingLogHandlerStorage, factory: @Sendable (String) -> any LogHandler) {
+        let handler = CapturingLogHandler()
+        return (handler.storage, { _ in handler })
+    }
+}
+
+private func makeCapturingLogHandler<Maker: CapturingLogHandlerMaking>(
+    _ maker: Maker.Type
+) -> (storage: CapturingLogHandlerStorage, factory: @Sendable (String) -> any LogHandler) {
+    maker.make()
 }

@@ -92,6 +92,12 @@ A few things worth calling out:
   (`jane@dest.com`), stored separately so the header encoder can apply RFC
   2047 encoding to the display name without ever touching the address
   itself.
+  The address has to be a plain mailbox (`local@domain`: a dot-atom local
+  part, and an LDH domain or an `[address literal]`), checked by
+  `AddressSyntax`. Quoted local parts, `<`, `>`, whitespace and control
+  characters are refused, and so are non-ASCII addresses: SMTPUTF8 isn't
+  implemented yet, so convert an internationalized domain to its A-label
+  (`xn--...`) form first.
 - **`bcc:` is a parameter of `send`, not a field on `EmailMessage`.** This
   is a deliberate structural fix (see
   [Migrating](#migrating-from-the-old-perfect-smtp)): Bcc addresses become
@@ -141,7 +147,17 @@ freshly-dialed connection once and reusing it across sends. `tls` is a
 `.startTLS` (explicit upgrade, typically port 587 — mandatory once
 requested: if the server doesn't advertise STARTTLS, the connection fails
 rather than silently continuing in plaintext), or `.implicit` (TLS from the
-first byte, typically port 465).
+first byte, typically port 465). Both TLS modes verify the server's
+certificate chain, and for a relay reached by name the certificate must
+carry a DNS subjectAltName for it (an IP-address SAN for the dialed
+address is not enough), so someone who can redirect the relay's DNS
+can't collect credentials with an IP certificate.
+
+`tls: .none` together with `auth` is refused: `send` throws
+`RelayTransportError.authenticationRequiresTLS` before opening a
+connection, so credentials are never sent in cleartext by accident. For a
+relay you trust (a loopback MTA, a MailHog/smtp4dev test server that wants
+AUTH), opt in with `allowsAuthenticationWithoutTLS: true`.
 
 ### `LocalMTATransport`
 
@@ -229,6 +245,12 @@ just-expired token.
 `SASLCramMD5`/`SASLScramSHA256` are not implemented (deliberately deferred,
 per the rewrite plan).
 
+AUTH is only sent over TLS unless you set
+`RelayConfig.allowsAuthenticationWithoutTLS` (see
+[`RelayTransport`](#relaytransport)). `RelayConfig.Auth`, `SASLPlain` and
+`SASLLogin` print redacted descriptions, so logging a configuration never
+prints the password.
+
 ## DKIM signing
 
 ```swift
@@ -299,20 +321,20 @@ doesn't apply to them.
 **`DirectMXTLSPolicy`** controls what TLS `DirectMXTransport` attempts
 against each resolved host:
 
-- **`.opportunistic`** (the default): try `.startTLS` first — a real,
-  mandatory-verified handshake, same as `.startTLS` always is in this
-  library. If the server's EHLO simply doesn't advertise STARTTLS at all,
-  retry the *same host* in plaintext rather than treating it as
-  unreachable. Important nuance: a **genuine certificate/handshake
-  failure does not fall back to plaintext** — this library's STARTTLS
-  buffer-discipline fencing (the defense against the CVE-2026-41319-class
-  injection attack) deliberately can't distinguish "an attacker injected
-  bytes during the upgrade" from "the certificate is merely
-  misconfigured," so both are treated as the more dangerous case and the
-  connection to that host fails outright. The plaintext fallback only
-  ever fires when the peer doesn't offer STARTTLS at all.
+- **`.opportunistic`** (the default): try `.startTLS` first, with full
+  certificate verification. If that fails, retry the *same host* in
+  plaintext: when the server doesn't advertise STARTTLS, answers it with
+  an error such as `454`, the handshake fails, or the certificate doesn't
+  verify (`SMTPError.tlsCertificateInvalid`). Someone able to break TLS on
+  the path could force plaintext anyway by stripping STARTTLS, so this
+  costs nothing and keeps mail flowing to the many MX hosts with
+  self-signed certificates. There is **no** plaintext retry after detected
+  STARTTLS injection (`.starttlsInjection`) or with the host's circuit
+  breaker open (it might have opened because of injections); delivery
+  moves on to the next MX host instead.
 - **`.fixed(TLSMode)`**: every host gets exactly the `TLSMode` you specify,
-  uniformly, with no opportunistic fallback and (crucially) **no MTA-STS
+  uniformly, with no opportunistic fallback (`.fixed(.startTLS)` is how to
+  require TLS for every host) and (crucially) **no MTA-STS
   involvement at all**, even for a domain that publishes an `enforce`
   policy. This is the explicit escape hatch for full manual control.
 
@@ -339,24 +361,39 @@ policy per domain (in-memory only — nothing here persists across process
 restarts), and `DirectMXTransport` applies it automatically:
 
 - **`mode: enforce`** — only MX hosts matching the policy's `mx:` patterns
-  are ever dialed, mandatory STARTTLS only. If none match, or every
-  matching host fails, the whole domain hard-fails immediately (a
-  `550 5.7.1` permanent failure) — it never silently falls back to a
-  non-matching host or to plaintext.
-- **`mode: testing`** — the same policy-matched, mandatory-TLS attempt runs
-  first, but a failure never blocks delivery: it falls through to the
+  are ever dialed, mandatory STARTTLS only, and the certificate must carry
+  a DNS subjectAltName for the MX host (an IP-address SAN alone isn't
+  accepted). If none match, or every matching host fails, nothing is
+  delivered now: the recipients get a temporary `451 4.7.5` and are queued
+  for retry (RFC 8461 §5), never a fallback to a non-matching host or to
+  plaintext.
+- **`mode: testing`** — the same policy-matched, mandatory-TLS,
+  DNS-name-checked attempt runs first, but a failure never blocks delivery: it falls through to the
   ordinary opportunistic path across all resolved hosts (RFC 8461 §5 —
   testing mode must never block delivery).
 - **No policy for the domain, or `mode: none`** — identical to not having
   configured a provider at all: plain opportunistic delivery per
   `tlsPolicy`.
 
-MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above: the
-HTTPS policy-file fetch target is address-checked the same way when you
-pass `addressResolver` to `MTASTSPolicyManager.init` (as in the example
-above), since the fetch hostname (`mta-sts.<domain>`) is just as
-attacker-influenceable as an MX record when the recipient domain isn't
-fully trusted.
+The policy fetch is bounded as a whole. `NIOMTASTSHTTPFetcher` (the
+default `httpFetcher`, a small HTTP/1.1 client on SwiftNIO with full
+certificate verification) gives up after `timeout` seconds (default 60)
+from connect to the last body byte (`MTASTSHTTPFetchError.timedOut`), and
+stops reading past 64 KiB of body (`.responseTooLarge`). A slow or endless
+policy host therefore can't hold up delivery to its domain or exhaust
+memory. Redirects are never followed (RFC 8461 §3.3).
+`URLSessionMTASTSFetcher` is the alternative if you need `URLSession`'s
+configuration (proxies, for example), but on Linux its size cap can't stop
+corelibs Foundation from buffering an endless body.
+
+MTA-STS's SSRF-safety story mirrors `allowPrivateAddresses` above, and is
+on by default: `NIOMTASTSHTTPFetcher` resolves `mta-sts.<domain>` once,
+refuses non-routable addresses, and connects to a vetted address (with
+the name in SNI and `Host`), since the fetch hostname is just as
+attacker-influenceable as an MX record. The policy host's certificate
+must carry a DNS subjectAltName for it. Passing `addressResolver` to
+`MTASTSPolicyManager.init` (as in the example above) adds the same check
+for a custom fetcher.
 
 DANE/TLSA is explicitly out of scope for this rewrite (deferred per the
 plan) — MTA-STS is the only policy mechanism implemented.
@@ -431,8 +468,8 @@ message.autoSubmitted = .autoGenerated
 ```
 
 **`List-Unsubscribe`/`List-Unsubscribe-Post`** (RFC 8058) are no longer
-optional for bulk mail: Gmail and Yahoo have enforced this — rejecting
-mail outright that doesn't have it — for bulk senders since November 2025.
+optional for bulk mail: Gmail and Yahoo have required them from bulk
+senders since February 2024.
 `ListUnsubscribe.url`, if set, **must be `https://`** — RFC 8058 §3.1
 requires it, and `MIMEComposer` enforces this unconditionally (not just
 when `postOneClick` is set), throwing
@@ -477,12 +514,14 @@ Every `DeliveryResult.Outcome` case, in plain language:
   never auto-retried (retrying here risks double delivery); surfaced so
   you can decide what's appropriate for your application (log it,
   alert on it, leave it for manual review).
-- **`.failed(any Error & Sendable)`** — a transport-level or pre-flight
-  failure with no `SMTPReply` at all: a connection/timeout error, a
-  DKIM/compose failure, a circuit-breaker rejection, or (for the batch
-  `send` overloads specifically) one message's own thrown failure, mapped
-  to this case per its would-be recipients so it doesn't take down the
-  rest of the batch.
+- **`.failed(any Error & Sendable)`** — a failure with no `SMTPReply` that
+  retrying won't fix: a DKIM/compose failure, an invalid address, a host
+  name that doesn't exist, addresses filtered as private, or (for the
+  batch `send` overloads specifically) one message's own thrown failure,
+  mapped to this case per its would-be recipients so it doesn't take down
+  the rest of the batch. `RelayTransport` and `LocalMTATransport` also
+  report connection errors this way; `DirectMXTransport` classifies those
+  as temporary (below).
 
 **Automatic retry is a `DirectMXTransport`-only feature.** Every transport
 classifies replies into these outcomes the same way (via the shared
@@ -497,28 +536,50 @@ yourself (re-call `mailer.send` for the `.queuedForRetry` recipients after
 `.queuedForRetry` result from a `send` call is automatically enqueued and
 redelivered in the background on the classified backoff schedule, up to
 that queue's configured expiry/attempt ceiling (at which point the
-recipient's final outcome becomes `.expired`, not silently dropped). If you
+recipient's final outcome becomes `.expired`, not silently dropped).
+
+Following RFC 5321 §4.5.4.1, `DirectMXTransport` treats failing to reach a
+domain as temporary: refused or reset connections, connect and reply
+timeouts, a peer hanging up, an open circuit breaker, TLS failures,
+DNS timeouts or SERVFAIL, and MTA-STS `enforce` violations all become
+`.queuedForRetry` (a synthesized `451 4.4.1` or `451 4.7.5` reply carries
+the cause). A host name that doesn't exist (NXDOMAIN), a null MX, and 5yz
+replies are final.
+
+**The retry schedule** (`RetryBackoffPolicy`): each wait doubles from the
+reply class's base delay (5 minutes for greylisting, `451 4.4.1` and
+`4.7.5`; 15 minutes for `421`; 2 minutes for other 4yz) up to
+`maximumBackoff` (4 hours), with ±10% jitter. A domain that stays down is
+retried at about 5, 10, 20, 40 and 80 minutes, then every 4 hours, until
+`DirectMXRetryQueue.Configuration.maxAge` (5 days); `maxAttempts` (50) is
+only a backstop. The recipient then gets `.expired`.
+
+**The retry queue lives in memory only.** Pending retries are lost when the
+process exits; if you need durability, record `.queuedForRetry` results
+yourself (or deliver through a local MTA with its own spool). If you
 want visibility into a background retry's eventual outcome, pass
 `onTerminalRetryOutcome` to `DirectMXTransport`'s initializer; you can also
 inspect what's still pending via `pendingRetryEntries()`.
 
 ## Testing your integration
 
-`swift test` runs the full suite (323 tests) with zero external
+`swift test` runs the full suite (about 400 tests) with zero external
 dependencies and zero environment variables — including tests that
-exercise a real STARTTLS handshake and a full `DirectMXTransport` delivery
-against an in-process fake SMTP server bound to `127.0.0.1`. None of this
-touches the real network.
+exercise a real STARTTLS handshake, a full `DirectMXTransport` delivery,
+the DNS resolver and the MTA-STS fetcher against in-process fake servers
+bound to `127.0.0.1`. None of it needs the internet or DNS: the 6.0.0
+release checks ran it in Linux containers with no network beyond loopback,
+and CI's `linux-offline` job does the same on every push.
 
 **There is no built-in live-integration test tier against a real SMTP
 server**, despite one being described in the original rewrite plan
 (`Documentation/swift6-nio-rewrite-plan.md` §4.1/§5: an `SMTP_TESTS=1`-
 gated CI job against a MailHog/smtp4dev service container). That tier was
 never implemented — there's no `SMTP_TESTS` (or similarly-named) reference
-anywhere in `Tests/`, and this repository has no `.github/workflows`
-directory at all. If you want to verify your own integration against a
-real (or realistic fake) SMTP server, the straightforward approach is to
-run [MailHog](https://github.com/mailhog/MailHog) or
+anywhere in `Tests/`, and no test is opt-in. If you want to verify your own
+integration against a real (or realistic fake) SMTP server, the
+straightforward approach is to run
+[MailHog](https://github.com/mailhog/MailHog) or
 [smtp4dev](https://github.com/rnwood/smtp4dev) locally and point a
 `RelayTransport` at it:
 

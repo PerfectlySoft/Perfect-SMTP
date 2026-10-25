@@ -2,17 +2,17 @@
 
 <p align="center">
     <a href="https://www.swift.org/" target="_blank">
-        <img src="https://img.shields.io/badge/Swift-6.2-orange.svg?style=flat" alt="Swift 6.2">
+        <img src="https://img.shields.io/badge/Swift-6.2%2B-orange.svg?style=flat" alt="Swift 6.2+">
     </a>
-    <a href="https://developer.apple.com/macos/" target="_blank">
-        <img src="https://img.shields.io/badge/Platforms-macOS%2012%2B-lightgray.svg?style=flat" alt="Platforms macOS 12+">
+    <a href="https://www.swift.org/platform-support/" target="_blank">
+        <img src="https://img.shields.io/badge/Platforms-macOS%2012%2B%20%7C%20Linux-lightgray.svg?style=flat" alt="Platforms macOS 12+ | Linux">
     </a>
     <a href="LICENSE" target="_blank">
         <img src="https://img.shields.io/badge/License-Apache%202.0-lightgrey.svg?style=flat" alt="License Apache 2.0">
     </a>
 </p>
 
-Perfect-SMTP is a from-scratch Swift 6.2 / SwiftNIO SMTP client. It is not a
+Perfect-SMTP is a from-scratch Swift 6 / SwiftNIO SMTP client. It is not a
 wrapper around libcurl or any other mail library — it drives the SMTP wire
 protocol itself, including its own STARTTLS state machine, connection
 pooling, DKIM signing, and MTA-STS policy enforcement.
@@ -22,23 +22,16 @@ hand off to a local MTA like Postfix/sendmail, or resolve MX records and
 deliver directly), so you can pick the one that matches how you already
 operate mail, or let Perfect-SMTP be the terminal MTA itself.
 
-> This is a complete rewrite of the pre-2026 libcurl-based Perfect-SMTP. If
-> you used the old `EMail`/`SMTPClient`/`Recipient` API, see
-> [Migrating from the old Perfect-SMTP](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
-> in the user guide — this is not a drop-in upgrade. The old version is
-> preserved on the [`legacy`](../../tree/legacy) branch.
+> 6.0.0 is a complete rewrite of the libcurl-based Perfect-SMTP 5.x. It is
+> not a drop-in upgrade; see [Migrating from 5.x](#migrating-from-5x). The
+> old code is preserved on the [`legacy`](../../tree/legacy) branch and the
+> `5.0.0` tag.
 
 This package is domain-agnostic by design — it has no Lasso-specific code
-and no Lasso dependency. It is, however, a **core dependency**:
+and no Lasso dependency. It is, however, a **core dependency** of
 [Perfect-Lasso](https://github.com/taplin/Perfect-Lasso) — a Swift
-reimplementation of the Lasso language, still in active development and
-not yet production-ready, though validated against real code from
-multiple production e-commerce sites — depends on this package directly
-to implement its `email_send` tag, which sends real outbound email during
-that validation testing. (There is a separate, unrelated
-in-progress target called `LassoPerfectSMTP` being built *inside* the
-Perfect-Lasso repo on another branch — that is not this package and does not
-depend on it.)
+reimplementation of the Lasso language, still in active development —
+which uses it to implement its `email_send` tag.
 
 ## Features
 
@@ -58,7 +51,7 @@ depend on it.)
   Gmail/Workspace, increasingly required by Microsoft 365).
 - **Deliverability headers** — `List-Unsubscribe`/`List-Unsubscribe-Post`
   (RFC 8058), `Precedence`, `Auto-Submitted` — the headers Gmail and Yahoo
-  have required for bulk senders since November 2025.
+  have required for bulk senders since February 2024.
 - **Bulk/list-server ready** — a bounded-concurrency batch `send` and an
   `AsyncSequence`-based streaming `send` for sending to millions of
   recipients without materializing them all in memory.
@@ -71,21 +64,30 @@ For anything beyond the basics below, see the
 
 ## Requirements
 
-- Swift 6.2 toolchain (`swift-tools-version: 6.2`, `.swiftLanguageMode(.v6)`)
-- macOS 12 or later (`Package.swift` declares `platforms: [.macOS(.v12)]`)
+- Swift 6.2 or later (`swift-tools-version: 6.2`, Swift 6 language mode)
+- macOS 12 or later, or Linux (CI covers Ubuntu 24.04 with Swift 6.2 and 6.4)
+
+iOS, tvOS and watchOS are not supported: this is a server-side package
+(SwiftNIO sockets, and `LocalMTATransport` launches a local `sendmail`).
+
+Dependencies are all Apple/SSWG packages: `swift-nio`, `swift-nio-ssl`,
+`swift-log` and `swift-crypto` (the last for DKIM; any 4.x release, so it
+resolves alongside other packages using swift-crypto 4).
 
 ## Installation
 
-Add the package to your `Package.swift`. No tagged releases exist yet, so pin a branch or a
-specific commit rather than a version range:
+Add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", branch: "main")
+.package(url: "https://github.com/PerfectlySoft/Perfect-SMTP.git", from: "6.0.0")
 ```
 
-and depend on the `PerfectSMTP` product (it re-exports `PerfectSMTPCore`,
-which you only need directly if you want to compose/sign messages without
-sending them):
+It has two products:
+
+| Product | Contents |
+|---|---|
+| `PerfectSMTP` | Everything: the transports (`RelayTransport`, `LocalMTATransport`, `DirectMXTransport`), `SMTPMailer`, the connection pool, the DNS resolver and MTA-STS. Re-exports `PerfectSMTPCore`. |
+| `PerfectSMTPCore` | Message model, MIME composer, header/body encoders and the DKIM signer, with no networking. Depend on it directly only if you compose or sign messages without sending them. |
 
 ```swift
 .target(
@@ -102,8 +104,8 @@ Send one email through an existing SMTP relay (a corporate MTA or an ESP
 like SendGrid/Postmark/SES):
 
 ```swift
-import PerfectSMTP
 import NIOPosix
+import PerfectSMTP
 
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
@@ -128,12 +130,123 @@ for result in results {
     print(result.recipient, result.outcome)
 }
 
+await transport.shutdown()
 try await group.shutdownGracefully()
 ```
+
+`MultiThreadedEventLoopGroup` comes from SwiftNIO's `NIOPosix`, which
+PerfectSMTP already depends on; if your build requires every imported module
+to be a declared dependency, add
+`.package(url: "https://github.com/apple/swift-nio.git", from: "2.86.0")` and
+`.product(name: "NIOPosix", package: "swift-nio")`.
 
 That's it for the basic case. For DKIM signing, direct-MX delivery,
 authentication options, bulk sending, and deliverability headers, see the
 **[user guide](Documentation/user-guide.md)**.
+
+## Security defaults
+
+You get these without configuring anything:
+
+- **TLS certificates are verified.** Every TLS connection (`.startTLS`,
+  `.implicit`, and `DirectMXTransport`'s STARTTLS attempts) uses
+  `TLSConfiguration.makeClientConfiguration()`: full chain verification
+  plus a name check. A relay reached by name, a direct-MX host under an
+  MTA-STS policy, and the MTA-STS policy host must present a DNS
+  subjectAltName for that name: an IP-address SAN alone, which NIOSSL
+  would accept for the dialed address, isn't enough. An IP-literal host is
+  checked against its IP SAN, and opportunistic direct MX without a policy
+  uses NIOSSL's check as is. Only a real IP literal is dialed without
+  SNI; any other name that isn't a valid host name fails before
+  connecting. A failed certificate is reported as
+  `SMTPError.tlsCertificateInvalid`.
+- **`.startTLS` never downgrades.** If the server doesn't advertise
+  `STARTTLS`, or answers it with an error such as `454`, the connection
+  fails instead of continuing in plaintext. Bytes injected around the
+  upgrade (the CVE-2026-41319 class) fail it with `.starttlsInjection`.
+- **No AUTH in cleartext.** A `RelayConfig` with credentials and
+  `tls: .none` throws `RelayTransportError.authenticationRequiresTLS`
+  before dialing. Set `allowsAuthenticationWithoutTLS: true` only for a
+  relay you trust, such as a loopback MTA or a test server.
+- **Strict syntax wherever text reaches the wire.**
+  - Addresses (MAIL FROM, RCPT TO, From/To/Cc/Reply-To/Sender) must be
+    plain `local@domain` mailboxes: a dot-atom local part, and an LDH
+    domain or an `[address literal]`. No quoted local parts, `<`, `>`,
+    whitespace or control characters, so nothing can smuggle an ESMTP
+    parameter or a second mailbox. Non-ASCII addresses are rejected
+    (SMTPUTF8 isn't implemented); pass IDN domains in A-label form.
+  - The EHLO name, TLS server name, DKIM `d=`/`s=` and `messageIDDomain`
+    must be LDH host names.
+  - Extra-header names must be RFC 5322 field names, and the
+    routing-critical names (`Bcc`, `To`, `From`...) are refused.
+  - Header values, message IDs, content types and content IDs are
+    refused if they contain CR, LF, other C0 or C1 controls, or
+    U+2028/U+2029. Subjects and display names have those stripped and
+    are RFC 2047-encoded.
+  - Headers are folded to 78 octets (refused if they can't be kept under
+    998). The DATA payload has its line endings normalized to CRLF and
+    is dot-stuffed. Bcc addresses only ever go into `RCPT TO`.
+- **Every network step has a timeout:** TCP connect (30 s), each SMTP reply
+  including the greeting, EHLO, STARTTLS and the TLS handshake (300 s), the
+  final reply after DATA (600 s), each DNS query (5 s), the whole MTA-STS
+  policy fetch (60 s, and at most 64 KiB of body, enforced while reading),
+  and the `sendmail` process (60 s). All are configurable.
+- **No secrets in logs.** The library logs only the DKIM alignment warning
+  and MTA-STS decisions (domains, hosts, errors), never message bodies or
+  credentials. `RelayConfig.Auth`, `SASLPlain`, `SASLLogin`, `XOAuth2` and
+  `SigningKey` print redacted descriptions, and their mirrors (`dump`, the
+  debugger) hide the secret too.
+- **Direct MX delivery:**
+  - It only dials globally reachable unicast addresses. Every IANA
+    special-purpose IPv4 and IPv6 range is refused (loopback, private,
+    `0.0.0.0/8`, link-local, CGNAT, documentation, benchmarking,
+    multicast, reserved), including IPv4 addresses embedded in mapped,
+    NAT64 and 6to4 IPv6 addresses, unless `allowPrivateAddresses` is set.
+  - DNS answers must match the question, and only records for the asked
+    name count. MX exchanges must be LDH host names, and a null MX
+    anywhere in the set means "no mail".
+  - STARTTLS is opportunistic with no MTA-STS policy: a host that doesn't
+    offer it, answers `454`, or fails the handshake or certificate is
+    retried in plaintext. It is never retried in plaintext after detected
+    injection or with its circuit breaker open, nor under
+    `.fixed(.startTLS)` or an MTA-STS `enforce` policy.
+  - Under an MTA-STS policy (`testing` or `enforce`), the certificate must
+    also carry a DNS subjectAltName for the MX host.
+  - Unreachable hosts, timeouts, TLS failures and DNS timeouts or SERVFAIL
+    are temporary and queued for retry (RFC 5321 §4.5.4.1), as is an
+    MTA-STS `enforce` violation. NXDOMAIN, null MX and 5yz replies are
+    final. Retries back off exponentially (5 minutes doubling to a
+    4-hour cap, with jitter) for up to 5 days. The retry queue is in memory
+    only: pending retries are lost if the process exits.
+
+## Migrating from 5.x
+
+5.x wrapped libcurl through Perfect-CURL: you built an `SMTPClient` with a
+URL and credentials, filled in an `EMail`, and called a blocking
+`send(completion:)`. 6.0.0 shares no types with it, so a port is a rewrite
+of the call site, not a find-and-replace:
+
+| 5.x | 6.0.0 |
+|---|---|
+| `SMTPClient(url: "smtp://host", username:, password:)` | `RelayTransport(config: RelayConfig(host:port:tls:auth:), group:)` |
+| `smtps://` URL | `tls: .implicit` (port 465); `tls: .startTLS` for port 587 |
+| `Recipient(name:address:)` | `EmailAddress(displayName:address:)` |
+| `EMail(client:)` | `EmailMessage(from:)`, sent with `SMTPMailer(transport:).send(_:envelopeFrom:)` |
+| `email.content` / `.html` / `.text` | `message.htmlBody` / `message.textBody` (set both for multipart/alternative) |
+| `email.bcc` | the `bcc:` parameter of `send` (never written to a header) |
+| `email.attachments` (file paths) | `message.attachments` (`Attachment(filename:contentType:data:)`) |
+| `try email.send { code, header, body in }` | `let results = try await mailer.send(...)`, one `DeliveryResult` per recipient |
+
+What changes in behavior: sending is `async`; the envelope sender is
+explicit (`envelopeFrom: .address(...)` or `.null`); STARTTLS is mandatory
+when requested; credentials over a plaintext connection are refused (see
+above); and the 5.x bugs that wrote a `Bcc:` header to every recipient and
+emitted a mislabeled quoted-printable subject are gone. There is no libcurl
+or OpenSSL system dependency any more, so the old `libssl-dev`/`libcurl`
+install notes no longer apply.
+
+The [user guide](Documentation/user-guide.md#migrating-from-the-old-perfect-smtp)
+explains why this is a rewrite rather than an update.
 
 ## Testing
 
@@ -141,21 +254,18 @@ authentication options, bulk sending, and deliverability headers, see the
 swift test
 ```
 
-346 tests (188 in `PerfectSMTPTests`, 158 in `PerfectSMTPCoreTests`) run with
-no external services and no environment variables — this includes tests
-that open real loopback sockets (a STARTTLS handshake and a full DirectMX
-delivery each run against an in-process fake SMTP server on `127.0.0.1`),
-but nothing here talks to the real network or a real mail server.
+The whole suite is hermetic: no environment variables, no internet, no DNS
+and no external mail server. Tests that need sockets (a real STARTTLS
+handshake, a full DirectMX delivery, the DNS resolver, the MTA-STS
+fetcher) run against in-process fake servers on `127.0.0.1`. CI runs it on
+Linux and macOS in debug and release with `-warnings-as-errors`, plus a
+Linux job in a container started with `--network none`.
 
-Note: the original rewrite plan (`Documentation/swift6-nio-rewrite-plan.md`
-§4.1/§5) describes an additional `SMTP_TESTS=1`-gated live-integration tier
-against a MailHog/smtp4dev CI service container. That tier was never built —
-there is no such environment variable referenced anywhere in `Tests/`, and
-this repository has no CI workflow files at all. If you need to verify
-against a real SMTP server, point a `RelayTransport` or `DirectMXTransport`
-at a local MailHog/smtp4dev instance yourself; see
-[Testing your integration](Documentation/user-guide.md#testing-your-integration)
-in the user guide.
+There is no live-integration tier. To check your own setup against a real
+SMTP server, point a `RelayTransport` at a local
+[MailHog](https://github.com/mailhog/MailHog) or
+[smtp4dev](https://github.com/rnwood/smtp4dev) instance; see
+[Testing your integration](Documentation/user-guide.md#testing-your-integration).
 
 ## License
 

@@ -10,6 +10,7 @@
 //  bypass this implementation additionally closes.
 //
 
+import NIOCore
 import Testing
 @testable import PerfectSMTP
 
@@ -134,5 +135,53 @@ struct DNSAddressRoutabilityTests {
         bytes[14] = 8
         bytes[15] = 8
         #expect(DNSAddress.v6(bytes).isRoutable)
+    }
+}
+
+/// Table tests over the IANA IPv4 and IPv6 special-purpose registries.
+struct DNSAddressSpecialPurposeRangeTests {
+    private struct NotIPv6: Error {}
+
+    private static func v6(_ text: String) throws -> DNSAddress {
+        // Parse via NIOCore so the table can be written in normal notation.
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let address = try SocketAddress(ipAddress: text, port: 0)
+        guard case .v6(let v6) = address else { throw NotIPv6() }
+        withUnsafeBytes(of: v6.address.sin6_addr) { raw in for i in 0..<16 { bytes[i] = raw[i] } }
+        return .v6(bytes)
+    }
+
+    private static func v4(_ text: String) -> DNSAddress { .v4(text.split(separator: ".").map { UInt8($0)! }) }
+
+    @Test(arguments: [
+        "0.0.0.0", "0.1.2.3", "10.1.1.1", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.16.0.1",
+        "192.0.0.8", "192.0.2.1", "192.88.99.1", "192.168.1.1", "198.18.0.1", "198.19.255.255",
+        "198.51.100.7", "203.0.113.9", "224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255",
+    ])
+    func ipv4SpecialPurposeAddressesAreNotRoutable(address: String) {
+        #expect(!Self.v4(address).isRoutable)
+    }
+
+    @Test(arguments: ["1.1.1.1", "8.8.8.8", "93.184.216.34", "192.0.1.1", "192.88.98.1", "198.20.0.1", "223.255.255.255", "100.128.0.1"])
+    func ipv4GlobalUnicastAddressesAreRoutable(address: String) {
+        #expect(Self.v4(address).isRoutable)
+    }
+
+    @Test(arguments: [
+        "::", "::1", "::127.0.0.1", "::8.8.8.8", "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:10.0.0.1",
+        "64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b:1::808:808", "100::1", "fc00::1", "fd12:3456::1",
+        "fe80::1", "fec0::1", "ff02::1", "ff0e::1", "2001::1", "2001:2::1", "2001:10::1", "2001:db8::1",
+        "2002:7f00:1::", "2002:a00:1::1", "2002:0:0::1", "3fff::1", "4000::1", "e000::1",
+    ])
+    func ipv6NonGlobalAddressesAreNotRoutable(address: String) throws {
+        #expect(try !Self.v6(address).isRoutable)
+    }
+
+    @Test(arguments: [
+        "2606:4700:4700::1111", "2a00:1450:4001:81a::200e", "2001:4860:4860::8888", "2001:200::1",
+        "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::1",
+    ])
+    func ipv6GlobalUnicastAddressesAreRoutable(address: String) throws {
+        #expect(try Self.v6(address).isRoutable)
     }
 }

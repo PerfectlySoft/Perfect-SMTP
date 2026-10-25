@@ -29,57 +29,85 @@ public enum DNSAddress: Sendable, Hashable {
 }
 
 extension DNSAddress {
-    /// FIX #2 (plan §9 Phase 3 milestone security review, SSRF-class
-    /// filtering): `false` for any address in a private, loopback,
-    /// link-local, unique-local, or carrier-grade-NAT range -- the ranges
-    /// a caller resolving an *untrusted* hostname (e.g. `DirectMXTransport`
-    /// resolving a recipient-controlled domain's MX/A/AAAA records) must
-    /// not blindly dial into. See `DirectMXConfig.allowPrivateAddresses`
-    /// for where this is applied and its documented opt-out.
+    /// `false` for any address that isn't a globally reachable unicast
+    /// address -- the addresses a caller resolving an *untrusted* hostname
+    /// (e.g. `DirectMXTransport` resolving a recipient-controlled domain's
+    /// MX/A/AAAA records) must not dial. See
+    /// `DirectMXConfig.allowPrivateAddresses` for where this is applied and
+    /// its opt-out.
     ///
-    /// Covers, at minimum: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`,
-    /// `192.168.0.0/16`), loopback (`127.0.0.0/8`, `::1`), link-local
-    /// (`169.254.0.0/16` -- which includes the cloud-metadata
-    /// `169.254.169.254` -- and `fe80::/10`), IPv6 unique-local
-    /// (`fc00::/7`), RFC 6598 carrier-grade NAT (`100.64.0.0/10`), and the
-    /// IPv6 unspecified address (`::`, never a sensible dial target
-    /// either way). Also unwraps an IPv4-mapped IPv6 address
-    /// (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) and evaluates the *embedded*
-    /// IPv4 address against the same IPv4 ranges -- without this, an
-    /// attacker could trivially bypass every IPv4 check above by
-    /// publishing an AAAA record for `::ffff:127.0.0.1` instead of an A
-    /// record for `127.0.0.1`, since that's the literal address that
-    /// would be handed to `SocketAddress(ipAddress:port:)` and dialed.
+    /// IPv4 rejects every block in the IANA IPv4 Special-Purpose Address
+    /// Registry that isn't globally reachable, plus multicast and the
+    /// reserved space: `0.0.0.0/8` ("this network"; `0.0.0.0` reaches the
+    /// local host on most systems), `10.0.0.0/8`, `100.64.0.0/10`,
+    /// `127.0.0.0/8`, `169.254.0.0/16` (including cloud metadata),
+    /// `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`,
+    /// `192.168.0.0/16`, `198.18.0.0/15` (benchmarking), `198.51.100.0/24`,
+    /// `203.0.113.0/24`, `224.0.0.0/4` (multicast) and `240.0.0.0/4`
+    /// (reserved, including broadcast).
+    ///
+    /// IPv6 is an allow-list: only global unicast `2000::/3` passes, so
+    /// `::`, `::1`, IPv4-compatible `::a.b.c.d`, `100::/64`, `fc00::/7`,
+    /// `fe80::/10`, `fec0::/10`, `ff00::/8` and every other block outside it
+    /// are rejected. Inside it, `2001::/23` (IETF protocol assignments,
+    /// including Teredo and benchmarking), `2001:db8::/32` and `3fff::/20`
+    /// (documentation) are rejected too. Addresses that embed an IPv4
+    /// address are judged by it: IPv4-mapped `::ffff:a.b.c.d`, the NAT64
+    /// well-known prefix `64:ff9b::/96` (the local-use `64:ff9b:1::/48` is
+    /// rejected), and 6to4 `2002::/16`. Without that, publishing an AAAA
+    /// record for `::ffff:127.0.0.1` or `2002:7f00:1::` would bypass every
+    /// IPv4 check.
     public var isRoutable: Bool {
         switch self {
         case .v4(let bytes):
             return Self.isRoutableIPv4(bytes)
         case .v6(let bytes):
-            guard bytes.count == 16 else { return true } // defensive; DNSWireFormat guarantees exactly 16
-            if bytes[0..<10].allSatisfy({ $0 == 0 }), bytes[10] == 0xFF, bytes[11] == 0xFF {
-                return Self.isRoutableIPv4(Array(bytes[12..<16]))
-            }
             return Self.isRoutableIPv6(bytes)
         }
     }
 
-    private static func isRoutableIPv4(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count == 4 else { return true } // defensive; DNSWireFormat guarantees exactly 4
-        if bytes[0] == 127 { return false } // 127.0.0.0/8 -- loopback
-        if bytes[0] == 10 { return false } // 10.0.0.0/8 -- RFC 1918
-        if bytes[0] == 172, (16...31).contains(bytes[1]) { return false } // 172.16.0.0/12 -- RFC 1918
-        if bytes[0] == 192, bytes[1] == 168 { return false } // 192.168.0.0/16 -- RFC 1918
-        if bytes[0] == 169, bytes[1] == 254 { return false } // 169.254.0.0/16 -- link-local (incl. 169.254.169.254 cloud metadata)
-        if bytes[0] == 100, (64...127).contains(bytes[1]) { return false } // 100.64.0.0/10 -- RFC 6598 CGNAT
-        return true
+    private static func isRoutableIPv4(_ b: [UInt8]) -> Bool {
+        guard b.count == 4 else { return false }
+        switch b[0] {
+        case 0: return false // 0.0.0.0/8 -- "this network"
+        case 10: return false // 10.0.0.0/8 -- RFC 1918
+        case 100 where (64...127).contains(b[1]): return false // 100.64.0.0/10 -- RFC 6598 shared/CGNAT
+        case 127: return false // 127.0.0.0/8 -- loopback
+        case 169 where b[1] == 254: return false // 169.254.0.0/16 -- link-local
+        case 172 where (16...31).contains(b[1]): return false // 172.16.0.0/12 -- RFC 1918
+        case 192 where b[1] == 0 && b[2] == 0: return false // 192.0.0.0/24 -- IETF protocol assignments
+        case 192 where b[1] == 0 && b[2] == 2: return false // 192.0.2.0/24 -- TEST-NET-1
+        case 192 where b[1] == 88 && b[2] == 99: return false // 192.88.99.0/24 -- 6to4 relay anycast (deprecated)
+        case 192 where b[1] == 168: return false // 192.168.0.0/16 -- RFC 1918
+        case 198 where b[1] == 18 || b[1] == 19: return false // 198.18.0.0/15 -- benchmarking
+        case 198 where b[1] == 51 && b[2] == 100: return false // 198.51.100.0/24 -- TEST-NET-2
+        case 203 where b[1] == 0 && b[2] == 113: return false // 203.0.113.0/24 -- TEST-NET-3
+        case 224...255: return false // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved, 255.255.255.255
+        default: return true
+        }
     }
 
-    private static func isRoutableIPv6(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count == 16 else { return true } // defensive; DNSWireFormat guarantees exactly 16
-        if bytes.allSatisfy({ $0 == 0 }) { return false } // :: -- unspecified
-        if bytes[0..<15].allSatisfy({ $0 == 0 }), bytes[15] == 1 { return false } // ::1 -- loopback
-        if bytes[0] == 0xFE, (bytes[1] & 0xC0) == 0x80 { return false } // fe80::/10 -- link-local
-        if (bytes[0] & 0xFE) == 0xFC { return false } // fc00::/7 -- unique-local
+    private static func isRoutableIPv6(_ b: [UInt8]) -> Bool {
+        guard b.count == 16 else { return false }
+        // ::ffff:a.b.c.d -- IPv4-mapped (RFC 4291 §2.5.5.2).
+        if b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xFF, b[11] == 0xFF {
+            return isRoutableIPv4(Array(b[12..<16]))
+        }
+        // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052): judged by the
+        // embedded IPv4 address.
+        if b[0] == 0x00, b[1] == 0x64, b[2] == 0xFF, b[3] == 0x9B, b[4..<12].allSatisfy({ $0 == 0 }) {
+            return isRoutableIPv4(Array(b[12..<16]))
+        }
+        // Allow-list: global unicast 2000::/3 only.
+        guard (b[0] & 0xE0) == 0x20 else { return false }
+        // 2001::/23 -- IETF protocol assignments (Teredo, benchmarking, ORCHID...).
+        if b[0] == 0x20, b[1] == 0x01, b[2] < 0x02 { return false }
+        // 2001:db8::/32 -- documentation.
+        if b[0] == 0x20, b[1] == 0x01, b[2] == 0x0D, b[3] == 0xB8 { return false }
+        // 2002::/16 -- 6to4: judged by the embedded IPv4 address.
+        if b[0] == 0x20, b[1] == 0x02 { return isRoutableIPv4(Array(b[2..<6])) }
+        // 3fff::/20 -- documentation (RFC 9637).
+        if b[0] == 0x3F, b[1] == 0xFF, (b[2] & 0xF0) == 0x00 { return false }
         return true
     }
 }

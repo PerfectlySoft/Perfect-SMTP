@@ -180,23 +180,37 @@ struct SMTPMailerStreamingSendTests {
             }
         }
 
-        // Let a handful of sends actually happen, then cancel.
+        // Let a handful of sends actually happen, then cancel, and wait
+        // for the consumer to finish: by then the pipeline has seen the
+        // cancellation (the consumer's `pull` cancels the driver, or the
+        // released stream does). Waiting for that, rather than a fixed
+        // delay, keeps a slow machine from reading the counter before
+        // cancellation has even been delivered.
         try await Task.sleep(nanoseconds: UInt64(60) * 1_000_000)
         consumer.cancel()
+        _ = await consumer.result
+        let countAtCancel = await tracker.totalSends
 
-        // Give the cancellation-aware pipeline a moment to actually wind
-        // down (in-flight sends complete, `startNextIfPossible` stops
-        // advancing the source iterator).
-        try await Task.sleep(nanoseconds: UInt64(100) * 1_000_000)
-        let countShortlyAfterCancel = await tracker.totalSends
-
+        // Sends already admitted to the window may still start and finish;
+        // nothing new may be pulled from the source. Wait for the count to
+        // settle (nothing in flight, unchanged across 100 ms).
+        var settled = await tracker.totalSends
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            try await Task.sleep(nanoseconds: UInt64(100) * 1_000_000)
+            let now = await tracker.totalSends
+            if now == settled, await tracker.current == 0 { break }
+            settled = now
+        }
         try await Task.sleep(nanoseconds: UInt64(200) * 1_000_000)
-        let countMuchLaterAfterCancel = await tracker.totalSends
+        let countMuchLater = await tracker.totalSends
 
-        // The defining assertion: production stopped -- it did not keep
-        // marching toward 100,000 in the background after cancellation.
-        #expect(countMuchLaterAfterCancel == countShortlyAfterCancel)
-        #expect(countMuchLaterAfterCancel < 100_000)
+        // The defining assertions: production stopped -- it did not keep
+        // marching toward 100,000 in the background after cancellation --
+        // and at most one window's worth of sends ran after it.
+        #expect(countMuchLater == settled, "sends kept starting after cancellation: \(settled) -> \(countMuchLater)")
+        #expect(countMuchLater <= countAtCancel + cap, "\(countMuchLater - countAtCancel) sends started after cancellation; at most \(cap) were in the window")
+        #expect(countMuchLater < 100_000)
     }
 
     @Test func abandoningTheStreamWithoutDrainingStopsThePipelinePromptly() async throws {

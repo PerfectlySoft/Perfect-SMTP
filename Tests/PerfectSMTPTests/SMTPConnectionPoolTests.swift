@@ -32,7 +32,7 @@ struct SMTPConnectionPoolTests {
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
                 await onDial()
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -124,7 +124,7 @@ struct SMTPConnectionPoolTests {
                     await firstDialGate.wait()
                     throw SimulatedDialFailure()
                 }
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -152,7 +152,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 4, maxTotal: 1),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, _) = try await ConnectionHarness.make()
+                let (connection, _) = try await ConnectionHarness.make(answersQUIT: true)
                 return connection
             }
         )
@@ -267,7 +267,7 @@ struct SMTPConnectionPoolTests {
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
                 await Task.yield()
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -322,7 +322,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 4, maxTotal: 1),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -352,7 +352,7 @@ struct SMTPConnectionPoolTests {
             configuration: .init(maxPerHost: 2, maxTotal: 2),
             group: NIOAsyncTestingEventLoop(),
             dialer: { _ in
-                let (connection, channel) = try await ConnectionHarness.make()
+                let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
                 try await channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 25))
                 sockets.opened(channel)
                 return connection
@@ -391,7 +391,7 @@ struct SMTPConnectionPoolTests {
         slowKeys: Set<SMTPConnectionPool.Key>? = nil
     ) -> SMTPConnectionPool {
         SMTPConnectionPool(configuration: configuration, group: NIOAsyncTestingEventLoop(), dialer: { key in
-            let (connection, channel) = try await ConnectionHarness.make()
+            let (connection, channel) = try await ConnectionHarness.make(answersQUIT: true)
             if slowKeys?.contains(key) ?? true {
                 try await channel.testingEventLoop.executeInContext {
                     try channel.pipeline.syncOperations.addHandler(HoldCloseHandler(holder), position: .first)
@@ -555,7 +555,11 @@ struct SMTPConnectionPoolTests {
         try await waitForPool(pool) { $0.active == 1 }
         let checkouts = (0..<3).map { _ in Task { try await pool.withConnection(to: key) { _ in () } } }
         try await waitForPool(pool) { $0.waiters == 3 }
-        try await Task.sleep(nanoseconds: 20_000_000)
+        // An evicted idle connection gets a best-effort QUIT before its
+        // close, so the close arrives a moment later: wait for the first
+        // one, then give any (wrong) extra evictions the same time.
+        try await waitUntilHeld(holder, count: 1)
+        try await Task.sleep(nanoseconds: 50_000_000)
 
         #expect(holder.heldCount == 1, "\(holder.heldCount) idle connections evicted; only 1 checkout for host A can be admitted")
         #expect(pool.snapshotForTesting().idle == 2)
@@ -625,14 +629,16 @@ private final class OpenSocketTracker: @unchecked Sendable {
 /// TLS close waiting on the peer's close_notify.
 private final class CloseHolder: @unchecked Sendable {
     private let lock = NSLock()
-    private var held: [(any EventLoop, () -> Void)] = []
+    // Each close is bound to its channel's loop: `hold` runs there (it is
+    // called from `HoldCloseHandler`), and `releaseAll` hops back to it.
+    private var held: [(any EventLoop, NIOLoopBound<() -> Void>)] = []
     private var heldChannels: Set<ObjectIdentifier> = []
     private var holding = true
 
     func hold(_ channel: any Channel, _ close: @escaping () -> Void) {
         let runNow: Bool = lock.withLock {
             guard holding else { return true }
-            held.append((channel.eventLoop, close))
+            held.append((channel.eventLoop, NIOLoopBound(close, eventLoop: channel.eventLoop)))
             heldChannels.insert(ObjectIdentifier(channel))
             return false
         }
@@ -644,12 +650,12 @@ private final class CloseHolder: @unchecked Sendable {
     var heldCount: Int { lock.withLock { heldChannels.count } }
 
     func releaseAll() {
-        let released: [(any EventLoop, () -> Void)] = lock.withLock {
+        let released: [(any EventLoop, NIOLoopBound<() -> Void>)] = lock.withLock {
             holding = false
             defer { held = [] }
             return held
         }
-        for (eventLoop, close) in released { eventLoop.execute(close) }
+        for (eventLoop, close) in released { eventLoop.execute { close.value() } }
     }
 }
 

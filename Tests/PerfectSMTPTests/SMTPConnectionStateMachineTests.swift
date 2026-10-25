@@ -263,6 +263,51 @@ struct SMTPConnectionStateMachineTests {
         }
     }
 
+    /// Release review: a server that answers the pipelined DATA with 354
+    /// even though every RCPT was rejected leaves the session in DATA mode.
+    /// The connection must end the empty message with a lone dot (never the
+    /// body) and be back in command mode afterwards.
+    @Test func a354AfterEveryRCPTWasRejectedIsClosedWithADotNotTheBody() async throws {
+        let (connection, channel) = try await ConnectionHarness.make()
+        try await negotiateWithCapabilities(connection, channel, lines: ["250-smtp.example.com", "250 PIPELINING"])
+
+        let envelope = try SMTPEnvelope(mailFrom: .address("from@example.com"), recipients: ["bad@example.com"])
+        let message = SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nSECRET BODY".utf8))
+
+        async let sendTask = connection.sendMessage(envelope, message)
+        _ = try await expectClientLine(channel) // MAIL
+        _ = try await expectClientLine(channel) // RCPT
+        _ = try await expectClientLine(channel) // DATA
+        try await serverSend(channel, "250 2.1.0 OK")
+        try await serverSend(channel, "550 5.1.1 User unknown")
+        try await serverSend(channel, "354 Start mail input")
+        #expect(try await expectClientLine(channel) == ".")
+        try await serverSend(channel, "554 5.5.1 No valid recipients")
+
+        let results = try await sendTask
+        guard case .permanentlyFailed(let reply)? = results.first?.outcome else {
+            Issue.record("expected the RCPT rejection, got \(String(describing: results.first?.outcome))")
+            return
+        }
+        #expect(reply.code == 550)
+
+        // Back in command mode: the next transaction's MAIL FROM is a command.
+        let next = try SMTPEnvelope(mailFrom: .address("from@example.com"), recipients: ["good@example.com"])
+        async let secondSend = connection.sendMessage(next, message)
+        #expect(try await expectClientLine(channel) == "MAIL FROM:<from@example.com>")
+        _ = try await expectClientLine(channel)
+        _ = try await expectClientLine(channel)
+        try await serverSend(channel, "250 OK")
+        try await serverSend(channel, "250 OK")
+        try await serverSend(channel, "354 go")
+        try await serverSend(channel, "250 queued")
+        let second = try await secondSend
+        guard case .delivered? = second.first?.outcome else {
+            Issue.record("expected the second message delivered, got \(String(describing: second.first?.outcome))")
+            return
+        }
+    }
+
     @Test func allRCPTRejectedNeverSendsMessageBody() async throws {
         let (connection, channel) = try await ConnectionHarness.make()
         try await negotiateWithCapabilities(connection, channel, lines: ["250-smtp.example.com", "250 PIPELINING"])
@@ -403,4 +448,46 @@ struct SMTPConnectionStateMachineTests {
 private actor CallCounter {
     private(set) var value = 0
     func increment() { value += 1 }
+}
+
+struct SASLHardeningTests {
+    @Test func anEndlessChallengeLoopIsCutOff() async throws {
+        let (connection, channel) = try await ConnectionHarness.make()
+        async let negotiate: Capabilities = connection.negotiateCapabilities()
+        _ = try await expectClientLine(channel)
+        try await serverSend(channel, "250-smtp.example.com")
+        try await serverSend(channel, "250 AUTH XOAUTH2")
+        _ = try await negotiate
+
+        // XOAUTH2 answers any number of 334s with an empty response, so it
+        // exercises the connection's own bound.
+        let auth = Task { try await connection.authenticate(XOAuth2(username: "u@example.com") { "token" }) }
+        _ = try await expectClientLine(channel) // AUTH XOAUTH2 <initial response>
+        for _ in 0..<SMTPConnection.maximumSASLChallenges {
+            try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
+            _ = try await expectClientLine(channel)
+        }
+        try await serverSend(channel, "334 " + Data("again".utf8).base64EncodedString())
+        await #expect(throws: SMTPConnectionError.tooManySASLChallenges) { try await auth.value }
+    }
+
+    /// Release review: LOGIN re-sent the password for every further 334.
+    @Test func loginSendsThePasswordOnceAndRefusesAThirdChallenge() async throws {
+        var login = SASLLogin(username: "u", password: "secret")
+        #expect(try await login.respond(to: []) == Array("u".utf8))
+        #expect(try await login.respond(to: []) == Array("secret".utf8))
+        await #expect(throws: SASLError.unexpectedChallenge) { _ = try await login.respond(to: []) }
+    }
+
+    @Test func anXOAuth2UsernameOrTokenWithTheFieldSeparatorIsRejected() async {
+        var forged = XOAuth2(username: "victim@example.com\u{1}auth=Bearer stolen") { "token" }
+        await #expect(throws: SASLError.separatorInCredential(field: "username")) { _ = try await forged.initialResponse() }
+        var badToken = XOAuth2(username: "u@example.com") { "tok\u{1}en" }
+        await #expect(throws: SASLError.separatorInCredential(field: "token")) { _ = try await badToken.initialResponse() }
+    }
+
+    @Test func aPlainCredentialWithNULIsRejected() async {
+        var plain = SASLPlain(username: "u\u{0}admin", password: "p")
+        await #expect(throws: SASLError.separatorInCredential(field: "username")) { _ = try await plain.initialResponse() }
+    }
 }

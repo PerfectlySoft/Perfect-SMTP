@@ -38,6 +38,7 @@ public enum ReversePath: Sendable, Hashable {
             case .address(let address):
                 let validated = try HeaderEncoder.rejectHeaderInjection(address, field: "MAIL FROM address")
                 try Self.rejectLeadingHyphen(validated, field: "MAIL FROM address")
+                try AddressSyntax.validateMailbox(validated, field: "MAIL FROM address")
                 return "MAIL FROM:<\(validated)>"
             case .null:
                 return "MAIL FROM:<>"
@@ -100,23 +101,34 @@ public struct DSNRequest: Sendable, Hashable {
 /// destined for individual `RCPT TO` commands — never serialized into any
 /// header.
 public struct SMTPEnvelope: Sendable {
-    public var mailFrom: ReversePath
-    /// Destined for individual `RCPT TO` commands. No transport consumes
-    /// this in Phase 0, but the identical unenforced-raw-string pattern as
-    /// `ReversePath.address`'s addr-spec exists here too (milestone review
-    /// finding) — validated at construction time below so the gap isn't
-    /// carried forward silently into Phase 1. Note this is a mutable
-    /// stored property: a caller that mutates `recipients` after
-    /// construction bypasses this check, same as any other value-type
-    /// invariant enforced only in an `init` — Phase 1's transport layer,
-    /// which actually emits `RCPT TO` on the wire, is the place a
-    /// stronger guarantee (e.g. re-validating immediately before send)
-    /// belongs.
-    public var recipients: [String]
+    /// Validated by `init` (a plain mailbox with no leading `-`, or `.null`)
+    /// and read-only afterwards. Release review: these used to be public
+    /// `var`s, so a caller could swap in an unvalidated address after
+    /// construction and `LocalMTATransport` passed it straight to the
+    /// `sendmail` argv. Build a new envelope instead of mutating one.
+    public private(set) var mailFrom: ReversePath
+    /// Destined for individual `RCPT TO` commands (or the `sendmail` argv).
+    /// Validated by `init` like `mailFrom` and read-only afterwards.
+    public private(set) var recipients: [String]
     public var size: Int?
     public var dsn: DSNRequest?
 
     public init(mailFrom: ReversePath, recipients: [String], size: Int? = nil, dsn: DSNRequest? = nil) throws {
+        try Self.validate(mailFrom: mailFrom, recipients: recipients)
+        self.mailFrom = mailFrom
+        self.recipients = recipients
+        self.size = size
+        self.dsn = dsn
+    }
+
+    /// Re-runs `init`'s checks. Transports call this right before an
+    /// address reaches the wire or a command line (defense in depth).
+    public func validate() throws {
+        try Self.validate(mailFrom: mailFrom, recipients: recipients)
+    }
+
+    private static func validate(mailFrom: ReversePath, recipients: [String]) throws {
+        _ = try mailFrom.mailFromCommand
         for recipient in recipients {
             _ = try HeaderEncoder.rejectHeaderInjection(recipient, field: "RCPT TO address")
             // FIX #2 (security review, CWE-88): reject a leading `-` here
@@ -124,10 +136,7 @@ public struct SMTPEnvelope: Sendable {
             // Recipients reach `LocalMTATransport`'s argv exactly the same
             // way the reverse-path address does.
             try ReversePath.rejectLeadingHyphen(recipient, field: "RCPT TO address")
+            try AddressSyntax.validateMailbox(recipient, field: "RCPT TO address")
         }
-        self.mailFrom = mailFrom
-        self.recipients = recipients
-        self.size = size
-        self.dsn = dsn
     }
 }

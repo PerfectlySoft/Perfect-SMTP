@@ -106,16 +106,36 @@ struct DNSResolverMXOrderingTests {
         #expect(resolved == [DNSResolver.MXRecord(preference: 0, exchange: "mail.example.org")])
     }
 
-    /// RFC 7505 requires the null-MX to be the *only* record. Two records,
-    /// one of which happens to be a root exchange at preference 0, is a
-    /// malformed zone, not a valid null-MX signal -- must not be
-    /// misclassified either.
-    @Test func rootExchangeAlongsideAnotherRecordIsNotTreatedAsNullMX() throws {
+    /// RFC 7505 §3 forbids publishing a null MX alongside other MX
+    /// records, and §4 says not to deliver to a domain with a null MX. The
+    /// RFC doesn't address the mixed (misconfigured) case, so the release
+    /// review settled it conservatively: any null MX in the RRset means
+    /// "this domain accepts no mail" rather than falling through to the
+    /// other records.
+    @Test func aNullMXAlongsideAnotherRecordIsStillNullMX() {
         let records = [
             Self.mxRecord(preference: 0, exchange: ""),
             Self.mxRecord(preference: 10, exchange: "mail.example.org"),
         ]
-        let resolved = try DNSResolver.processMXAnswers(records)
-        #expect(resolved.count == 2)
+        #expect(throws: DNSResolver.ResolveError.nullMX) { _ = try DNSResolver.processMXAnswers(records) }
+    }
+
+    /// A root exchange at a non-zero preference isn't a null MX, but it
+    /// can't be dialed either: it's dropped, and the real host kept.
+    @Test func aRootExchangeAtANonZeroPreferenceIsDropped() throws {
+        let records = [
+            Self.mxRecord(preference: 5, exchange: ""),
+            Self.mxRecord(preference: 10, exchange: "mail.example.org"),
+        ]
+        #expect(try DNSResolver.processMXAnswers(records) == [DNSResolver.MXRecord(preference: 10, exchange: "mail.example.org")])
+    }
+
+    @Test(arguments: ["mx\u{0}.victim.test", "mx .victim.test", "-mx.victim.test", "mx_.victim.test"])
+    func aNonHostnameExchangeIsDroppedAndAnAllInvalidSetIsMalformed(exchange: String) throws {
+        #expect(throws: DNSResolver.ResolveError.malformedResponse) {
+            _ = try DNSResolver.processMXAnswers([Self.mxRecord(preference: 10, exchange: exchange)])
+        }
+        let mixed = [Self.mxRecord(preference: 10, exchange: exchange), Self.mxRecord(preference: 20, exchange: "mx2.victim.test")]
+        #expect(try DNSResolver.processMXAnswers(mixed) == [DNSResolver.MXRecord(preference: 20, exchange: "mx2.victim.test")])
     }
 }

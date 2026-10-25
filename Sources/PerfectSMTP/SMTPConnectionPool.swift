@@ -61,10 +61,17 @@ public final class SMTPConnectionPool: Sendable {
         public let host: String
         public let port: Int
         public let tls: TLSMode
-        public init(host: String, port: Int, tls: TLSMode) {
+        /// Whether the server certificate must carry a DNS subjectAltName
+        /// for `host` (DirectMX under an MTA-STS policy; see
+        /// `SMTPBootstrap.connect(to:...)`). Part of the key, so a
+        /// connection verified without that check is never reused where
+        /// it is required.
+        public let requireCertificateDNSName: Bool
+        public init(host: String, port: Int, tls: TLSMode, requireCertificateDNSName: Bool = false) {
             self.host = host
             self.port = port
             self.tls = tls
+            self.requireCertificateDNSName = requireCertificateDNSName
         }
     }
 
@@ -105,6 +112,10 @@ public final class SMTPConnectionPool: Sendable {
         /// terminator, where the server may legitimately be doing real
         /// work (spooling/scanning a large message).
         public var dataTerminationTimeout: TimeInterval
+        /// How long `shutdown()` waits for each idle connection's `221`
+        /// reply to `QUIT` before closing it (default 0.5 s). Evictions and
+        /// idle-timeout closes never wait: they send `QUIT` and close.
+        public var quitReplyTimeout: TimeInterval
 
         public init(
             maxPerHost: Int = 4,
@@ -114,7 +125,8 @@ public final class SMTPConnectionPool: Sendable {
             circuitBreakerThreshold: Int = 5,
             circuitBreakerResetTimeout: TimeInterval = 30,
             replyTimeout: TimeInterval = 300,
-            dataTerminationTimeout: TimeInterval = 600
+            dataTerminationTimeout: TimeInterval = 600,
+            quitReplyTimeout: TimeInterval = 0.5
         ) {
             self.maxPerHost = maxPerHost
             self.maxTotal = maxTotal
@@ -124,6 +136,7 @@ public final class SMTPConnectionPool: Sendable {
             self.circuitBreakerResetTimeout = circuitBreakerResetTimeout
             self.replyTimeout = replyTimeout
             self.dataTerminationTimeout = dataTerminationTimeout
+            self.quitReplyTimeout = quitReplyTimeout
         }
     }
 
@@ -165,7 +178,7 @@ public final class SMTPConnectionPool: Sendable {
     /// released (see `lockedEffects` and `run`).
     private struct Effects {
         var resumes: [(CheckedContinuation<CheckoutOutcome, any Error>, Result<CheckoutOutcome, any Error>)] = []
-        var closes: [(connection: SMTPConnection, isEviction: Bool)] = []
+        var closes: [(connection: SMTPConnection, isEviction: Bool, polite: Bool)] = []
     }
 
     private struct State {
@@ -188,14 +201,16 @@ public final class SMTPConnectionPool: Sendable {
         var evicting = 0
         /// Closes decided under the current lock acquisition, not yet
         /// issued; `lockedEffects` hands them to `run(_:)`.
-        var queuedCloses: [(connection: SMTPConnection, isEviction: Bool)] = []
+        var queuedCloses: [(connection: SMTPConnection, isEviction: Bool, polite: Bool)] = []
 
         /// The only way the pool closes a connection: it keeps counting
         /// toward `maxTotal` from this moment until `closeFinished()`.
-        mutating func beginClosing(_ connection: SMTPConnection, isEviction: Bool = false) {
+        /// `polite`: the connection is idle and in command mode, so it gets
+        /// a best-effort `QUIT` before the close.
+        mutating func beginClosing(_ connection: SMTPConnection, isEviction: Bool = false, polite: Bool = false) {
             closing += 1
             if isEviction { evicting += 1 }
-            queuedCloses.append((connection, isEviction))
+            queuedCloses.append((connection, isEviction, polite))
         }
         /// Every open connection the pool is responsible for: checked out,
         /// being dialed (a reserved slot), idle, or still closing.
@@ -227,6 +242,13 @@ public final class SMTPConnectionPool: Sendable {
         DispatchTime(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0, secondsFromNow) * 1_000_000_000))
     }
 
+    /// Whether the default dialer requires a DNS subjectAltName for `key`:
+    /// always for a TLS connection to a host name, never for an IP literal
+    /// or plaintext.
+    static func requiresCertificateDNSName(_ key: Key) -> Bool {
+        key.tls != .none && (key.requireCertificateDNSName || !SMTPBootstrap.isIPAddressLiteral(key.host))
+    }
+
     public init(configuration: Configuration = .init(), ehloHostname: String = "localhost", group: any EventLoopGroup) {
         self.configuration = configuration
         self.ehloHostname = ehloHostname
@@ -237,9 +259,18 @@ public final class SMTPConnectionPool: Sendable {
         let capturedReplyTimeout = configuration.replyTimeout
         let capturedDataTerminationTimeout = configuration.dataTerminationTimeout
         self.dialer = { key in
+            // Release review: a relay reached by name must present a
+            // certificate with a DNS subjectAltName for that name. NIOSSL
+            // alone also accepts an IP SAN equal to the dialed address, so
+            // someone able to redirect the relay's DNS to an address they
+            // hold an IP certificate for could otherwise collect AUTH
+            // credentials. An IP-literal relay is checked against its IP.
             let asyncChannel = try await SMTPBootstrap.connect(
                 host: key.host, port: key.port, tls: key.tls,
-                connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout, group: capturedGroup
+                connectTimeout: capturedTimeout, replyTimeout: capturedReplyTimeout,
+                ehloHostname: capturedHostname,
+                requireCertificateDNSName: Self.requiresCertificateDNSName(key),
+                group: capturedGroup
             )
             let connection = SMTPConnection(
                 asyncChannel: asyncChannel,
@@ -328,7 +359,7 @@ public final class SMTPConnectionPool: Sendable {
         let effects = lockedEffects { state, effects in
             state.isShutDown = true
             for (_, entries) in state.idle {
-                for entry in entries { state.beginClosing(entry.connection) }
+                for entry in entries { state.beginClosing(entry.connection, polite: true) }
             }
             state.idle.removeAll()
             for (_, list) in state.waiters {
@@ -361,9 +392,18 @@ public final class SMTPConnectionPool: Sendable {
     /// lock. When each close completes, its slot is freed and parked
     /// waiters are admitted.
     private func run(_ effects: Effects) {
-        for (connection, isEviction) in effects.closes {
-            connection.channel.close(promise: nil)
+        // Only a shutdown waits for the 221: an eviction or idle-timeout
+        // close holds a maxTotal slot until it completes, and a checkout may
+        // be parked waiting for that slot.
+        let shuttingDown = effects.closes.contains(where: \.polite) && state.withLockedValue { $0.isShutDown }
+        for (connection, isEviction, polite) in effects.closes {
             connection.channel.closeFuture.whenComplete { _ in self.closeFinished(wasEviction: isEviction) }
+            if polite {
+                let timeout = configuration.quitReplyTimeout
+                Task { await connection.quitAndClose(waitForReply: shuttingDown, timeout: timeout) }
+            } else {
+                connection.channel.close(promise: nil)
+            }
         }
         for (continuation, result) in effects.resumes { continuation.resume(with: result) }
     }
@@ -499,7 +539,7 @@ public final class SMTPConnectionPool: Sendable {
             }
         }
         guard let key = oldest?.key, var list = state.idle[key] else { return false }
-        state.beginClosing(list.removeFirst().connection, isEviction: true)
+        state.beginClosing(list.removeFirst().connection, isEviction: true, polite: true)
         state.idle[key] = list.isEmpty ? nil : list
         return true
     }
@@ -512,7 +552,7 @@ public final class SMTPConnectionPool: Sendable {
             let ageNanoseconds = DispatchTime.now().uptimeNanoseconds &- entry.returnedAt.uptimeNanoseconds
             let ageSeconds = TimeInterval(ageNanoseconds) / 1_000_000_000
             if ageSeconds > configuration.idleTimeout || !entry.connection.channel.isActive {
-                state.beginClosing(entry.connection)
+                state.beginClosing(entry.connection, polite: entry.connection.channel.isActive)
                 continue
             }
             result = entry.connection
@@ -563,7 +603,7 @@ public final class SMTPConnectionPool: Sendable {
             // socket) for the lifetime of the process. Close it immediately
             // instead.
             guard !state.isShutDown else {
-                state.beginClosing(connection)
+                state.beginClosing(connection, polite: healthy)
                 return
             }
             if healthy, connection.channel.isActive {

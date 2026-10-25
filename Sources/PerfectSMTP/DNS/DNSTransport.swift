@@ -62,13 +62,13 @@ enum DNSTransport {
                 do {
                     let response = try await withTimeout(resolver.queryTimeout) {
                         try await sendUDPQuery(
-                            to: nameserver, message: queryBytes, expectedID: id, group: resolver.group
+                            to: nameserver, message: queryBytes, expectedID: id, name: name, type: type, group: resolver.group
                         )
                     }
                     if response.header.truncated {
                         let tcpResponse = try await withTimeout(resolver.queryTimeout) {
                             try await sendTCPQuery(
-                                to: nameserver, message: queryBytes, expectedID: id, group: resolver.group
+                                to: nameserver, message: queryBytes, expectedID: id, name: name, type: type, group: resolver.group
                             )
                         }
                         try DNSResolver.validateResponseCode(tcpResponse)
@@ -94,7 +94,8 @@ enum DNSTransport {
     // MARK: - UDP
 
     private static func sendUDPQuery(
-        to nameserver: SocketAddress, message: [UInt8], expectedID: UInt16, group: any EventLoopGroup
+        to nameserver: SocketAddress, message: [UInt8], expectedID: UInt16, name: String, type: DNSRecordType,
+        group: any EventLoopGroup
     ) async throws -> DNSMessage {
         let channel = try await DatagramBootstrap(group: group)
             .bind(host: wildcardBindHost(for: nameserver), port: 0)
@@ -120,18 +121,13 @@ enum DNSTransport {
                 // from the nameserver we queried.
                 guard envelope.remoteAddress == nameserver else { continue }
                 let responseBytes = [UInt8](envelope.data.readableBytesView)
-                let decoded: DNSMessage
-                do {
-                    decoded = try DNSMessage.decode(responseBytes)
-                } catch {
-                    // A malformed packet from the *correct* source is a
-                    // genuine protocol violation worth surfacing distinctly
-                    // -- unlike an ID mismatch (below), this isn't "keep
-                    // waiting for the real reply," it's "the real reply we
-                    // got back doesn't parse."
-                    throw DNSResolver.ResolveError.malformedResponse
-                }
-                guard isValidResponse(decoded, expectedID: expectedID) else { continue }
+                // Release review: a malformed or mismatched datagram is
+                // ignored and the wait continues, so one spoofed packet
+                // can't abort the lookup; the real reply (or the timeout)
+                // still decides. TCP, below, has no such spoofing surface.
+                guard let decoded = try? DNSMessage.decode(responseBytes),
+                      isValidResponse(decoded, expectedID: expectedID, name: name, type: type)
+                else { continue }
                 return decoded
             }
             throw DNSResolver.ResolveError.timeout
@@ -146,7 +142,8 @@ enum DNSTransport {
     // MARK: - TCP (RFC 1035 §4.2.2 fallback on a truncated UDP response)
 
     private static func sendTCPQuery(
-        to nameserver: SocketAddress, message: [UInt8], expectedID: UInt16, group: any EventLoopGroup
+        to nameserver: SocketAddress, message: [UInt8], expectedID: UInt16, name: String, type: DNSRecordType,
+        group: any EventLoopGroup
     ) async throws -> DNSMessage {
         let channel = try await ClientBootstrap(group: group)
             .channelInitializer { channel in
@@ -189,7 +186,7 @@ enum DNSTransport {
                 // there's no equivalent source-address spoofing surface --
                 // the transaction-ID check is still applied for
                 // defense-in-depth and consistency with the UDP path.
-                guard isValidResponse(decoded, expectedID: expectedID) else { continue }
+                guard isValidResponse(decoded, expectedID: expectedID, name: name, type: type) else { continue }
                 return decoded
             }
             throw DNSResolver.ResolveError.timeout
@@ -208,6 +205,15 @@ enum DNSTransport {
     /// being able to exercise it indirectly through a live UDP exchange.
     static func isValidResponse(_ message: DNSMessage, expectedID: UInt16) -> Bool {
         message.header.isResponse && message.header.id == expectedID
+    }
+
+    /// `isValidResponse(_:expectedID:)` plus (release review) the question
+    /// section: exactly one question, echoing the name (case-insensitively)
+    /// and type that were asked.
+    static func isValidResponse(_ message: DNSMessage, expectedID: UInt16, name: String, type: DNSRecordType) -> Bool {
+        guard isValidResponse(message, expectedID: expectedID), message.questions.count == 1 else { return false }
+        let question = message.questions[0]
+        return question.type == type.rawValue && DNSResolver.sameName(question.name, name)
     }
 
     // MARK: - Timeout

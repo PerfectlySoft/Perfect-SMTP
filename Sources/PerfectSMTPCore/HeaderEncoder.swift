@@ -41,7 +41,7 @@ public enum HeaderEncoder {
     /// characters. Payload capped at 45 bytes so the base64 expansion
     /// (ceil(45/3)*4 = 60 chars) plus overhead stays comfortably at or
     /// under `maxEncodedWordLength`.
-    private static let maxPayloadBytesPerWord = 45
+    private static let maxPayloadBytesPerWord = 39 // 52 base64 chars + 12 = 64, so "Subject: " plus a word stays under 78
 
     private static let atextChars: Set<Character> = Set(
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-/=?^_`{|}~"
@@ -52,7 +52,12 @@ public enum HeaderEncoder {
     /// anything else is emitted as one or more folded encoded-words.
     public static func encodeUnstructured(_ text: String) -> String {
         let sanitized = sanitizeForHeader(text)
-        guard needsEncoding(sanitized) else { return sanitized }
+        // A run without whitespace can't be folded; past 900 octets it
+        // would break the 998-octet line limit, so encode it instead
+        // (encoded words are folded between words).
+        // Text containing "=?" is encoded too: a receiver would otherwise
+        // decode a lookalike encoded word in plain text ("=?utf-8?q?x?=").
+        guard needsEncoding(sanitized) || longestUnbreakableRun(sanitized) > 900 || sanitized.contains("=?") else { return sanitized }
         return encodedWords(for: sanitized).joined(separator: "\r\n ")
     }
 
@@ -64,7 +69,7 @@ public enum HeaderEncoder {
     public static func encodePhrase(_ text: String) -> String {
         let sanitized = sanitizeForHeader(text)
         guard !sanitized.isEmpty else { return sanitized }
-        if sanitized.utf8.allSatisfy({ $0 < 0x80 }) {
+        if sanitized.utf8.allSatisfy({ $0 < 0x80 }), !sanitized.contains("=?") {
             return isPlainAtomsPhrase(sanitized) ? sanitized : quotedString(sanitized)
         }
         return encodedWords(for: sanitized).joined(separator: "\r\n ")
@@ -83,6 +88,9 @@ public enum HeaderEncoder {
     /// (`ComposerError.invalidHeaderValue`, thrown rather than stripped).
     public static func encodeAddress(_ address: EmailAddress) throws -> String {
         let addrSpec = try rejectHeaderInjection(address.address, field: "address")
+        // A plain mailbox only: `s@example.test>, <attacker@evil.test`
+        // would otherwise add a second mailbox to the header.
+        try AddressSyntax.validateMailbox(addrSpec, field: "address")
         guard let name = address.displayName, !name.isEmpty else {
             return addrSpec
         }
@@ -114,7 +122,7 @@ public enum HeaderEncoder {
         case leadingHyphenInField(String)
     }
 
-    /// True for any C0 control character (0x00–0x1F) or DEL (0x7F) — the
+    /// True for any C0 control character (0x00–0x1F), DEL (0x7F) — the
     /// character class that must never survive, unescaped, into a string
     /// bound for an RFC 5322 header line or an SMTP command line. This is
     /// broader than just CR/LF: it also covers other C0 controls such as
@@ -124,8 +132,12 @@ public enum HeaderEncoder {
     /// review finding — a `quoted-string` only escapes `\` and `"`, not
     /// control characters, so a control byte in a display name survives
     /// straight through `quotedString` below).
-    private static func isForbiddenControlScalar(_ scalar: Unicode.Scalar) -> Bool {
-        scalar.value <= 0x1F || scalar.value == 0x7F
+    ///
+    /// Release review: also the C1 controls (U+0080–U+009F, including NEL
+    /// U+0085) and the Unicode line and paragraph separators U+2028/U+2029,
+    /// which some receivers and tools treat as line breaks.
+    static func isForbiddenControlScalar(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value <= 0x1F || (0x7F...0x9F).contains(scalar.value) || scalar.value == 0x2028 || scalar.value == 0x2029
     }
 
     /// The single, uniformly-applied discipline for every caller-controlled
@@ -162,6 +174,14 @@ public enum HeaderEncoder {
     private static func sanitizeForHeader(_ text: String) -> String {
         guard text.unicodeScalars.contains(where: isForbiddenControlScalar) else { return text }
         return String(String.UnicodeScalarView(text.unicodeScalars.filter { !isForbiddenControlScalar($0) }))
+    }
+
+    private static func longestUnbreakableRun(_ text: String) -> Int {
+        var longest = 0, current = 0
+        for byte in text.utf8 {
+            if byte == UInt8(ascii: " ") || byte == UInt8(ascii: "\t") { current = 0 } else { current += 1; longest = max(longest, current) }
+        }
+        return longest
     }
 
     private static func needsEncoding(_ text: String) -> Bool {

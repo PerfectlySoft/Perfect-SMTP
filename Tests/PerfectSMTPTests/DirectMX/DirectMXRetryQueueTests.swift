@@ -21,7 +21,8 @@ struct DirectMXRetryQueueTests {
         let policy = RetryBackoffPolicy(
             serviceUnavailable: 111,
             greylist: 22,
-            defaultTransient: 3
+            defaultTransient: 3,
+            jitter: 0
         )
         let reply421 = SMTPReply(code: 421, lines: ["4.3.2 Service unavailable, closing channel"])
         let reply450 = SMTPReply(code: 450, lines: ["4.2.0 Greylisted, try again later"])
@@ -452,7 +453,7 @@ struct DirectMXRetryQueueTests {
         // processed entries. Counting live loops also catches a superseded
         // loop that was never cancelled at all, which would sleep on
         // entry 1's 30 s target without calling anything.
-        let oneLoopLeft = try? await waitUntil(timeoutSeconds: 2) { await queue.liveLoopCountForTesting == 1 }
+        let oneLoopLeft: Void? = try? await waitUntil(timeoutSeconds: 2) { await queue.liveLoopCountForTesting == 1 }
         let liveLoops = await queue.liveLoopCountForTesting
         #expect(oneLoopLeft != nil, "\(liveLoops) loop tasks still running after the restart")
         #expect(await queue.processDueEntriesFromSupersededLoopCountForTesting == 0)
@@ -511,7 +512,7 @@ struct DirectMXRetryQueueTests {
         #expect(failures == 0, "\(failures) of 40 queues lost track of their sleeping loop")
     }
 
-    private static func message() -> SignedMessage {
+    static func message() -> SignedMessage {
         SignedMessage(rfc5322: Array("Subject: hi\r\n\r\nbody".utf8))
     }
 }
@@ -573,4 +574,92 @@ actor OutcomeCollector {
 
 private enum OutcomeCollectorError: Error {
     case timedOut
+}
+
+
+/// Release review: retries used a flat 5-minute delay for every
+/// greylist-class reply (which includes the library's own 451 4.4.1
+/// connection failures) and gave up after 10 attempts, about 50 minutes.
+struct RetryScheduleTests {
+    private static let connectionFailure = SMTPReply(code: 451, lines: ["4.4.1 No usable connection"])
+
+    @Test func delaysDoubleFromTheClassBaseUpToTheCap() {
+        let policy = RetryBackoffPolicy(jitter: 0)
+        let delays = (1...9).map { policy.delay(for: Self.connectionFailure, attempt: $0) }
+        #expect(delays == [300, 600, 1200, 2400, 4800, 9600, 14400, 14400, 14400])
+        #expect(policy.delay(for: SMTPReply(code: 421, lines: ["busy"]), attempt: 1) == 900)
+        #expect(policy.delay(for: SMTPReply(code: 421, lines: ["busy"]), attempt: 3) == 3600)
+        #expect(policy.delay(for: SMTPReply(code: 441, lines: ["other"]), attempt: 2) == 240)
+        #expect(policy.delay(for: Self.connectionFailure, attempt: 1000) == 14400) // no overflow
+    }
+
+    @Test func jitterStaysWithinItsFraction() {
+        let policy = RetryBackoffPolicy() // ±10%
+        let samples = (0..<500).map { _ in policy.delay(for: Self.connectionFailure, attempt: 3) }
+        #expect(samples.allSatisfy { (1080...1320).contains($0) })
+        #expect(Set(samples.map { Int($0) }).count > 10, "jitter should actually vary the delay")
+    }
+
+    /// With the defaults, maxAge (5 days), not maxAttempts, ends retrying.
+    @Test func theDefaultScheduleRunsForTheWholeMaxAge() {
+        let configuration = DirectMXRetryQueue.Configuration(backoff: RetryBackoffPolicy(jitter: 0))
+        var elapsed: TimeInterval = 0
+        var attempt = 1
+        while elapsed < configuration.maxAge {
+            elapsed += configuration.backoff.delay(for: Self.connectionFailure, attempt: attempt)
+            attempt += 1
+        }
+        #expect(attempt <= configuration.maxAttempts, "\(attempt) attempts needed to span maxAge, maxAttempts is \(configuration.maxAttempts)")
+        // Even with jitter at its low end every attempt, maxAge still wins.
+        let low = DirectMXRetryQueue.Configuration()
+        var lowElapsed: TimeInterval = 0
+        var lowAttempt = 1
+        while lowElapsed < low.maxAge {
+            lowElapsed += RetryBackoffPolicy(jitter: 0).delay(for: Self.connectionFailure, attempt: lowAttempt) * (1 - low.backoff.jitter)
+            lowAttempt += 1
+        }
+        #expect(lowAttempt <= low.maxAttempts)
+    }
+
+    /// The queue applies the schedule from the entry's real attempt number,
+    /// not the redelivery's own (history-less) classification. Each gap
+    /// between redeliveries must be at least the scheduled delay (a busy
+    /// machine can only make them later), and the count stays far below
+    /// what a flat 10 ms schedule would produce.
+    @Test(.timeLimit(.minutes(1)))
+    func theQueueReschedulesWithAGrowingDelay() async throws {
+        let configuration = DirectMXRetryQueue.Configuration(
+            backoff: .init(serviceUnavailable: 0.01, greylist: 0.01, defaultTransient: 0.01, maximumBackoff: 1000, jitter: 0),
+            maxAttempts: 100, maxAge: 3600
+        )
+        let times = TimestampLog()
+        let queue = DirectMXRetryQueue(
+            configuration: configuration,
+            redeliver: { envelope, _ in
+                await times.record()
+                return envelope.recipients.map { DeliveryResult(recipient: $0, outcome: configuration.classify(Self.connectionFailure, attempt: 1)) }
+            },
+            onTerminalOutcome: { _ in }
+        )
+        await queue.enqueue(
+            recipients: ["r@example.com"], mailFrom: .address("f@example.com"), message: DirectMXRetryQueueTests.message(),
+            outcome: configuration.classify(Self.connectionFailure, attempt: 1)
+        )
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        await queue.shutdown()
+        let stamps = await times.stamps
+        #expect(stamps.count >= 2 && stamps.count <= 9, "\(stamps.count) redeliveries in 1.5 s")
+        // Redelivery k (k = 2, 3, ...) follows redelivery k-1 by at least
+        // 0.01 × 2^(k-1) s (the failed attempt k sets the next wait).
+        for index in 1..<max(1, stamps.count) {
+            let gap = stamps[index].timeIntervalSince(stamps[index - 1])
+            let scheduled = 0.01 * pow(2, Double(index))
+            #expect(gap >= scheduled * 0.9, "gap \(index): \(gap) s, scheduled \(scheduled) s")
+        }
+    }
+}
+
+private actor TimestampLog {
+    private(set) var stamps: [Date] = []
+    func record() { stamps.append(Date()) }
 }

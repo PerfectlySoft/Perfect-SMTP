@@ -17,6 +17,8 @@
 import Foundation
 import Logging
 import NIOCore
+import NIOPosix
+import NIOSSL
 
 /// The TLS policy `DirectMXTransport` applies when dialing a resolved MX
 /// host (plan §9 Phase 4). `DirectMXTransport` itself layers per-domain
@@ -479,7 +481,8 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                 recipients: recipients, mailFrom: mailFrom, message: message,
                 pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
             ) { return results }
-            return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(lastError)) }
+            let outcome = classify(connectionFailure: lastError, domain: domain, retryQueueConfiguration: retryQueueConfiguration)
+            return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
         }
 
         if let mtaSTSPolicyProvider, let policy = await mtaSTSPolicyProvider.policy(for: domain), policy.mode != .none {
@@ -492,11 +495,14 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                         "MTA-STS enforce: no resolved MX host matches the policy's mx: patterns; hard-failing delivery",
                         metadata: ["domain": "\(domain)", "resolvedHosts": "\(hosts)", "mxPatterns": "\(policy.mxPatterns)"]
                     )
-                    let outcome = mtaSTSEnforceViolationOutcome(domain: domain, reason: "no resolved MX host matches the policy's mx: patterns")
+                    let outcome = mtaSTSEnforceViolationOutcome(
+                        domain: domain, reason: "no resolved MX host matches the policy's mx: patterns",
+                        retryQueueConfiguration: retryQueueConfiguration
+                    )
                     return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
                 }
                 if let results = await attemptHostsInOrder(
-                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS) },
+                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS, requireCertificateDNSName: true) },
                     recipients: recipients, mailFrom: mailFrom, message: message,
                     pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
                 ) { return results }
@@ -504,12 +510,15 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                     "MTA-STS enforce: every policy-matched MX host failed a mandatory-TLS connection attempt; hard-failing delivery",
                     metadata: ["domain": "\(domain)", "matchedHosts": "\(matchedHosts)", "lastError": "\(lastError)"]
                 )
-                let outcome = mtaSTSEnforceViolationOutcome(domain: domain, reason: "every policy-matched MX host failed mandatory STARTTLS (last error: \(lastError))")
+                let outcome = mtaSTSEnforceViolationOutcome(
+                    domain: domain, reason: "every policy-matched MX host failed mandatory STARTTLS (last error: \(lastError))",
+                    retryQueueConfiguration: retryQueueConfiguration
+                )
                 return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
 
             case .testing:
                 if let results = await attemptHostsInOrder(
-                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS) },
+                    matchedHosts, keyForHost: { SMTPConnectionPool.Key(host: $0, port: config.port, tls: .startTLS, requireCertificateDNSName: true) },
                     recipients: recipients, mailFrom: mailFrom, message: message,
                     pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
                 ) { return results }
@@ -532,7 +541,8 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
             hosts, port: config.port, recipients: recipients, mailFrom: mailFrom, message: message,
             pool: pool, retryQueueConfiguration: retryQueueConfiguration, lastError: &lastError
         ) { return results }
-        return recipients.map { DeliveryResult(recipient: $0, outcome: .failed(lastError)) }
+        let outcome = classify(connectionFailure: lastError, domain: domain, retryQueueConfiguration: retryQueueConfiguration)
+        return recipients.map { DeliveryResult(recipient: $0, outcome: outcome) }
     }
 
     /// Tries `hosts` in order, each with exactly `keyForHost(host)` -- no
@@ -678,20 +688,74 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         }
     }
 
-    /// Plan §9 Phase 4's "enforce-mode hard-fail" requirement: a distinct,
-    /// clearly-classified `.permanentlyFailed` outcome -- never
-    /// `.queuedForRetry` (an MTA-STS enforce violation is a policy
-    /// decision, not a transient server condition retrying would resolve)
-    /// and never silently downgraded to plaintext or a non-matching host.
-    /// RFC 8461 itself defines no SMTP-level reply code for this (the
-    /// violation is detected before/around the SMTP conversation, at the
-    /// TLS-policy layer) -- `550 5.7.1` is this library's own conventional
-    /// choice (a generic, widely-recognized "delivery not authorized,
-    /// security policy" enhanced status), matching the precedent this
-    /// codebase already set for its own non-RFC-mandated synthesized
-    /// replies (e.g. `classify(resolveError:)`'s `556 5.1.10` for null-MX).
-    private static func mtaSTSEnforceViolationOutcome(domain: String, reason: String) -> DeliveryResult.Outcome {
-        .permanentlyFailed(SMTPReply(code: 550, lines: ["5.7.1 MTA-STS enforce policy violation for domain \(domain): \(reason)"]))
+    /// Plan §9 Phase 4's "enforce-mode hard-fail" requirement: never
+    /// silently downgraded to plaintext or a non-matching host. Release
+    /// review: classified as *temporary* (`451 4.7.5`, queued for retry),
+    /// not permanent. RFC 8461 §5 has the sender not deliver to a host
+    /// that fails the policy, and a missing match or a failed handshake is
+    /// often a passing condition (a certificate being renewed, an MX being
+    /// moved) that a later attempt can succeed past; the retry queue's
+    /// attempt and age ceilings still end it.
+    private static func mtaSTSEnforceViolationOutcome(
+        domain: String, reason: String, retryQueueConfiguration: DirectMXRetryQueue.Configuration
+    ) -> DeliveryResult.Outcome {
+        let reply = SMTPReply(code: 451, lines: ["4.7.5 MTA-STS enforce policy violation for domain \(domain): \(reason)"])
+        return retryQueueConfiguration.classify(reply, attempt: 1)
+    }
+
+    /// Release review (RFC 5321 §4.5.4.1: a sender keeps retrying a
+    /// destination it couldn't reach): what to report when no host of a
+    /// domain could be used.
+    ///
+    /// Temporary, so queued for retry (`451 4.4.1`):
+    /// - TCP connect refused, reset or timed out, and other socket errors;
+    /// - no reply in time, or the peer hanging up mid-conversation;
+    /// - an open circuit breaker;
+    /// - TLS: STARTTLS missing where it is required, a failed handshake or
+    ///   certificate, or detected STARTTLS injection;
+    /// - DNS timeouts, SERVFAIL and other failures to get an answer
+    ///   (`DNSResolver.ResolveError.isTransient`).
+    ///
+    /// Final (`.failed`): the host name doesn't exist (NXDOMAIN/NODATA for
+    /// its addresses), every address was filtered as private, a name or
+    /// address fails syntax checks, or anything this method doesn't
+    /// recognize. Null MX and 5yz replies never reach here; they are
+    /// classified where they occur.
+    static func classify(
+        connectionFailure error: any Error, domain: String, retryQueueConfiguration: DirectMXRetryQueue.Configuration
+    ) -> DeliveryResult.Outcome {
+        guard isTransientConnectionFailure(error) else { return .failed(error) }
+        let reply = SMTPReply(code: 451, lines: ["4.4.1 No usable connection to any MX host for \(domain) (\(error))"])
+        return retryQueueConfiguration.classify(reply, attempt: 1)
+    }
+
+    static func isTransientConnectionFailure(_ error: any Error) -> Bool {
+        switch error {
+        case let smtpError as SMTPError:
+            switch smtpError {
+            case .circuitOpen, .starttlsRequired, .starttlsInjection, .tlsCertificateInvalid,
+                 .transientFailure, .serviceUnavailable, .greylisted:
+                return true
+            case .connectionFailed(let underlying):
+                return isTransientConnectionFailure(underlying)
+            case .permanentFailure, .sizeExceeded, .authenticationFailed, .tlsPolicyViolation, .ambiguousDelivery:
+                return false
+            }
+        case let connectionError as SMTPConnectionError:
+            switch connectionError {
+            case .replyTimedOut, .channelClosedByPeer: return true
+            case .malformedSASLChallenge, .tooManySASLChallenges: return false
+            }
+        case let resolveError as DNSResolver.ResolveError:
+            return resolveError.isTransient
+        case is DirectMXError, is AddressSyntax.Error, is HeaderEncoder.HeaderInjectionError:
+            return false
+        case is ChannelError, is IOError, is NIOConnectionError, is NIOSSLError, is CertificateNameError,
+             is SMTPResponseDecoder.DecoderError:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Checks out (dialing if needed) a pooled connection to `key` and runs
@@ -860,7 +924,7 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
             // `.ambiguous` here is sufficient on its own to guarantee this
             // never gets auto-retried.
             return .ambiguous(reply)
-        case .starttlsRequired, .starttlsInjection, .tlsPolicyViolation, .circuitOpen, .connectionFailed:
+        case .starttlsRequired, .starttlsInjection, .tlsCertificateInvalid, .tlsPolicyViolation, .circuitOpen, .connectionFailed:
             // None of these are reply-classified rejections from a
             // connected peer -- they're connection/policy-level failures
             // that, in practice, are thrown by the pool's own dial path or
@@ -906,6 +970,10 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
         retryQueueConfiguration: DirectMXRetryQueue.Configuration
     ) -> @Sendable (SMTPConnectionPool.Key) async throws -> SMTPConnection {
         { key in
+            // A custom `MXResolving` could hand back anything; only LDH
+            // host names are dialed (they become SNI and EHLO-adjacent
+            // log and TLS names).
+            try AddressSyntax.validateHostname(key.host, field: "MX host")
             let resolvedAddresses = try await resolver.resolveAddresses(hostname: key.host)
             // FIX #2 (milestone security review, SSRF-class filtering):
             // drop every address in a private/loopback/link-local/
@@ -932,7 +1000,9 @@ public final class DirectMXTransport: SMTPTransport, Sendable {
                     let socketAddress = try SocketAddress(ipAddress: address.description, port: key.port)
                     let asyncChannel = try await SMTPBootstrap.connect(
                         to: socketAddress, sniHostname: key.host, tls: key.tls,
-                        connectTimeout: config.connectTimeout, replyTimeout: config.replyTimeout, group: group
+                        connectTimeout: config.connectTimeout, replyTimeout: config.replyTimeout,
+                        ehloHostname: config.ehloHostname, requireCertificateDNSName: key.requireCertificateDNSName,
+                        group: group
                     )
                     let connection = SMTPConnection(
                         asyncChannel: asyncChannel, ehloHostname: config.ehloHostname,
