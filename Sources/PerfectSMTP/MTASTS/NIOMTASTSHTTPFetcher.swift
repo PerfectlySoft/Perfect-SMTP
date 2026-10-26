@@ -37,7 +37,9 @@ import NIOTLS
 /// - Redirects are never followed (RFC 8461 §3.3): a 3xx is returned as
 ///   is, and `MTASTSPolicyManager` treats any non-200 as a failed fetch.
 /// - `timeout` bounds the whole fetch, resolution to last byte
-///   (`MTASTSHTTPFetchError.timedOut`).
+///   (`MTASTSHTTPFetchError.timedOut`), and cancelling the calling task
+///   ends it at once (`CancellationError`); either way the connection is
+///   closed.
 /// - At most `maximumBodySize` body bytes are read. A larger
 ///   `Content-Length` is refused before the body, and the connection is
 ///   closed as soon as the cap is passed
@@ -47,7 +49,8 @@ import NIOTLS
 ///   (`tlsConfiguration.shutdownTimeout` is overridden). The response is
 ///   still accepted only when complete: by `Content-Length`, the chunked
 ///   terminator, or, for a body delimited by the close, the server's
-///   close_notify.
+///   close_notify (over `http://`, which is for tests and local tooling,
+///   a bare TCP close ends such a body).
 public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
     private let group: any EventLoopGroup
     private let timeout: TimeInterval
@@ -104,99 +107,157 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
         var tls = tlsConfiguration
         tls.shutdownTimeout = .milliseconds(1)
         let sslContext = useTLS ? try NIOSSLContext(configuration: tls) : nil
-        let group = self.group
         let connectTimeout = Self.timeAmount(timeout)
         let resolver = addressResolver
         let allowPrivate = allowPrivateAddresses
-        let promise = group.next().makePromise(of: MTASTSHTTPResponse.self)
+        // One event loop for the whole fetch: its state, every promise and
+        // every attempt's channel live there.
+        let loop = group.next()
+        let promise = loop.makePromise(of: MTASTSHTTPResponse.self)
+        let abortSignal = loop.makePromise(of: Void.self)
+        let state = NIOLoopBoundBox.makeBoxSendingValue(FetchState(), as: FetchState.self, eventLoop: loop)
 
-        return try await Self.withDeadline(timeout, onTimeout: { promise.fail(MTASTSHTTPFetchError.timedOut) }) {
-            // Resolve once and vet; the vetted address is what gets dialed.
-            let resolved: [DNSAddress]
-            if let literal {
-                resolved = [literal]
-            } else {
-                resolved = try await resolver.resolveAddresses(hostname: host)
+        // 6.0.1 (review): the deadline used to fail only the response
+        // promise, so a server that accepted and never finished the TLS
+        // handshake held the fetch (and its fd) past the deadline, and a
+        // cancelled caller waited for the server. Now the deadline and
+        // cancellation abort every stage (resolution, connect, handshake,
+        // response), and the channel, even one that connects later, is
+        // closed.
+        let abort: @Sendable (any Error) -> Void = { error in
+            loop.execute {
+                if state.value.aborted == nil { state.value.aborted = error }
+                abortSignal.fail(error)
+                promise.fail(error)
+                if let channel = state.value.channel { Self.abandon(channel) }
             }
-            let permitted = allowPrivate ? resolved : resolved.filter(\.isRoutable)
-            guard !permitted.isEmpty else {
-                promise.fail(MTASTSHTTPFetchError.noPermittedAddress(host: host))
-                throw MTASTSHTTPFetchError.noPermittedAddress(host: host)
-            }
-            // One event loop for every attempt, so each attempt's readiness
-            // promise is created up front and held here rather than looked up
-            // in a pipeline that may already have been torn down.
-            let loop = group.next()
-            func bootstrap(ready: EventLoopPromise<Void>) -> ClientBootstrap {
-                ClientBootstrap(group: loop)
-                    .connectTimeout(connectTimeout)
-                    .channelInitializer { channel in
-                        channel.eventLoop.makeCompletedFuture {
-                            if let sslContext {
-                                let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
-                                try channel.pipeline.syncOperations.addHandler(tls)
-                                try channel.pipeline.syncOperations.addHandler(
-                                    TLSReadyGate(host: literal == nil ? host : nil, ready: ready)
-                                )
-                            }
-                            try channel.pipeline.syncOperations.addHTTPClientHandlers()
-                            try channel.pipeline.syncOperations.addHandler(CappedResponseCollector(limit: limit, promise: promise))
-                        }
-                    }
-            }
-            var connected: (channel: any Channel, ready: EventLoopPromise<Void>)?
-            var lastError: any Error = MTASTSHTTPFetchError.noPermittedAddress(host: host)
-            for address in permitted {
-                let ready = loop.makePromise(of: Void.self)
-                do {
-                    let channel = try await bootstrap(ready: ready)
-                        .connect(to: SocketAddress(ipAddress: address.description, port: port)).get()
-                    connected = (channel, ready)
-                    break
-                } catch {
-                    ready.fail(error)  // no-op if the gate already failed it
-                    lastError = error
-                }
-            }
-            guard let (channel, ready) = connected else {
-                promise.fail(lastError)
-                throw lastError
-            }
-            // Re-review: nothing is written until the handshake has
-            // completed and the certificate's DNS name has been checked, so
-            // a refused server never sees the request.
-            if useTLS {
-                do {
-                    try await ready.futureResult.get()
-                } catch {
-                    Self.abandon(channel)
-                    promise.fail(error)
-                    throw error
-                }
-            } else {
-                ready.succeed(())
-            }
-            var headers = HTTPHeaders()
-            headers.add(name: "Host", value: hostField)
-            headers.add(name: "User-Agent", value: "PerfectSMTP-MTA-STS")
-            headers.add(name: "Accept", value: "text/plain")
-            headers.add(name: "Connection", value: "close")
-            let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: path, headers: headers)
-            channel.write(HTTPClientRequestPart.head(head), promise: nil)
-            channel.writeAndFlush(HTTPClientRequestPart.end(nil), promise: nil)
+        }
+        let deadline = loop.scheduleTask(in: connectTimeout) { abort(MTASTSHTTPFetchError.timedOut) }
+        defer {
+            deadline.cancel()
+            // Every promise is completed on every path (a no-op if it
+            // already was): a leaked promise traps in debug builds.
+            abortSignal.succeed(())
+            promise.fail(FetchError.incompleteResponse)
+        }
+        let aborted = abortSignal.futureResult
+        func abortReason() async -> (any Error)? {
+            try? await loop.submit { state.value.aborted }.get()
+        }
+
+        return try await withTaskCancellationHandler {
             do {
+                // Resolve once and vet; the vetted address is what gets dialed.
+                let resolved: [DNSAddress]
+                if let literal {
+                    resolved = [literal]
+                } else {
+                    let resolving = loop.makePromise(of: [DNSAddress].self)
+                    let task = Task {
+                        do { resolving.succeed(try await resolver.resolveAddresses(hostname: host)) } catch { resolving.fail(error) }
+                    }
+                    defer { task.cancel() }
+                    resolved = try await Self.unlessAborted(resolving.futureResult, aborted)
+                }
+                let permitted = allowPrivate ? resolved : resolved.filter(\.isRoutable)
+                guard !permitted.isEmpty else { throw MTASTSHTTPFetchError.noPermittedAddress(host: host) }
+
+                func bootstrap(ready: EventLoopPromise<Void>) -> ClientBootstrap {
+                    ClientBootstrap(group: loop)
+                        .connectTimeout(connectTimeout)
+                        .channelInitializer { channel in
+                            channel.eventLoop.makeCompletedFuture {
+                                if let sslContext {
+                                    let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
+                                    try channel.pipeline.syncOperations.addHandler(tls)
+                                    try channel.pipeline.syncOperations.addHandler(
+                                        TLSReadyGate(host: literal == nil ? host : nil, ready: ready)
+                                    )
+                                }
+                                try channel.pipeline.syncOperations.addHTTPClientHandlers()
+                                try channel.pipeline.syncOperations.addHandler(CappedResponseCollector(limit: limit, promise: promise))
+                            }
+                        }
+                }
+                var connected: (channel: any Channel, ready: EventLoopPromise<Void>)?
+                var lastError: any Error = MTASTSHTTPFetchError.noPermittedAddress(host: host)
+                for address in permitted {
+                    // Each attempt's readiness promise is created up front and
+                    // held here rather than looked up in a pipeline that may
+                    // already have been torn down.
+                    let ready = loop.makePromise(of: Void.self)
+                    let attempt = loop.makePromise(of: (any Channel).self)
+                    do {
+                        // A channel that connects after an abort is closed;
+                        // otherwise it is recorded, so an abort closes it.
+                        bootstrap(ready: ready).connect(to: try SocketAddress(ipAddress: address.description, port: port))
+                            .hop(to: loop).whenComplete { result in
+                                switch result {
+                                case .success(let channel):
+                                    if let error = state.value.aborted {
+                                        Self.abandon(channel)
+                                        attempt.fail(error)
+                                    } else {
+                                        state.value.channel = channel
+                                        attempt.succeed(channel)
+                                    }
+                                case .failure(let error):
+                                    attempt.fail(error)
+                                }
+                            }
+                        connected = (try await Self.unlessAborted(attempt.futureResult, aborted), ready)
+                        break
+                    } catch {
+                        ready.fail(error)  // no-op if the gate already failed it
+                        attempt.fail(error)
+                        if let reason = await abortReason() { throw reason }
+                        lastError = error
+                    }
+                }
+                guard let (channel, ready) = connected else { throw lastError }
+                // Re-review: nothing is written until the handshake has
+                // completed and the certificate's DNS name has been checked,
+                // so a refused server never sees the request.
+                if useTLS {
+                    try await Self.unlessAborted(ready.futureResult, aborted)
+                } else {
+                    ready.succeed(())
+                }
+                var headers = HTTPHeaders()
+                headers.add(name: "Host", value: hostField)
+                headers.add(name: "User-Agent", value: "PerfectSMTP-MTA-STS")
+                headers.add(name: "Accept", value: "text/plain")
+                headers.add(name: "Connection", value: "close")
+                let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: path, headers: headers)
+                // Written on the loop, and only if nothing has aborted the fetch.
+                try await loop.submit {
+                    if let error = state.value.aborted { throw error }
+                    channel.write(HTTPClientRequestPart.head(head), promise: nil)
+                    channel.writeAndFlush(HTTPClientRequestPart.end(nil), promise: nil)
+                }.get()
                 let response = try await promise.futureResult.get()
                 Self.abandon(channel)
                 return response
             } catch {
-                Self.abandon(channel)
-                throw error
+                let reason = await abortReason() ?? error
+                abort(reason)  // fails what is still pending and closes the channel
+                throw reason
             }
+        } onCancel: {
+            abort(CancellationError())
         }
     }
 
-    /// Stops reading, then closes: nothing more is pulled off the socket
-    /// while the close (and the 1 ms TLS shutdown) completes.
+    /// `future`'s result, or the abort's error if the fetch is aborted first.
+    private static func unlessAborted<T: Sendable>(_ future: EventLoopFuture<T>, _ aborted: EventLoopFuture<Void>) async throws -> T {
+        let either = aborted.eventLoop.makePromise(of: T.self)
+        future.hop(to: aborted.eventLoop).whenComplete { either.completeWith($0) }
+        aborted.whenFailure { either.fail($0) }
+        return try await either.futureResult.get()
+    }
+
+    /// Stops reading, then closes: no new reads are started while the
+    /// close (and the 1 ms TLS shutdown) completes.
     static func abandon(_ channel: any Channel) {
         channel.eventLoop.execute {
             try? channel.syncOptions?.setOption(.autoRead, value: false)
@@ -220,22 +281,12 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
     private static func timeAmount(_ seconds: TimeInterval) -> TimeAmount {
         .nanoseconds(Int64(min(max(0, seconds), 86_400) * 1_000_000_000))
     }
+}
 
-    private static func withDeadline<T: Sendable>(
-        _ seconds: TimeInterval, onTimeout: @escaping @Sendable () -> Void, _ operation: @escaping @Sendable () async throws -> T
-    ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { race in
-            race.addTask { try await operation() }
-            race.addTask {
-                try await Task.sleep(nanoseconds: UInt64(min(max(0, seconds), 86_400) * 1_000_000_000))
-                onTimeout()
-                throw MTASTSHTTPFetchError.timedOut
-            }
-            defer { race.cancelAll() }
-            guard let result = try await race.next() else { throw MTASTSHTTPFetchError.timedOut }
-            return result
-        }
-    }
+/// Per-fetch state, confined to the fetch's event loop.
+private struct FetchState: Sendable {
+    var channel: (any Channel)?
+    var aborted: (any Error)?
 }
 
 /// Completes `ready` once the TLS handshake is done and, for a host name,
@@ -286,8 +337,10 @@ private final class TLSReadyGate: ChannelInboundHandler, @unchecked Sendable {
 /// Collects one HTTP response, failing (and closing) as soon as the body
 /// would pass `limit`. Event-loop confined: all callbacks run on the
 /// channel's loop, which is why `@unchecked Sendable` holds.
-private final class CappedResponseCollector: ChannelInboundHandler, @unchecked Sendable {
+private final class CappedResponseCollector: ChannelDuplexHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
+    typealias OutboundIn = HTTPClientRequestPart
+    typealias OutboundOut = HTTPClientRequestPart
 
     private let limit: Int
     private let promise: EventLoopPromise<MTASTSHTTPResponse>
@@ -333,6 +386,21 @@ private final class CappedResponseCollector: ChannelInboundHandler, @unchecked S
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
         finish(context, .failure(error))
+    }
+
+    /// 6.0.1 (review): any close that passes here before the response is
+    /// complete fails it first. A close that ends through NIOSSL's shutdown
+    /// timer (now 1 ms) leaves no `uncleanShutdown` error behind, so the
+    /// decoder would otherwise end a close-delimited body as if the server
+    /// had. Every close of ours already settles the response first; this
+    /// covers any other (say, the event-loop group shutting down).
+    func close(context: ChannelHandlerContext, mode: CloseMode, promise closePromise: EventLoopPromise<Void>?) {
+        if !done {
+            done = true
+            body = []
+            promise.fail(NIOMTASTSHTTPFetcher.FetchError.incompleteResponse)
+        }
+        context.close(mode: mode, promise: closePromise)
     }
 
     private func finish(_ context: ChannelHandlerContext, _ result: Result<MTASTSHTTPResponse, any Error>) {

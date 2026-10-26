@@ -7,8 +7,8 @@
 //  `shutdownTimeout` (5 s by default). A policy host that streams an
 //  endless body and never answers the client's close_notify kept every
 //  capped (or timed-out, or refused) fetch's connection reading at full
-//  speed for 5 s: 50 capped fetches on macOS took 19-25 s and moved
-//  52-60 GB. The fetcher now stops reading and closes after 1 ms.
+//  speed for 5 s: 50 capped fetches on macOS took 15-25 s and moved
+//  40-60 GB. The fetcher now stops reading and closes after 1 ms.
 //
 //  The second half pins down that this never lets a cut-off response
 //  through: a short Content-Length body, an unterminated chunked body, or
@@ -52,12 +52,72 @@ struct MTASTSHTTPFetcherTLSShutdownTests {
 
     @Test(.timeLimit(.minutes(1)))
     func aRefusedCertificateLetsGoOfADeafServerAtOnce() async throws {
-        // An IP-only certificate for a host name: refused after the handshake.
-        let server = try await ScriptedTLSServer.start(.init(leaf: .ipOnly, framing: .closeDelimited, body: .endless, deafAfter: .handshake))
+        // An IP-only certificate for a host name: refused after the
+        // handshake. TLS 1.2, so the server has finished its handshake (and
+        // gone deaf) before the client's close_notify can arrive; under 1.3
+        // it can come in the same read as the client's Finished and be
+        // answered.
+        let server = try await ScriptedTLSServer.start(.init(
+            leaf: .ipOnly, maximumTLSVersion: .tlsv12, framing: .closeDelimited, body: .bytes(0), deafAfter: .handshake
+        ))
         let returned = try await server.expectFetch(throws: CertificateNameError.noDNSName(host: "mta-sts.victim.test"), host: "mta-sts.victim.test")
         try await server.expectClosedSoon(after: returned)
         try await server.stop()
     }
+
+    // MARK: - The deadline and cancellation end every stage
+
+    /// Review: the deadline used to fail only the response, so a server
+    /// that accepted and never spoke held the fetch in the TLS handshake
+    /// until the server closed.
+    @Test(.timeLimit(.minutes(1)))
+    func theDeadlineEndsAStalledHandshake() async throws {
+        let server = try await SilentTCPServer.start()
+        let fetcher = try server.fetcher(timeout: 0.5)
+        let started = Date()
+        await #expect(throws: MTASTSHTTPFetchError.timedOut) { _ = try await fetcher.fetch(url: try server.url()) }
+        #expect(Date().timeIntervalSince(started) < 3)
+        try await server.expectClosedSoon(after: Date())
+        try await server.stop()
+    }
+
+    /// Review: cancelling the caller cancelled the deadline too, and the
+    /// fetch then waited for the server indefinitely.
+    @Test(.timeLimit(.minutes(1)), arguments: [CancelPoint.handshake, .response])
+    func cancellingTheCallerEndsTheFetch(at point: CancelPoint) async throws {
+        let server: any ClosableTestServer = switch point {
+        case .handshake: try await SilentTCPServer.start()
+        case .response: try await ScriptedTLSServer.start(.init(framing: .contentLength(1000), body: .bytes(10)))
+        }
+        let fetcher = try server.fetcher(timeout: 30)
+        let url = try server.url()
+        let fetch = Task { try await fetcher.fetch(url: url) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let cancelled = Date()
+        fetch.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await fetch.value }
+        #expect(Date().timeIntervalSince(cancelled) < 2)
+        try await server.expectClosedSoon(after: cancelled)
+        try await server.stop()
+    }
+
+    /// Review: a resolver error left the response promise uncompleted,
+    /// which traps ("leaking promise") in debug builds.
+    @Test(.timeLimit(.minutes(1)))
+    func aResolverErrorIsThrown() async throws {
+        struct Failing: MTASTSAddressResolving {
+            struct Failure: Error, Equatable {}
+            func resolveAddresses(hostname: String) async throws -> [DNSAddress] { throw Failure() }
+        }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let fetcher = NIOMTASTSHTTPFetcher(group: group, timeout: 10, addressResolver: Failing())
+        await #expect(throws: Failing.Failure()) {
+            _ = try await fetcher.fetch(url: try #require(URL(string: "https://mta-sts.victim.test/.well-known/mta-sts.txt")))
+        }
+        try await group.shutdownGracefully()
+    }
+
+    enum CancelPoint: Sendable { case handshake, response }
 
     // MARK: - A cut-off response is never accepted
 
@@ -111,13 +171,14 @@ struct MTASTSHTTPFetcherTLSShutdownTests {
 /// A TLS server on its own thread (an endless pump on the client's loop
 /// would compete with the client) that answers the first request by
 /// script and records when the connection closed.
-final class ScriptedTLSServer: Sendable {
+final class ScriptedTLSServer: ClosableTestServer {
     enum Body: Sendable { case policy, bytes(Int), endless }
     enum DeafPoint: Sendable { case handshake, request }
     enum Ending: Sendable { case closeNotify, tcpCloseWithoutCloseNotify }
 
     struct Script: Sendable {
         var leaf: STARTTLSCertificateTests.Leaf = .named
+        var maximumTLSVersion: TLSVersion? = nil
         var framing: MTASTSHTTPFetcherTLSShutdownTests.Framing
         var body: Body
         /// From then on the server reads nothing, so it never sees (or
@@ -151,6 +212,7 @@ final class ScriptedTLSServer: Sendable {
         )
         // The server's own clean close (`.closeNotify`) needn't linger.
         configuration.shutdownTimeout = .milliseconds(100)
+        configuration.maximumTLSVersion = script.maximumTLSVersion
         let context = try NIOSSLContext(configuration: configuration)
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let closedAt = NIOLockedValueBox<Date?>(nil)
@@ -167,15 +229,19 @@ final class ScriptedTLSServer: Sendable {
         return ScriptedTLSServer(group: group, channel: channel, closedAt: closedAt)
     }
 
-    func url(host: String = "127.0.0.1") throws -> URL {
+    func url(host: String) throws -> URL {
         try #require(URL(string: "https://\(host):\(channel.localAddress?.port ?? 0)/.well-known/mta-sts.txt"))
     }
 
-    func fetcher(timeout: TimeInterval = 10) throws -> NIOMTASTSHTTPFetcher {
+    static func trustingTestCA() throws -> TLSConfiguration {
         var configuration = TLSConfiguration.makeClientConfiguration()
         configuration.trustRoots = .certificates([try NIOSSLCertificate(bytes: Array(TestCertificates.caPEM.utf8), format: .pem)])
-        return NIOMTASTSHTTPFetcher(
-            group: clientGroup, timeout: timeout, tlsConfiguration: configuration,
+        return configuration
+    }
+
+    func fetcher(timeout: TimeInterval = 10) throws -> NIOMTASTSHTTPFetcher {
+        NIOMTASTSHTTPFetcher(
+            group: clientGroup, timeout: timeout, tlsConfiguration: try Self.trustingTestCA(),
             addressResolver: LoopbackResolver(), allowPrivateAddresses: true
         )
     }
@@ -208,6 +274,10 @@ final class ScriptedTLSServer: Sendable {
     /// The server sees the connection close well before NIOSSL's 5 s
     /// default shutdown timeout (2 s leaves room for an emulated machine).
     func expectClosedSoon(after returned: Date) async throws {
+        try await Self.expectClosedSoon(closedAt, after: returned)
+    }
+
+    static func expectClosedSoon(_ closedAt: NIOLockedValueBox<Date?>, after returned: Date) async throws {
         let deadline = Date().addingTimeInterval(10)
         while closedAt.withLockedValue({ $0 }) == nil, Date() < deadline {
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -223,6 +293,64 @@ final class ScriptedTLSServer: Sendable {
     }
 }
 
+/// A test server whose connection close the tests wait for.
+protocol ClosableTestServer: Sendable {
+    func url(host: String) throws -> URL
+    func fetcher(timeout: TimeInterval) throws -> NIOMTASTSHTTPFetcher
+    func expectClosedSoon(after returned: Date) async throws
+    func stop() async throws
+}
+
+extension ClosableTestServer {
+    func url() throws -> URL { try url(host: "127.0.0.1") }
+}
+
+/// Accepts TCP connections and never says anything (so a TLS handshake
+/// never completes); records when the connection closed.
+final class SilentTCPServer: ClosableTestServer {
+    private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    private let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    private let closedAt = NIOLockedValueBox<Date?>(nil)
+    private let channel: NIOLockedValueBox<(any Channel)?> = NIOLockedValueBox(nil)
+
+    static func start() async throws -> SilentTCPServer {
+        let server = SilentTCPServer()
+        let closedAt = server.closedAt
+        let channel = try await ServerBootstrap(group: server.group)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(SocketEnd(closedAt: closedAt))
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        server.channel.withLockedValue { $0 = channel }
+        return server
+    }
+
+    func url(host: String) throws -> URL {
+        let port = channel.withLockedValue { $0?.localAddress?.port } ?? 0
+        return try #require(URL(string: "https://\(host):\(port)/.well-known/mta-sts.txt"))
+    }
+
+    func fetcher(timeout: TimeInterval) throws -> NIOMTASTSHTTPFetcher {
+        NIOMTASTSHTTPFetcher(
+            group: clientGroup, timeout: timeout, tlsConfiguration: try ScriptedTLSServer.trustingTestCA(),
+            addressResolver: LoopbackResolver(), allowPrivateAddresses: true
+        )
+    }
+
+    func expectClosedSoon(after returned: Date) async throws {
+        try await ScriptedTLSServer.expectClosedSoon(closedAt, after: returned)
+    }
+
+    func stop() async throws {
+        try await channel.withLockedValue { $0 }?.close()
+        try await group.shutdownGracefully()
+        try await clientGroup.shutdownGracefully()
+    }
+}
+
 private struct LoopbackResolver: MTASTSAddressResolving {
     func resolveAddresses(hostname: String) async throws -> [DNSAddress] { [.v4([127, 0, 0, 1])] }
 }
@@ -230,7 +358,7 @@ private struct LoopbackResolver: MTASTSAddressResolving {
 /// Socket side of the server's TLS handler: records the close, can go
 /// deaf (drop everything inbound), and can close the TCP connection
 /// without NIOSSL sending close_notify. Event-loop confined.
-private final class SocketEnd: ChannelInboundHandler, @unchecked Sendable {
+final class SocketEnd: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let closedAt: NIOLockedValueBox<Date?>
     var deaf = false
