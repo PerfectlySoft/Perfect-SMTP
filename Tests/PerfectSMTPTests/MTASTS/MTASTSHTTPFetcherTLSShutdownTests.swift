@@ -76,8 +76,9 @@ struct MTASTSHTTPFetcherTLSShutdownTests {
         let fetcher = try server.fetcher(timeout: 0.5)
         let started = Date()
         await #expect(throws: MTASTSHTTPFetchError.timedOut) { _ = try await fetcher.fetch(url: try server.url()) }
-        #expect(Date().timeIntervalSince(started) < 3)
-        try await server.expectClosedSoon(after: Date())
+        let returned = Date()
+        #expect(returned.timeIntervalSince(started) < 3)
+        try await server.expectClosedSoon(after: returned)
         try await server.stop()
     }
 
@@ -458,6 +459,8 @@ struct NIOMTASTSHTTPFetcherRequestTargetTests {
         ("/api/", "/api/"),
         ("/%3F/?", "/%3F/?"),
         ("/a%20b/%2F/caf%C3%A9?x=%26y&z", "/a%20b/%2F/caf%C3%A9?x=%26y&z"),
+        ("/a;b;c=d/e;f?x;y", "/a;b;c=d/e;f?x;y"),
+        ("/p?#fragment", "/p?"),
     ])
     func theRequestTargetIsSentAsEncoded(path: String, expected: String) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -477,6 +480,13 @@ struct NIOMTASTSHTTPFetcherRequestTargetTests {
         try await group.shutdownGracefully()
         #expect(response.statusCode == 200)
         #expect(target.withLockedValue { $0 } == expected)
+    }
+}
+
+extension NIOMTASTSHTTPFetcherRequestTargetTests {
+    @Test func userinfoAndFragmentsNeverReachTheTarget() throws {
+        let url = try #require(URL(string: "https://user:p%0D%0Ass@mta-sts.example.com/x%20y?q#f%0D%0A"))
+        #expect(NIOMTASTSHTTPFetcher.requestTarget(url) == "/x%20y?q")
     }
 }
 

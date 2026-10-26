@@ -94,10 +94,7 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
         // slash, so `/a%20b/` went out as `/a b` (a malformed request line)
         // and `/%3F` as `/?`. The policy manager's fixed
         // `/.well-known/mta-sts.txt` was never affected; direct callers were.
-        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let encodedPath = components?.percentEncodedPath ?? ""
-        let basePath = encodedPath.isEmpty ? "/" : encodedPath
-        let path = components?.percentEncodedQuery.map { basePath + "?" + $0 } ?? basePath
+        guard let path = Self.requestTarget(url) else { throw FetchError.unsupportedURL(url.absoluteString) }
         let literal = Self.addressLiteral(host)
         // Host header: name or address, IPv6 in brackets, port if explicit.
         let hostField = (literal.map { if case .v6 = $0 { return "[\(host)]" } else { return host } } ?? host)
@@ -174,6 +171,11 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
                         .connectTimeout(connectTimeout)
                         .channelInitializer { channel in
                             channel.eventLoop.makeCompletedFuture {
+                                // Recorded before the connect starts (on the
+                                // fetch's loop), so an abort also closes a
+                                // connect still in flight, failing it at once.
+                                if let error = state.value.aborted { throw error }
+                                state.value.channel = channel
                                 if let sslContext {
                                     let tls = try NIOSSLClientHandler(context: sslContext, serverHostname: literal == nil ? host : nil)
                                     try channel.pipeline.syncOperations.addHandler(tls)
@@ -270,6 +272,19 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
             try? channel.syncOptions?.setOption(.autoRead, value: false)
             channel.close(promise: nil)
         }
+    }
+
+    /// The origin-form request target: the URL's percent-encoded path
+    /// (empty becomes `/`) and query, fragment dropped. Nil if the URL has
+    /// no components or the result holds a space, a control character or a
+    /// non-ASCII byte (defence in depth: NIO doesn't check the request URI,
+    /// and older Foundations differ on encoding such characters).
+    static func requestTarget(_ url: URL) -> String? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        let path = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+        let target = components.percentEncodedQuery.map { path + "?" + $0 } ?? path
+        guard target.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else { return nil }
+        return target
     }
 
     /// `host` as an address if it is an IP literal.
