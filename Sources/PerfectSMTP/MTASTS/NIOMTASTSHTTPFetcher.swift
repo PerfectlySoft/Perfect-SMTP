@@ -42,6 +42,12 @@ import NIOTLS
 ///   `Content-Length` is refused before the body, and the connection is
 ///   closed as soon as the cap is passed
 ///   (`MTASTSHTTPFetchError.responseTooLarge`).
+/// - Once a fetch is done (or capped, timed out, refused) it stops reading
+///   and closes without waiting for the server's TLS close_notify
+///   (`tlsConfiguration.shutdownTimeout` is overridden). The response is
+///   still accepted only when complete: by `Content-Length`, the chunked
+///   terminator, or, for a body delimited by the close, the server's
+///   close_notify.
 public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
     private let group: any EventLoopGroup
     private let timeout: TimeInterval
@@ -88,7 +94,16 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
             + (url.port.map { ":\($0)" } ?? "")
 
         let limit = maximumBodySize
-        let sslContext = useTLS ? try NIOSSLContext(configuration: tlsConfiguration) : nil
+        // 6.0.1: when we close (done, capped, timed out, refused), don't
+        // wait for the peer's close_notify. NIOSSL's clean shutdown keeps
+        // reading, and discarding, whatever the peer sends for up to
+        // `shutdownTimeout` (5 s by default): against an endless body that
+        // ignores our close_notify, 5 s of full-speed reading per capped
+        // fetch. This only affects our own close, after the response has
+        // been accepted or refused.
+        var tls = tlsConfiguration
+        tls.shutdownTimeout = .milliseconds(1)
+        let sslContext = useTLS ? try NIOSSLContext(configuration: tls) : nil
         let group = self.group
         let connectTimeout = Self.timeAmount(timeout)
         let resolver = addressResolver
@@ -154,7 +169,7 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
                 do {
                     try await ready.futureResult.get()
                 } catch {
-                    channel.close(promise: nil)
+                    Self.abandon(channel)
                     promise.fail(error)
                     throw error
                 }
@@ -171,12 +186,21 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
             channel.writeAndFlush(HTTPClientRequestPart.end(nil), promise: nil)
             do {
                 let response = try await promise.futureResult.get()
-                channel.close(promise: nil)
+                Self.abandon(channel)
                 return response
             } catch {
-                channel.close(promise: nil)
+                Self.abandon(channel)
                 throw error
             }
+        }
+    }
+
+    /// Stops reading, then closes: nothing more is pulled off the socket
+    /// while the close (and the 1 ms TLS shutdown) completes.
+    static func abandon(_ channel: any Channel) {
+        channel.eventLoop.execute {
+            try? channel.syncOptions?.setOption(.autoRead, value: false)
+            channel.close(promise: nil)
         }
     }
 
@@ -236,6 +260,7 @@ private final class TLSReadyGate: ChannelInboundHandler, @unchecked Sendable {
             } catch {
                 ready.fail(error)
                 context.fireErrorCaught(error)
+                try? context.channel.syncOptions?.setOption(.autoRead, value: false)
                 context.close(promise: nil)
                 return
             }
@@ -315,6 +340,7 @@ private final class CappedResponseCollector: ChannelInboundHandler, @unchecked S
         done = true
         body = []
         promise.completeWith(result)
+        try? context.channel.syncOptions?.setOption(.autoRead, value: false)
         context.close(promise: nil)
     }
 }
