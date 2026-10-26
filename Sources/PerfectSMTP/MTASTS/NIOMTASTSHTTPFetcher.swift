@@ -89,8 +89,15 @@ public struct NIOMTASTSHTTPFetcher: MTASTSHTTPFetching {
         let host = rawHost.hasPrefix("[") && rawHost.hasSuffix("]") ? String(rawHost.dropFirst().dropLast()) : rawHost
         let useTLS = scheme == "https"
         let port = url.port ?? (useTLS ? 443 : 80)
-        let basePath = url.path.isEmpty ? "/" : url.path
-        let path = url.query.map { basePath + "?" + $0 } ?? basePath
+        // 6.0.1: the request target is the URL's own percent-encoded path
+        // and query. `url.path` is percent-decoded and drops a trailing
+        // slash, so `/a%20b/` went out as `/a b` (a malformed request line)
+        // and `/%3F` as `/?`. The policy manager's fixed
+        // `/.well-known/mta-sts.txt` was never affected; direct callers were.
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let encodedPath = components?.percentEncodedPath ?? ""
+        let basePath = encodedPath.isEmpty ? "/" : encodedPath
+        let path = components?.percentEncodedQuery.map { basePath + "?" + $0 } ?? basePath
         let literal = Self.addressLiteral(host)
         // Host header: name or address, IPv6 in brackets, port if explicit.
         let hostField = (literal.map { if case .v6 = $0 { return "[\(host)]" } else { return host } } ?? host)

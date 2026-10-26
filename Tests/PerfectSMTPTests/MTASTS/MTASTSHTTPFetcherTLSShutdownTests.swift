@@ -445,3 +445,63 @@ private final class ScriptedResponder: ChannelInboundHandler, @unchecked Sendabl
         try? context.pipeline.syncOperations.handler(type: SocketEnd.self).deaf = true
     }
 }
+
+/// 6.0.1: the request target is sent exactly as the URL has it. It used to
+/// come from `url.path`, which is percent-decoded and loses a trailing
+/// slash. Not reachable through `MTASTSPolicyManager` (its path is fixed),
+/// only by calling the fetcher directly.
+@Suite(.serialized)
+struct NIOMTASTSHTTPFetcherRequestTargetTests {
+    @Test(.timeLimit(.minutes(1)), arguments: [
+        ("/.well-known/mta-sts.txt", "/.well-known/mta-sts.txt"),
+        ("", "/"),
+        ("/api/", "/api/"),
+        ("/%3F/?", "/%3F/?"),
+        ("/a%20b/%2F/caf%C3%A9?x=%26y&z", "/a%20b/%2F/caf%C3%A9?x=%26y&z"),
+    ])
+    func theRequestTargetIsSentAsEncoded(path: String, expected: String) async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let target = NIOLockedValueBox<String?>(nil)
+        let server = try await ServerBootstrap(group: group)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(RequestLineRecorder(target: target))
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let port = try #require(server.localAddress?.port)
+        let fetcher = NIOMTASTSHTTPFetcher(group: group, timeout: 10, allowPrivateAddresses: true)
+        let response = try await fetcher.fetch(url: try #require(URL(string: "http://127.0.0.1:\(port)\(path)")))
+        try await server.close()
+        try await group.shutdownGracefully()
+        #expect(response.statusCode == 200)
+        #expect(target.withLockedValue { $0 } == expected)
+    }
+}
+
+/// Records the request target from the request line and answers 200.
+/// Event-loop confined.
+private final class RequestLineRecorder: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+    private let target: NIOLockedValueBox<String?>
+    private var received = ""
+    private var answered = false
+
+    init(target: NIOLockedValueBox<String?>) { self.target = target }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !answered else { return }
+        received += String(buffer: Self.unwrapInboundIn(data))
+        guard let line = received.components(separatedBy: "\r\n").first, received.contains("\r\n\r\n") else { return }
+        answered = true
+        let parts = line.split(separator: " ")
+        target.withLockedValue { $0 = parts.count == 3 ? String(parts[1]) : "malformed: \(line)" }
+        let channel = context.channel
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        context.writeAndFlush(Self.wrapOutboundOut(ByteBuffer(string: response))).whenComplete { _ in channel.close(promise: nil) }
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: any Error) { context.close(promise: nil) }
+}
