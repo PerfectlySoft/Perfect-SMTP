@@ -211,13 +211,8 @@ public actor LocalMTATransport: SMTPTransport {
                 // bridges the whole loop onto a dedicated background
                 // thread instead, off the cooperative pool entirely.
                 let collected = try await Self.runBlocking {
-                    let handle = stderrPipe.fileHandleForReading
                     var collected: [UInt8] = []
-                    while true {
-                        let chunk = handle.availableData
-                        if chunk.isEmpty { break }
-                        collected.append(contentsOf: chunk)
-                    }
+                    try Self.readToEnd(stderrPipe.fileHandleForReading) { collected.append(contentsOf: $0) }
                     return collected
                 }
                 stderrBox.value = collected
@@ -229,11 +224,7 @@ public actor LocalMTATransport: SMTPTransport {
                 // same way an undrained stderr would. Same off-cooperative-
                 // pool bridging as the stderr drain above (FIX #7).
                 _ = try await Self.runBlocking {
-                    let handle = stdoutPipe.fileHandleForReading
-                    while true {
-                        let chunk = handle.availableData
-                        if chunk.isEmpty { break }
-                    }
+                    try Self.readToEnd(stdoutPipe.fileHandleForReading) { _ in }
                 }
             }
 
@@ -248,6 +239,31 @@ public actor LocalMTATransport: SMTPTransport {
             }
 
             try await group.waitForAll()
+        }
+    }
+
+    /// Reads `handle` to end of file, passing each chunk to `body`.
+    ///
+    /// 6.0.1: this used `FileHandle.availableData`, which corelibs
+    /// Foundation turns into a `fatalError` on any read error, EINTR
+    /// included, so a signal interrupting the read crashed the process
+    /// (the test suite hit it on emulated linux/amd64). An interrupted
+    /// read is now retried, and any other error is thrown.
+    static func readToEnd(_ handle: FileHandle, _ body: (UnsafeRawBufferPointer) -> Void) throws {
+        let fd = handle.fileDescriptor
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let (count, error) = buffer.withUnsafeMutableBytes { bytes in
+                let count = read(fd, bytes.baseAddress, bytes.count)
+                return (count, count < 0 ? errno : 0)
+            }
+            if count > 0 {
+                buffer.withUnsafeBytes { body(UnsafeRawBufferPointer(rebasing: $0.prefix(count))) }
+            } else if count == 0 {
+                return
+            } else if error != EINTR {
+                throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+            }
         }
     }
 
