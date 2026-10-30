@@ -29,7 +29,7 @@ operate mail, or let Perfect-SMTP be the terminal MTA itself.
 
 This package is domain-agnostic by design — it has no Lasso-specific code
 and no Lasso dependency. It is, however, a **core dependency** of
-[Perfect-Lasso](https://github.com/taplin/Perfect-Lasso) — a Swift
+[Lariat](https://github.com/taplin/Lariat) (formerly Perfect-Lasso) — a Swift
 reimplementation of the Lasso language, still in active development —
 which uses it to implement its `email_send` tag.
 
